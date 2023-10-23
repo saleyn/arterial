@@ -20,13 +20,13 @@ end
 ```mermaid
 flowchart TD
     subgraph arterial [Arterial]
-    A[fa:fa-person-military-pointing Arterial Sup] <--->|supervises| P(fa:fa-layer-group Pool)
-    A[fa:fa-person-military-pointing Arterial Sup] <--->|supervises| CS[fa:fa-person-military-pointing Connection Mgr Sup]
+    A[fa:fa-person-military-pointing Arterial Sup] --->|supervises| P(fa:fa-layer-group Pool)
+    A[fa:fa-person-military-pointing Arterial Sup] --->|supervises| CS[fa:fa-person-military-pointing Connection Mgr Sup]
     B>fa:fa-arrow-down-9-1 Backlog] -.-> P
     style B stroke-width:1px,color:#666,stroke-dasharray: 5 5
-    CS <-->|supervises| C1(fa:fa-link Connection1)
-    CS <-->|supervises| C2(fa:fa-link Connection2)
-    CS <-->|supervises| CN(fa:fa-link ConnectionN)
+    CS -->|supervises| C1(fa:fa-link Connection1)
+    CS -->|supervises| C2(fa:fa-link Connection2)
+    CS -->|supervises| CN(fa:fa-link ConnectionN)
     P -.-|monitors| C1
     P -.-|monitors| C2
     P -.-|monitors| CN
