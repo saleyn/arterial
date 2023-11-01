@@ -42,7 +42,21 @@ static ERL_NIF_TERM destroy_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
   if (!get(env, argv[0], ptr)) [[unlikely]]
     return enif_make_badarg(env);
 
-  
+
+}
+
+static ERL_NIF_TERM make_available_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+  assert(argc == 2);
+
+  resource_ptr<ConnectionPool> ptr;
+  uint32_t                     idx;
+
+  if (!get(env, argv[0], ptr) || !get(env, argv[1], idx)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  ptr->Get(idx)
+
 }
 
 static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
@@ -63,10 +77,12 @@ static int upgrade(ErlNifEnv* env, void** priv_data, void** old_priv_data, ERL_N
 }
 
 static ErlNifFunc nif_funcs[] = {
-  {"create_nif",   2, create_nif},
-  {"destroy_nif",  1, destroy_nif},
-  {"checkout_nif", 1, checkout_nif},
-  {"checkin_nif",  2, checkin_nif},
+  {"create_nif",       2, create_nif},
+  {"destroy_nif",      1, destroy_nif},
+  {"checkout_nif",     1, checkout_nif},
+  {"checkin_nif",      2, checkin_nif},
+  {"make_available",   2, make_available_nif},
+  {"make_unavailable", 2, make_unavailable_nif},
 };
 
 ERL_NIF_INIT(Elixir.Arterial.Pool, nif_funcs, load, nullptr, upgrade, nullptr);
