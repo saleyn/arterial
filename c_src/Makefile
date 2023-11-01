@@ -8,7 +8,7 @@ run test: test_pool
 test_pool: test_pool.o
 	$(CXX) -o $@ $< -latomic
 
-test_pool.o : test_pool.cpp pool.hpp nifpp.h
+test_pool.o : test_pool.cpp pool_lifo.hpp pool_fifo.hpp nifpp.h
 	$(CXX) -c -g -O0 -std=c++20 -o $@ $<
 
 nifpp.h:
