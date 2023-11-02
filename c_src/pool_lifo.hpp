@@ -229,11 +229,27 @@ struct BaseObjectPoolLIFO {
   using ObjT    = typename NodeT::ObjT;
   using TraitsT = typename NodeT::TraitsT;
 
+  BaseObjectPoolLIFO(size_t size) : m_magic(NewMagic())
+  {
+    auto init = [this](auto i){ return NodeT(m_magic, false, i); };
+    Construct(size, init);
+  }
+
   template<typename Init>
-  BaseObjectPoolLIFO(size_t size, Init const& init);
+  BaseObjectPoolLIFO(size_t size, Init const& init) : m_magic(NewMagic())
+  {
+    Construct(size, init);
+  }
 
   template <IsObjOrUniqPtr<ObjT> T>
-  BaseObjectPoolLIFO(std::vector<T> const& objects);
+  BaseObjectPoolLIFO(std::vector<T> const& objects) : m_magic(NewMagic())
+  {
+    auto new_node = [this, &objects](auto i) {
+      return NodeT(Ptr(objects[i]), m_magic, false, i);
+    };
+
+    Construct(objects.size(), new_node);
+  }
 
 private:
   static ObjT* Ptr(ObjT* p) { return p; }
@@ -308,26 +324,6 @@ using ObjectPoolLIFO = BaseObjectPoolLIFO<BasePoolNode<T, PooledNodeTraits>>;
 //-----------------------------------------------------------------------------
 // IMPLEMENTATION
 //-----------------------------------------------------------------------------
-
-template<class NodeT>
-template<typename Init>
-BaseObjectPoolLIFO<NodeT>::BaseObjectPoolLIFO(size_t size, Init const& init)
-: m_magic(NewMagic())
-{
-  Construct(size, init);
-}
-
-template<class NodeT>
-template <IsObjOrUniqPtr<typename BaseObjectPoolLIFO<NodeT>::ObjT> T>
-BaseObjectPoolLIFO<NodeT>::BaseObjectPoolLIFO(std::vector<T> const& objects)
-: m_magic(NewMagic())
-{
-  auto new_node = [this, &objects](auto i) {
-    return NodeT(Ptr(objects[i]), m_magic, false, i);
-  };
-
-  Construct(objects.size(), new_node);
-}
 
 template<DerivedFromPooledObject NodeT>
 template <typename Init>

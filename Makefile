@@ -6,4 +6,7 @@ deps.get:
 compile:
 	rebar3 $@
 
+test:
+	make -C c_src test
+
 .PHONY: test
