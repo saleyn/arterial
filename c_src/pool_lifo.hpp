@@ -72,28 +72,28 @@ private:
 template <typename T>
 struct PooledObject {
   explicit PooledObject()
-    : m_obj(nullptr), m_index(-1), m_available(false), m_magic(0)
+  : m_obj(nullptr), m_index(-1), m_available(false), m_magic(0)
   {}
 
   PooledObject(T* obj, int idx, bool avail, uint32_t magic)
-    : m_obj(obj)
-    , m_index(idx)
-    , m_available(avail)
-    , m_magic(magic)
+  : m_obj(obj)
+  , m_index(idx)
+  , m_available(avail)
+  , m_magic(magic)
   {}
 
   PooledObject(PooledObject&& rhs)
-    : m_obj(rhs.m_obj)
-    , m_index(rhs.m_index)
-    , m_available(rhs.m_available.load(std::memory_order_relaxed))
-    , m_magic(rhs.m_magic)
+  : m_obj(rhs.m_obj)
+  , m_index(rhs.m_index)
+  , m_available(rhs.m_available.load(std::memory_order_relaxed))
+  , m_magic(rhs.m_magic)
   {}
 
   PooledObject(PooledObject const& rhs)
-    : m_obj(rhs.m_obj)
-    , m_index(rhs.m_index)
-    , m_available(rhs.m_available)
-    , m_magic(rhs.m_magic)
+  : m_obj(rhs.m_obj)
+  , m_index(rhs.m_index)
+  , m_available(rhs.m_available)
+  , m_magic(rhs.m_magic)
   {}
 
   T*         Value()            { return m_obj;        }
@@ -158,15 +158,15 @@ struct BasePoolNode : PooledObject<T> {
   /// caller uses the same arguments to initialize every object in the pool.
   template <typename... Args>
   explicit BasePoolNode(uint32_t magic, bool avail, int idx = -1, Args... args)
-    : PooledObject<T>(new T(std::forward(args)...), idx, avail, magic)
-    , m_obj_owner(this->PooledObject<T>::m_obj) // Take ownership
-    , m_next(std::max(-1, idx-1))
+  : PooledObject<T>(new T(std::forward(args)...), idx, avail, magic)
+  , m_obj_owner(this->PooledObject<T>::m_obj) // Take ownership
+  , m_next(std::max(-1, idx-1))
   {}
 
   explicit BasePoolNode(T* obj, uint32_t magic, bool avail, int idx = -1)
-    : PooledObject<T>(obj, idx, avail, magic)
-    , m_obj_owner(this->PooledObject<T>::m_obj) // Take ownership
-    , m_next(idx+1)
+  : PooledObject<T>(obj, idx, avail, magic)
+  , m_obj_owner(this->PooledObject<T>::m_obj) // Take ownership
+  , m_next(idx+1)
   {}
 
   // BasePoolNode(BasePoolNode&& rhs)
@@ -229,8 +229,8 @@ struct BaseObjectPoolLIFO {
   using ObjT    = typename NodeT::ObjT;
   using TraitsT = typename NodeT::TraitsT;
 
-  template<typename... Args>
-  BaseObjectPoolLIFO(size_t size, Args&&... args);
+  template<typename Init>
+  BaseObjectPoolLIFO(size_t size, Init const& init);
 
   template <IsObjOrUniqPtr<ObjT> T>
   BaseObjectPoolLIFO(std::vector<T> const& objects);
@@ -309,23 +309,17 @@ using ObjectPoolLIFO = BaseObjectPoolLIFO<BasePoolNode<T, PooledNodeTraits>>;
 // IMPLEMENTATION
 //-----------------------------------------------------------------------------
 
-template<DerivedFromPooledObject NodeT>
-template<typename... Args>
-BaseObjectPoolLIFO<NodeT>::BaseObjectPoolLIFO(size_t size, Args&&... args)
+template<class NodeT>
+template<typename Init>
+BaseObjectPoolLIFO<NodeT>::BaseObjectPoolLIFO(size_t size, Init const& init)
 : m_magic(NewMagic())
 {
-  auto new_node = [this, ...args = std::forward<Args>(args)](auto i) {
-    return NodeT(m_magic, false, i, std::forward<Args>(args)...);
-  };
-
-  Construct(size, new_node);
+  Construct(size, init);
 }
 
 template<class NodeT>
-template<class T>
-requires IsObjOrUniqPtr<T, typename NodeT::ObjT>
+template <IsObjOrUniqPtr<typename BaseObjectPoolLIFO<NodeT>::ObjT> T>
 BaseObjectPoolLIFO<NodeT>::BaseObjectPoolLIFO(std::vector<T> const& objects)
-//BaseObjectPoolLIFO<NodeT>::BaseObjectPoolLIFO(std::vector<T> const& objects)
 : m_magic(NewMagic())
 {
   auto new_node = [this, &objects](auto i) {

@@ -72,6 +72,8 @@ private:
   int64_t m_tv;
 };
 
+inline time_val now_utc() { return time_val::now(); }
+
 /// @brief Throttle given rate over a number of seconds.
 /// Implementation uses time spacing reservation algorithm where each
 /// allocation of samples reserves a fraction of space in the throttling
