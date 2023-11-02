@@ -60,19 +60,12 @@ struct BaseObjectPoolFIFO : public BaseObjectPoolLIFO<NodeT> {
 
   static_assert(std::is_same_v<std::atomic<NodeIndex>, typename NodeT::TraitsT::NextT>);
 
-  template<typename... Args>
-  BaseObjectPoolFIFO(size_t size, Args&&... args)
-    : BaseT(size, std::forward<Args&&>(args)...)
-  {
-    Init();
-  }
+  template<typename InitFun>
+  BaseObjectPoolFIFO(size_t size, InitFun const& init)
+  : BaseT(size, init) { Init(); }
 
   template <IsObjOrUniqPtr<ObjT> T>
-  BaseObjectPoolFIFO(std::vector<T> const& objects)
-    : BaseT(objects)
-  {
-    Init();
-  }
+  BaseObjectPoolFIFO(std::vector<T> const& objects) : BaseT(objects) { Init(); }
 
   ~BaseObjectPoolFIFO() {}
 
@@ -251,9 +244,9 @@ void BaseObjectPoolFIFO<NodeT>::CheckIn(const BaseObjectPoolFIFO<NodeT>::ObjT& n
 }
 
 template<DerivedFromPooledObject NodeT>
-bool BaseObjectPoolFIFO<NodeT>::MakeAvailable(ObjT* obj)
+bool BaseObjectPoolFIFO<NodeT>::MakeAvailable(T* obj)
 {
-  auto   node =  Find(obj);
+  auto   node =  this->Find(obj);
   return node && MakeAvailable(*node);
 }
 
@@ -264,7 +257,7 @@ bool BaseObjectPoolFIFO<NodeT>::MakeAvailable(NodeT& node)
 
   // Place the node in the pool
   if (success)
-    CheckIn(*node);
+    CheckIn(node);
 
   return success;
 }
@@ -272,7 +265,7 @@ bool BaseObjectPoolFIFO<NodeT>::MakeAvailable(NodeT& node)
 template<DerivedFromPooledObject NodeT>
 bool BaseObjectPoolFIFO<NodeT>::MakeUnavailable(T* obj)
 {
-  auto   node =  Find(obj);
+  auto   node =  this->Find(obj);
   return node && MakeUnavailable(*node);
 }
 
