@@ -60,9 +60,10 @@ struct BaseObjectPoolFIFO : public BaseObjectPoolLIFO<NodeT> {
 
   static_assert(std::is_same_v<std::atomic<NodeIndex>, typename NodeT::TraitsT::NextT>);
 
+  BaseObjectPoolFIFO(size_t size) : BaseT(size) { Init(); }
+
   template<typename InitFun>
-  BaseObjectPoolFIFO(size_t size, InitFun const& init)
-  : BaseT(size, init) { Init(); }
+  BaseObjectPoolFIFO(size_t size, InitFun const& init) : BaseT(size, init) { Init(); }
 
   template <IsObjOrUniqPtr<ObjT> T>
   BaseObjectPoolFIFO(std::vector<T> const& objects) : BaseT(objects) { Init(); }
@@ -253,7 +254,7 @@ bool BaseObjectPoolFIFO<NodeT>::MakeAvailable(T* obj)
 template<DerivedFromPooledObject NodeT>
 bool BaseObjectPoolFIFO<NodeT>::MakeAvailable(NodeT& node)
 {
-  auto success = !node.Available(true);
+  auto success = node.Available(true);
 
   // Place the node in the pool
   if (success)

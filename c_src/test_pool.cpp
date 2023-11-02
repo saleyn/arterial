@@ -21,6 +21,10 @@ struct ObjT {
     int value;
 };
 
+#define OUTPUT(Exec, Str) \
+  std::cout << "==> " << std::filesystem::path(Exec).stem().c_str() \
+                      << ":" << __LINE__ << ": " << (Str) << "\n"
+
 constexpr const size_t SIZE = 5;
 
 bool debug = false;
@@ -52,6 +56,11 @@ void test_lifo_pool(const char* exec) {
     objects.push_back(node->Value());
     objects.back()->value = ++count;
   }
+
+  ASSERT_EQUAL(0, pool.UnsafeSize());
+
+  for (int i=0; i < SIZE; ++i)
+    pool.CheckIn(*pool.Get(i));
 
   ASSERT_EQUAL(SIZE, pool.UnsafeSize());
 
@@ -115,7 +124,7 @@ void test_lifo_pool(const char* exec) {
 
   ASSERT_EQUAL(SIZE, pool.UnsafeSize());
 
-  std::cout << "==> " << std::filesystem::path(exec).stem().c_str() << ": success\n";
+  OUTPUT(exec, "success");
 }
 
 //-----------------------------------------------------------------------------
@@ -190,7 +199,8 @@ void test_fifo_pool(const char* exec) {
   count = 1;
   for (int i = 0; i < SIZE; ++i) {
     same_indexes.push_back(pool.CheckOut());
-    std::cout << "Object[" << pool.Get(*same_indexes.back())->value << "] (count=" << count << ")\n";
+    if (debug)
+      std::cout << "Object[" << pool.Get(*same_indexes.back())->value << "] (count=" << count << ")\n";
     ASSERT_EQUAL((count++ % SIZE)+1, pool.Get(*same_indexes.back())->value);
   }
 
@@ -201,5 +211,5 @@ void test_fifo_pool(const char* exec) {
 
   ASSERT_EQUAL(SIZE, pool.UnsafeSize());
 
-  std::cout << "==> " << std::filesystem::path(exec).stem().c_str() << ": success\n";
+  OUTPUT(exec, "success");
 }
