@@ -306,6 +306,9 @@ public:
   /// @brief Return the number of available nodes in the pool
   size_t UnsafeSize() const;
 
+  /// @brief Checkout N items from the queue
+  std::pair<bool, std::vector<T*>> UnsafeReserve(size_t n);
+
   /// @brief Call given lambda for each node in the pool
   template <typename Fun>
   void ForEach(Fun const& fun);
@@ -415,6 +418,28 @@ size_t BaseObjectPoolLIFO<NodeT>::UnsafeSize() const
   }
 
   return result;
+}
+
+template<DerivedFromPooledObject NodeT>
+std::pair<bool, std::vector<typename BaseObjectPoolLIFO<NodeT>::T*>>
+BaseObjectPoolLIFO<NodeT>::UnsafeReserve(size_t n)
+{
+  size_t result = 0;
+  auto   cursor = m_free_list_head.load(std::memory_order_relaxed);
+
+  auto   vec = std::vector<T*>();
+  vec.reserve(n);
+
+  while (cursor.Valid() && vec.size() < n) {
+    vec.push_back(cursor.Get()->ID());
+    cursor = m_nodes[cursor.Index()].Next();
+  }
+
+  auto success = vec.size() == n;
+  if  (success)
+    m_free_list_head.exchange(cursor);
+
+  return std::make_pair(success, vec);
 }
 
 /// @brief Call given lambda for each node in the pool
