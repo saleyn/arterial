@@ -6,22 +6,17 @@
 
 #include "pool_fifo.hpp"
 #include "throttle.hpp"
-#include <erl_nif.h>
+#include "backlog.hpp"
 #include <map>
 
 namespace arterial {
 
-using BaseReqID = uint16_t;     // Internal request ID
-using ReqID     = uint64_t;     // Request ID for sending over the wire
+using namespace nifpp;
 
-/// @brief Information about a request sent over the current connection
-struct ReqInfo {
-  BaseReqID m_req_id;
-  uint64_t  m_last_req_id;
-  uint64_t  m_ts_create;
-  uint64_t  m_ts_expire;
-  ErlNifPid m_pid;
-};
+using BaseReqID    = uint16_t;  // Internal request ID
+using ReqID        = uint32_t;  // Request ID for sending over the wire
+using BackLogValue = BaseReqID; // Type for backlog value
+using ReqInfo      = RequestInfo<BaseReqID, ReqID>;
 
 struct ThrottleInit {
   uint32_t rate;
@@ -29,23 +24,23 @@ struct ThrottleInit {
 };
 
 struct Connection {
-  using RequestVec  = std::vector<ReqInfo>;
-  using Throttle    = time_spacing_throttle;
+  using Throttle    = basic_time_spacing_throttle<uint32_t>;
   using ThrottleVec = std::vector<time_spacing_throttle>;
+  using ReqQueue    = BackLog<ReqInfo>;
 
-  Connection(uint16_t id, uint16_t backlog_size, std::vector<ThrottleInit>&& throttles)
-  : m_id(id)
-  , m_max_backlog(backlog_size)
-  , m_requests(backlog_size, [this](auto i) {
+  Connection(uint16_t a_id, BackLogValue a_backlog, std::vector<ThrottleInit>&& a_throttles)
+  : m_id(a_id)
+  , m_max_backlog(a_backlog)
+  , m_requests(a_backlog, [this](auto i) {
     m_requests[i] = ReqInfo{.m_req_id = i};
   })
   {
-    m_throttles.reserve(throttles.size());
-    for (auto& t : throttles)
-      m_requests.emplace_back(Throttle(t.rate, t.window));
+    m_throttles.reserve(a_throttles.size());
+    for (auto& t : a_throttles)
+      m_throttles.emplace_back(Throttle(t.rate, t.window));
   }
 
-  std::pair<ReqID, ReqInfo*> Get
+  ReqInfo* Get
   (
     BaseReqID    req_id,
     uint32_t     ttl_us,
@@ -54,32 +49,29 @@ struct Connection {
   )
   {
     if (req_id >= m_requests.size()) [[unlikely]]
-      return std::make_pair(0, nullptr);
+      return nullptr;
 
-    auto  req_id = EncodeReqID(req_id);
-    auto& req    = m_requests[req_id];
+    auto& req = m_requests[req_id];
+    req.Update(now.microseconds(), ttl_us, m_vsn);
 
-    req.m_last_req_id = req_id;
-    req.m_ts_create   = now.microseconds();
-    req.m_ts_expire   = req.m_ts_create + ttl_us;
-
-    return std::make_pair(req_id, &req)
+    return &req;
   }
 
-  ReqID EncodeReqID(BaseReqID req_id)
-  {
-    assert(req_id <= m_max_backlog);
+  uint32_t     ID()             const { return m_id;        }
+  ThrottleVec& Throttles()            { return m_throttles; }
+  ReqQueue&    Requests()             { return m_requests;  }
+  size_t       ThrottlesCount() const { return m_throttles.size(); }
+  TERM         Socket()         const { return m_socket;    }
+  void         Socket(TERM socket)    { m_socket = socket;  }
 
-    return ReqID((++m_vsn) << 32) & 0x00FFFFFF00000000ull
-         | ((m_id << 16) & 0xFFFF0000)
-         | (req_id & 0xFFFF);
-  }
 private:
   alignas(64) std::atomic<uint32_t> m_vsn; // Version mask added to the req_count
   uint32_t                          m_id;
-  uint32_t                          m_max_backlog;
-  ObjectPoolLIFO<ReqInfo>           m_requests;
+  BackLogValue                      m_max_backlog;
+  ReqQueue                          m_requests;
   ThrottleVec                       m_throttles;
+  TERM                              m_socket;
+  std::string                       m_name;
 };
 
 } // namespace arterial

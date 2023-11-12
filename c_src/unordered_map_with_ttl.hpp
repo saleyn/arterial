@@ -70,8 +70,9 @@ namespace arterial {
 
     struct erase_action {
       template <class Map>
-      void operator()(Map& m, typename Map::iterator const& it) {
+      bool operator()(Map& m, typename Map::iterator const& it) {
         m.erase(it);
+        return true;
       }
     };
 
@@ -103,83 +104,83 @@ namespace arterial {
     class Alloc = std::allocator<std::pair<const K, T>>
   >
   struct unordered_map_with_ttl {
-      struct ttl_node {
-        uint64_t time;
-        K        key;
-      };
+    struct ttl_node {
+      uint64_t time;
+      K        key;
+    };
 
-      using hash_map       = std::unordered_map<K, val_node<T>, Hash, KeyEqual, Alloc>;
-      using lru_alloc      = typename std::allocator_traits<Alloc>::template rebind_alloc<ttl_node>;
-      using lru_list       = std::list<ttl_node, lru_alloc>;
-      using iterator       = typename hash_map::iterator;
-      using const_iterator = typename hash_map::const_iterator;
+    using hash_map       = std::unordered_map<K, val_node<T>, Hash, KeyEqual, Alloc>;
+    using lru_alloc      = typename std::allocator_traits<Alloc>::template rebind_alloc<ttl_node>;
+    using lru_list       = std::list<ttl_node, lru_alloc>;
+    using iterator       = typename hash_map::iterator;
+    using const_iterator = typename hash_map::const_iterator;
 
-      explicit unordered_map_with_ttl(uint64_t ttl)
-        : m_ttl(ttl)
-        , m_map()
-        , m_lru()
-        , m_assign(val_assigner<T>())
-      {}
+    explicit unordered_map_with_ttl(uint64_t ttl)
+      : m_ttl(ttl)
+      , m_map()
+      , m_lru()
+      , m_assign(val_assigner<T>())
+    {}
 
-      unordered_map_with_ttl(uint64_t ttl, const Alloc& alloc)
-        : m_ttl(ttl)
-        , m_map(alloc)
-        , m_assign(val_assigner<T>())
-      {}
+    unordered_map_with_ttl(uint64_t ttl, const Alloc& alloc)
+      : m_ttl(ttl)
+      , m_map(alloc)
+      , m_assign(val_assigner<T>())
+    {}
 
-      unordered_map_with_ttl(
+    unordered_map_with_ttl(
       uint64_t         ttl,
       size_t           bucket_count,
       const Hash&      hash   = Hash(),
       const KeyEqual&  equal  = KeyEqual(),
       const ValDelete& eraser = erase_action(),
       const Alloc&     alloc  = Alloc()
-      )
-        : m_ttl(ttl)
-        , m_map(bucket_count, hash, equal, alloc)
-        , m_lru()
-        , m_assign(val_assigner<T>())
-        , m_eraser(eraser)
-      {}
+    )
+    : m_ttl(ttl)
+    , m_map(bucket_count, hash, equal, alloc)
+    , m_lru()
+    , m_assign(val_assigner<T>())
+    , m_eraser(eraser)
+    {}
 
-      /// @brief Try to add a given key/value to the map.
-      /// @return true if the value was added
-      bool try_add(const K& key, T&& value, uint64_t now);
+    /// @brief Try to add a given key/value to the map.
+    /// @return true if the value was added
+    bool try_add(const K& key, T&& value, uint64_t now);
 
-      size_t size() const { return m_map.size(); }
+    size_t size() const { return m_map.size(); }
 
-      iterator       begin()         noexcept { return m_map.begin();  }
-      const_iterator begin()   const noexcept { return m_map.begin();  }
-      const_iterator cbegin()  const noexcept { return m_map.cbegin(); }
+    iterator       begin()         noexcept { return m_map.begin();  }
+    const_iterator begin()   const noexcept { return m_map.begin();  }
+    const_iterator cbegin()  const noexcept { return m_map.cbegin(); }
 
-      iterator       end()           noexcept { return m_map.end();    }
-      const_iterator end()     const noexcept { return m_map.end();    }
-      const_iterator cend()    const noexcept { return m_map.cend();   }
+    iterator       end()           noexcept { return m_map.end();    }
+    const_iterator end()     const noexcept { return m_map.end();    }
+    const_iterator cend()    const noexcept { return m_map.cend();   }
 
-      /// @brief Erase the given key from the map
-      /// @return true when the key was evicted
-      template <typename Key>
-      bool erase(Key&& k)                     { return m_map.erase(k) > 0; }
+    /// @brief Erase the given key from the map
+    /// @return true when the key was evicted
+    template <typename Key>
+    bool erase(Key&& k)                     { return m_map.erase(k) > 0; }
 
-      /// @brief Clear the map
-      void clear()                            { m_map.clear(); m_lru.clear(); }
+    /// @brief Clear the map
+    void clear()                            { m_map.clear(); m_lru.clear(); }
 
-      /// @brief Evict expired key/value pairs
-      /// @param now - current timestamp
-      /// @return the number of evicted items
-      template <typename OnErase>
-      size_t refresh(uint64_t now, OnErase const& on_erase =
-        [](auto k, auto& v, auto expire, auto now){});
+    /// @brief Evict expired key/value pairs
+    /// @param now - current timestamp
+    /// @return the number of evicted items
+    template <typename OnErase>
+    size_t refresh(uint64_t now, OnErase const& on_erase =
+      [](auto k, auto& v, auto expire, auto now){});
 
-      iterator       find(const K& k)         { return m_map.find(k);  }
-      const_iterator find(const K& k)   const { return m_map.find(k);  }
+    iterator       find(const K& k)         { return m_map.find(k);  }
+    const_iterator find(const K& k)   const { return m_map.find(k);  }
 
   private:
-      uint64_t  m_ttl;
-      hash_map  m_map;
-      lru_list  m_lru;
-      ValUpdate m_assign;
-      ValDelete m_eraser;
+    uint64_t  m_ttl;
+    hash_map  m_map;
+    lru_list  m_lru;
+    ValUpdate m_assign;
+    ValDelete m_eraser;
   };
 
   //---------------------------------------------------------------------------
@@ -201,9 +202,9 @@ namespace arterial {
       auto  it  = m_map.find(i->key);
       if   (it == m_map.end()) continue;
 
-      on_erase(i->key, it->second, i->time, now);
+      if (on_erase(i->key, it->second, i->time, now))
+        m_eraser(m_map, it);    // Evict expired node
 
-      m_eraser(m_map, it);    // Evict expired node
       m_lru.pop_front();
     }
 
@@ -222,7 +223,7 @@ namespace arterial {
 
     if (not_found)
       m_map.emplace(key, val_node<T>(std::move(value), now));
-    else // maybe_add the existing entry
+    else // maybe replace the existing entry
       not_found = m_assign(it->second, std::move(value), now);
 
     if (not_found)
