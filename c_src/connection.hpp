@@ -13,8 +13,6 @@ namespace arterial {
 
 using namespace nifpp;
 
-using BaseReqID    = uint16_t;  // Internal request ID
-using ReqID        = uint32_t;  // Request ID for sending over the wire
 using BackLogValue = BaseReqID; // Type for backlog value
 using ReqInfo      = RequestInfo<BaseReqID, ReqID>;
 
