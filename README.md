@@ -50,20 +50,6 @@ get a reply.
 * Automatic reconnect with exponential backoff per connection
   (`arterial_connection`).
 
-> **Status:** the C++ NIF layer, the in-flight timeout registry, the
-> queue-when-busy wait-list, and the Erlang connection-lifecycle/supervision
-> chain (`arterial_app` -> `arterial_pool` -> `arterial_connection` workers +
-> `arterial_sweeper`) are implemented and compile cleanly; the NIF layer has
-> an EUnit suite ([test/arterial_nif_tests.erl](test/arterial_nif_tests.erl))
-> covering timeout firing, checkin-before-timeout untracking, fixed-TTL pool
-> mode, backlog-slot-leak regression, and the full queue-when-busy path
-> (immediate success, queuing, FIFO servicing order, servicing via either
-> `checkin_connection` or `sweep_timeouts`, waiter timeout, wait-list-full
-> rejection, and multi-connection pools). The one remaining known-broken
-> module is `arterial_proxy.erl` (the asynchronous request queuing/dispatch
-> path), which doesn't compile yet — see
-> [Implementation status](#implementation-status).
-
 ## Installation
 
 Arterial is not yet published to Hex. Add it as a `rebar3` dependency directly
@@ -256,49 +242,12 @@ Two behaviours decouple the wire transport from request/response encoding:
 * **`arterial_protocol`** ([src/arterial_protocol.erl](src/arterial_protocol.erl)) — the transport and per-request codec: `connect/3`, `close/1`, `send/2`, `recv/2`, `setopts/2`, `encode_request/3`, `decode_reply/2`.
 * **`arterial_client`** ([src/arterial_client.erl](src/arterial_client.erl)) — the connection lifecycle: `init/1`, `setup/2`, `handle_request/2`, `handle_data/2`, `handle_timeout/2` (optional), `terminate/2`. Also implements `call/3`, the synchronous request API used by callers (the caller's own process owns the socket for the call's duration via `arterial_protocol`; `arterial_connection`'s `gen_server` is not involved in the call itself).
 
-Pool/connection options (`arterial_client:options/0`) include `address`/`ip`,
+Pool/connection options (`t:arterial_client:options/0`) include `address`/`ip`,
 `port`, `protocol`, `reconnect`, `reconnect_time_min`/`reconnect_time_max`,
-`bounce_interval_ms`, and `socket_options`. `arterial_pool:options/0` (passed
+`bounce_interval_ms`, and `socket_options`. `t:arterial_pool:options/0` (passed
 to `arterial_pool:start_link/2`) additionally controls `size`, `backlog`,
 `fifo`, `fixed_timeout_us`, `sweep_interval_ms`, `protocol`, `client`, and
 `client_opts` (the per-connection options map above).
-
-## Implementation status
-
-This is a snapshot of known gaps as of the current code, useful if you're
-picking this project back up:
-
-* `src/arterial_proxy.erl` — **not yet working.** The second `handle_cast/2`
-  clause has a stray `case ... of` with no matching `end`, references
-  unbound variables (`Bin`, `Rate`, `Win`, `Pool`), and calls a nonexistent
-  Erlang `throttle` module (the real rate throttling lives in
-  `c_src/throttle.hpp`, on the C++ side). The asynchronous queuing-when-busy
-  policy this module was meant to implement now exists at the NIF level
-  (`arterial_nif:checkout_async/3`, see
-  [Queue-when-busy checkouts](#queue-when-busy-checkouts)), which may make a
-  rewrite of this module unnecessary — intentionally left as a follow-up
-  decision, separate from the synchronous (`arterial_client:call/3`) and
-  timeout-tracking/queue-when-busy paths, which are all implemented and
-  tested.
-* `test/arterial_nif_tests.erl` exercises the NIF, the in-flight timeout
-  registry, and the queue-when-busy wait-list end-to-end (timeout firing,
-  checkin-before-timeout untracking, fixed-TTL pool mode, a regression test
-  for backlog-slot leaks on repeated timeouts, and — for
-  `checkout_async/3` — immediate success, queuing, FIFO servicing order,
-  servicing via both `checkin_connection/4` and `sweep_timeouts/1`, waiter
-  timeout, wait-list-full rejection, and multi-connection pools), but there
-  is no test yet that starts a real `arterial_pool` supervisor against a
-  live socket — `arterial_connection`'s reconnect loop and
-  `arterial_client:call/3` are compiled and type-checked but not yet
-  exercised against a real server.
-
-The lock-free pool/throttle/wait-list primitives in `pool_fifo.hpp`,
-`pool_lifo.hpp`, `throttle.hpp` (ported from the author's
-[utxx](https://github.com/saleyn/utxx) library), and `wait_list.hpp`, the
-in-flight timeout registry (`unordered_map_with_ttl.hpp`), and the full
-Erlang supervision chain (`arterial_app` -> `arterial_pool` ->
-`arterial_connection` + `arterial_sweeper`) are implemented, compile
-cleanly, and are covered by tests where noted above.
 
 ## Documentation
 

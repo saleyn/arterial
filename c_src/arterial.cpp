@@ -8,7 +8,15 @@ using namespace arterial;
 
 namespace {
 
-ERL_NIF_TERM create_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+// Resource `down` event: fires when a process holding a monitored
+// checkout (see ConnectionPool::MonitorOwner()) dies, so its reservations
+// don't leak forever. See ConnectionPool::OnProcessDown().
+void on_pool_down(ConnectionPool* pool, ErlNifEnv*, ErlNifPid* pid, ErlNifMonitor*)
+{
+  pool->OnProcessDown(*pid);
+}
+
+ERL_NIF_TERM create_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
 {
   assert(argc == 5);
 
@@ -26,13 +34,14 @@ ERL_NIF_TERM create_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
       !get(env, argv[4], max_waiters)) [[unlikely]]
     return enif_make_badarg(env);
 
-  auto pool = construct_resource<ConnectionPool>(
+  auto pool = construct_resource_with_events<ConnectionPool>(
+    resource_events<ConnectionPool>(on_pool_down),
     size, BaseReqID(backlog), fifo, uint64_t(fixed_ttl_us), size_t(max_waiters));
 
   return make(env, std::make_tuple(am_ok, pool));
 }
 
-ERL_NIF_TERM destroy_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+ERL_NIF_TERM destroy_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
 {
   assert(argc == 1);
 
@@ -43,7 +52,7 @@ ERL_NIF_TERM destroy_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
   return make(env, am_ok);
 }
 
-ERL_NIF_TERM set_socket_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+ERL_NIF_TERM set_socket_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
 {
   assert(argc == 3);
 
@@ -56,7 +65,7 @@ ERL_NIF_TERM set_socket_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
   return make(env, ptr->SetSocket(id, argv[2]));
 }
 
-ERL_NIF_TERM make_available_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+ERL_NIF_TERM make_available_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
 {
   assert(argc == 2);
 
@@ -69,7 +78,7 @@ ERL_NIF_TERM make_available_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
   return make(env, ptr->MakeAvailable(id));
 }
 
-ERL_NIF_TERM make_unavailable_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+ERL_NIF_TERM make_unavailable_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
 {
   assert(argc == 2);
 
@@ -82,14 +91,17 @@ ERL_NIF_TERM make_unavailable_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM a
   return make(env, ptr->MakeUnavailable(id));
 }
 
-ERL_NIF_TERM checkout_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+ERL_NIF_TERM checkout_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
 {
-  assert(argc == 2);
+  assert(argc == 3);
 
   resource_ptr<ConnectionPool> ptr;
+  ErlNifPid                    pid;
   unsigned int                 samples;
 
-  if (!get(env, argv[0], ptr) || !get(env, argv[1], samples) || samples == 0) [[unlikely]]
+  if (!get(env, argv[0], ptr) ||
+      !enif_get_local_pid(env, argv[1], &pid) ||
+      !get(env, argv[2], samples) || samples == 0) [[unlikely]]
     return enif_make_badarg(env);
 
   auto [conn, ids] = ptr->CheckOut(samples);
@@ -97,39 +109,56 @@ ERL_NIF_TERM checkout_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
   if (!conn)
     return make(env, std::make_tuple(am_error, atom(env, "no_connection")));
 
+  // The calling process now owns this connection's reserved backlog
+  // slot(s); monitor it so they're released automatically if it dies
+  // before checking them back in (see ConnectionPool::OnProcessDown()).
+  if (!ptr->MonitorOwner(env, pid, conn->ID(), ids)) [[unlikely]] {
+    // pid is already gone (a race with the caller's own death) -- undo
+    // the reservation instead of leaking it forever.
+    for (auto id : ids)
+      conn->Requests().CheckIn(id);
+    ptr->CheckIn(conn->ID());
+    return make(env, std::make_tuple(am_error, atom(env, "no_connection")));
+  }
+
   std::vector<unsigned int> req_ids(ids.begin(), ids.end());
 
   return make(env, std::make_tuple(am_ok,
     std::make_tuple(conn->ID(), TERM(conn->Socket(env)), req_ids)));
 }
 
-ERL_NIF_TERM checkin_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+ERL_NIF_TERM checkin_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
 {
-  assert(argc == 4);
+  assert(argc == 5);
 
   resource_ptr<ConnectionPool> ptr;
   unsigned int                 id;
   std::vector<unsigned int>    req_ids;
+  ErlNifPid                    pid;
 
   if (!get(env, argv[0], ptr) || !get(env, argv[1], id) ||
-      !get(env, argv[2], req_ids)) [[unlikely]]
+      !get(env, argv[2], req_ids) ||
+      !enif_get_local_pid(env, argv[4], &pid)) [[unlikely]]
     return enif_make_badarg(env);
 
   auto* conn = ptr->Get(id);
   if (!conn) [[unlikely]]
     return enif_make_badarg(env);
 
-  for (auto rid : req_ids) {
-    conn->Requests().CheckIn(ReqID(rid));
-    ptr->UntrackInflight(ReqID(rid));
+  std::vector<ReqID> ids(req_ids.begin(), req_ids.end());
+
+  for (auto rid : ids) {
+    conn->Requests().CheckIn(rid);
+    ptr->UntrackInflight(rid);
   }
 
+  ptr->ReleaseOwnerReservation(env, pid, id, ids);
   ptr->CheckIn(id, env, argv[3]);
 
   return make(env, am_ok);
 }
 
-ERL_NIF_TERM checkout_async_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+ERL_NIF_TERM checkout_async_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
 {
   assert(argc == 3);
 
@@ -146,6 +175,16 @@ ERL_NIF_TERM checkout_async_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
 
   switch (result.status) {
     case AsyncCheckoutStatus::Ok: {
+      // Mirrors checkout_nif(): the caller now owns this connection's
+      // reserved backlog slot(s), so monitor it the same way.
+      if (!ptr->MonitorOwner(env, pid, result.conn->ID(), result.ids)) [[unlikely]] {
+        for (auto id : result.ids) {
+          result.conn->Requests().CheckIn(id);
+          ptr->UntrackInflight(id);
+        }
+        ptr->CheckIn(result.conn->ID());
+        return make(env, std::make_tuple(am_error, atom(env, "no_connection")));
+      }
       std::vector<unsigned int> req_ids(result.ids.begin(), result.ids.end());
       return make(env, std::make_tuple(am_ok,
         std::make_tuple(result.conn->ID(), TERM(result.conn->Socket(env)), req_ids)));
@@ -159,7 +198,7 @@ ERL_NIF_TERM checkout_async_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
   }
 }
 
-ERL_NIF_TERM track_inflight_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+ERL_NIF_TERM track_inflight_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
 {
   assert(argc == 5);
 
@@ -184,7 +223,7 @@ ERL_NIF_TERM track_inflight_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
   return make(env, am_ok);
 }
 
-ERL_NIF_TERM sweep_timeouts_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+ERL_NIF_TERM sweep_timeouts_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
 {
   assert(argc == 2);
 
@@ -224,8 +263,8 @@ ErlNifFunc nif_funcs[] = {
   {"set_socket_nif",       3, set_socket_nif,       0},
   {"make_available_nif",   2, make_available_nif,   0},
   {"make_unavailable_nif", 2, make_unavailable_nif, 0},
-  {"checkout_nif",         2, checkout_nif,         0},
-  {"checkin_nif",          4, checkin_nif,          0},
+  {"checkout_nif",         3, checkout_nif,         0},
+  {"checkin_nif",          5, checkin_nif,          0},
   {"checkout_async_nif",   3, checkout_async_nif,   0},
   {"track_inflight_nif",   5, track_inflight_nif,   0},
   {"sweep_timeouts_nif",   2, sweep_timeouts_nif,   0},

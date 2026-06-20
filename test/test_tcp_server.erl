@@ -1,0 +1,124 @@
+-module(test_tcp_server).
+
+-moduledoc """
+A real TCP server used by `test_tcp_server_tests` to exercise
+`arterial_pool`/`arterial_client:call/3` end-to-end over an actual
+loopback socket (as opposed to `test_protocol`'s in-process fake used by
+`arterial_nif_tests`).
+
+Listens on `Port` (use `0` to let the OS pick a free port, then read it
+back via `port/1`), accepts connections, and for each
+`test_echo_protocol`-framed request applies a tiny request language:
+
+- `{echo, Term}`        -> replies with `Term`
+- `{upcase, Binary}`    -> replies with `string:uppercase(Binary)`
+- `{delay, Ms, Term}`   -> replies with `Term` after sleeping `Ms`
+- anything else         -> replies with `{error, unknown_request}`
+
+## Examples
+
+```
+1> {ok, Srv} = test_tcp_server:start(0).
+{ok,<0.123.0>}
+2> Port = test_tcp_server:port(Srv).
+54321
+3> test_tcp_server:stop(Srv).
+ok
+```
+""".
+
+-export([start/1, port/1, stop/1]).
+
+-doc "Start listening on `Port` (`0` picks a free ephemeral port).".
+-spec start(arterial:inet_port()) -> {ok, pid()}.
+start(Port) ->
+  Parent = self(),
+  Pid = spawn_link(fun() -> init(Parent, Port) end),
+  receive
+    {Pid, ready, _ListenPort} -> {ok, Pid}
+  after 5000 ->
+    error(tcp_server_start_timeout)
+  end.
+
+-doc "Return the port `Srv` is actually listening on.".
+-spec port(pid()) -> arterial:inet_port().
+port(Srv) ->
+  Srv ! {self(), get_port},
+  receive {Srv, port, Port} -> Port end.
+
+-doc "Stop the server and close every connection it accepted.".
+-spec stop(pid()) -> ok.
+stop(Srv) ->
+  Srv ! {self(), stop},
+  receive {Srv, stopped} -> ok end.
+
+init(Parent, Port) ->
+  {ok, LSock} = socket:open(inet, stream, tcp),
+  ok = socket:setopt(LSock, socket, reuseaddr, true),
+  ok = socket:bind(LSock, #{family => inet, addr => {127,0,0,1}, port => Port}),
+  ok = socket:listen(LSock),
+  {ok, #{port := ListenPort}} = socket:sockname(LSock),
+  Parent ! {self(), ready, ListenPort},
+  accept_loop(LSock, ListenPort, []).
+
+accept_loop(LSock, ListenPort, Conns) ->
+  Self = self(),
+  AcceptorPid = spawn(fun() ->
+    case socket:accept(LSock) of
+      {ok, ASock} ->
+        %% `socket' ties a socket's lifetime to its owning process: the
+        %% process that calls accept/1 becomes ASock's owner, so it must
+        %% hand ownership to the long-lived connection process *before*
+        %% this one-shot acceptor exits, or ASock gets closed right away.
+        ConnPid = spawn(fun() -> conn_recv_loop(ASock, <<>>) end),
+        ok = socket:setopt(ASock, otp, controlling_process, ConnPid),
+        Self ! {self(), accepted, ConnPid};
+      {error, _} -> ok
+    end
+  end),
+  loop(LSock, ListenPort, AcceptorPid, Conns).
+
+loop(LSock, ListenPort, AcceptorPid, Conns) ->
+  receive
+    {AcceptorPid, accepted, ConnPid} ->
+      accept_loop(LSock, ListenPort, [ConnPid | Conns]);
+    {From, get_port} ->
+      From ! {self(), port, ListenPort},
+      loop(LSock, ListenPort, AcceptorPid, Conns);
+    {From, stop} ->
+      socket:close(LSock),
+      lists:foreach(fun(C) -> exit(C, kill) end, Conns),
+      From ! {self(), stopped}
+  end.
+
+conn_recv_loop(Sock, Buf) ->
+  case socket:recv(Sock, 0, infinity) of
+    {ok, Data} ->
+      Buf1 = handle_frames(Sock, <<Buf/binary, Data/binary>>),
+      conn_recv_loop(Sock, Buf1);
+    {error, _} ->
+      socket:close(Sock)
+  end.
+
+handle_frames(Sock, Buf) ->
+  case test_echo_protocol:unframe(Buf) of
+    {ok, ReqID, Payload, Rest} ->
+      spawn(fun() -> respond(Sock, ReqID, binary_to_term(Payload)) end),
+      handle_frames(Sock, Rest);
+    more ->
+      Buf
+  end.
+
+respond(Sock, ReqID, {echo, Term}) ->
+  reply(Sock, ReqID, Term);
+respond(Sock, ReqID, {upcase, Bin}) when is_binary(Bin) ->
+  reply(Sock, ReqID, string:uppercase(Bin));
+respond(Sock, ReqID, {delay, Ms, Term}) ->
+  timer:sleep(Ms),
+  reply(Sock, ReqID, Term);
+respond(Sock, ReqID, _Other) ->
+  reply(Sock, ReqID, {error, unknown_request}).
+
+reply(Sock, ReqID, Term) ->
+  Data = test_echo_protocol:frame(ReqID, term_to_binary(Term)),
+  socket:send(Sock, Data).

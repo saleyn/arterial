@@ -42,13 +42,13 @@ namespace arterial {
 // SOURCE:
 // https://github.com/saleyn/utxx/blob/master/include/utxx/time_val.hpp
 struct nsecs {
-  constexpr explicit nsecs(long   ns) : m_nsec(int64_t(ns))                  {}
-  constexpr explicit nsecs(long long ns) : m_nsec(int64_t(ns))               {}
-  constexpr explicit nsecs(size_t ns) : m_nsec(int64_t(ns))                 {}
-  constexpr nsecs(long s,  long   ns) : m_nsec(int64_t(s)*1000000000LL+int64_t(ns))    {}
-  constexpr int64_t   value()      const { return m_nsec; }
-  constexpr int64_t   nsec()       const { return m_nsec; }
-  constexpr int64_t   nanoseconds() const { return m_nsec; }
+  constexpr explicit nsecs(long   ns) : m_nsec(int64_t(ns))    {}
+  constexpr explicit nsecs(long long ns) : m_nsec(int64_t(ns)) {}
+  constexpr explicit nsecs(size_t ns) : m_nsec(int64_t(ns))    {}
+  constexpr nsecs(long s,  long   ns) : m_nsec(int64_t(s)*1000000000LL+int64_t(ns)) {}
+  constexpr int64_t   value()           const { return m_nsec;  }
+  constexpr int64_t   nsec()            const { return m_nsec;  }
+  constexpr int64_t   nanoseconds()     const { return m_nsec;  }
 private:
   int64_t m_nsec;
 };

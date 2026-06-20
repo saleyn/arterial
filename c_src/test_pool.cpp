@@ -59,7 +59,7 @@ void test_lifo_pool(const char* exec) {
 
   ASSERT_EQUAL(0, pool.UnsafeSize());
 
-  for (int i=0; i < SIZE; ++i)
+  for (size_t i=0; i < SIZE; ++i)
     pool.CheckIn(*pool.Get(i));
 
   ASSERT_EQUAL(SIZE, pool.UnsafeSize());
@@ -105,7 +105,7 @@ void test_lifo_pool(const char* exec) {
   for (auto nd : holder) {
     auto p = pool.Find(nd->Value());
     ASSERT_EQUAL(true, p != nullptr);
-    ASSERT_EQUAL(count, p->Value()->value);
+    ASSERT_EQUAL(int(count), p->Value()->value);
     count--;
   }
 
@@ -114,7 +114,7 @@ void test_lifo_pool(const char* exec) {
 
     for (size_t i = 0; i < SIZE; ++i) {
     same_indexes.push_back(pool.CheckOut());
-    ASSERT_EQUAL(i+1, pool.Get(*same_indexes.back())->value);
+    ASSERT_EQUAL(int(i+1), pool.Get(*same_indexes.back())->value);
   }
 
   ASSERT_EQUAL(0, pool.UnsafeSize());
@@ -190,7 +190,7 @@ void test_fifo_pool(const char* exec) {
   for (auto nd : holder) {
     auto p = pool.Find(nd->Value());
     ASSERT_EQUAL(true, p != nullptr);
-    ASSERT_EQUAL((count++ % SIZE)+1, p->Value()->value);
+    ASSERT_EQUAL(int(count++ % SIZE)+1, p->Value()->value);
   }
 
   std::vector<PooledObject<ObjT>*> same_indexes;
@@ -201,7 +201,7 @@ void test_fifo_pool(const char* exec) {
     same_indexes.push_back(pool.CheckOut());
     if (debug)
       std::cout << "Object[" << pool.Get(*same_indexes.back())->value << "] (count=" << count << ")\n";
-    ASSERT_EQUAL((count++ % SIZE)+1, pool.Get(*same_indexes.back())->value);
+    ASSERT_EQUAL(int(count++ % SIZE)+1, pool.Get(*same_indexes.back())->value);
   }
 
   ASSERT_EQUAL(0, pool.UnsafeSize());

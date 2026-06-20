@@ -48,48 +48,46 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #include <cstdint>
 
 namespace arterial {
-  namespace {
-    template <typename T>
-    struct val_node {
-      val_node() {}
-      val_node(T&& v, uint64_t time) : value(v), time(time) {}
+  template <typename T>
+  struct val_node {
+    val_node() {}
+    val_node(T&& v, uint64_t time) : value(v), time(time) {}
 
-      T        value;
-      uint64_t time;      // Last maybe_add time
-    };
+    T        value;
+    uint64_t time;      // Last maybe_add time
+  };
 
-    template <class T>
-    struct val_assigner {
-      bool operator()(
-        [[maybe_unused]] val_node<T>& old,
-        [[maybe_unused]] const T&     new_val,
-        [[maybe_unused]] uint64_t     time
-      ) {
-        return false;
-      }
-    };
+  template <class T>
+  struct val_assigner {
+    bool operator()(
+      [[maybe_unused]] val_node<T>& old,
+      [[maybe_unused]] const T&     new_val,
+      [[maybe_unused]] uint64_t     time
+    ) {
+      return false;
+    }
+  };
 
-    struct erase_action {
-      template <class Map>
-      bool operator()(Map& m, typename Map::iterator const& it) {
-        m.erase(it);
-        return true;
-      }
-    };
+  struct erase_action {
+    template <class Map>
+    bool operator()(Map& m, typename Map::iterator const& it) {
+      m.erase(it);
+      return true;
+    }
+  };
 
-    struct reset_action {
-      template <class Map>
-      void operator()(Map&, typename Map::iterator const& it) {
-        it->second = typename Map::mapped_type();
-      }
-    };
-  }
+  struct reset_action {
+    template <class Map>
+    void operator()(Map&, typename Map::iterator const& it) {
+      it->second = typename Map::mapped_type();
+    }
+  };
 
   //---------------------------------------------------------------------------
   /// Unordered map with TTL for each key
-  /// @tparam K        key type
-  /// @tparam T        value type
-  /// @tparam Alloc    custom allocator
+  /// @tparam K     key type
+  /// @tparam T     value type
+  /// @tparam Alloc custom allocator
   ///
   /// Short vectors up to \a MaxItems don't involve memory allocations.
   /// Short vector can be set to have NULL value by using "set_null()" method.
@@ -102,7 +100,7 @@ namespace arterial {
     class KeyEqual  = std::equal_to<K>,
     class ValUpdate = val_assigner<T>,
     class ValDelete = erase_action,
-    class Alloc = std::allocator<std::pair<const K, val_node<T>>>
+    class Alloc     = std::allocator<std::pair<const K, val_node<T>>>
   >
   struct unordered_map_with_ttl {
     struct ttl_node {

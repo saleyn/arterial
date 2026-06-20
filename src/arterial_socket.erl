@@ -1,7 +1,33 @@
 -module(arterial_socket).
 
+-moduledoc """
+Thin wrapper around OTP's `socket` module: opens a `tcp` or `udp` socket,
+applies socket options, and exposes a uniform `connect/5`/`close/1` pair
+used by `arterial_connection`.
+
+This is the default low-level transport; an `arterial_protocol`
+implementation typically calls into this module (or replaces it) from its
+`connect/3` callback.
+""".
+
 -export([connect/5, close/1]).
 
+-doc """
+Open a `tcp` or `udp` socket to `IP`:`Port`, apply `Opts`
+(`arterial:socket_options()`), and return it. For `udp`, this binds a
+local socket on `Port` rather than connecting (UDP has no connection
+handshake); `IP` is ignored in that case.
+
+## Examples
+
+```
+1> arterial_socket:connect(tcp, {127,0,0,1}, 9000, [], 5000).
+{ok, Socket}
+```
+""".
+-spec connect(tcp | udp, inet:ip_address(), arterial:inet_port(),
+              arterial:socket_options(), timeout()) ->
+  {ok, arterial:socket()} | {error, term()}.
 connect(tcp, IP, Port, Opts, Timeout) ->
   case socket:open(inet, stream, tcp) of
     {ok, Sock} ->
@@ -50,5 +76,16 @@ apply_opts(Sock, Opts) ->
     end
   end, Opts).
 
+-doc """
+Close `Sock`, as returned by `connect/5`.
+
+## Examples
+
+```
+1> arterial_socket:close(Socket).
+ok
+```
+""".
+-spec close(arterial:socket()) -> ok.
 close(Sock) ->
   socket:close(Sock).
