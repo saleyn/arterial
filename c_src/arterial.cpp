@@ -1,40 +1,38 @@
 #include "arterial.hpp"
+#include "nifpp.h"
 #include <cassert>
+#include <iostream>
 
-use namespace nifpp;
+using namespace nifpp;
+using namespace arterial;
 
-static ERL_NIF_TERM create_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+namespace {
+
+ERL_NIF_TERM create_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
-  assert(argc == 2);
+  assert(argc == 5);
 
-  std::string       name;
-  std::vector<TERM> sockets;
+  unsigned int size;
+  unsigned int backlog;
+  bool         fifo;
+  ErlNifUInt64 fixed_ttl_us;
+  unsigned int max_waiters;
 
-  if (!get(env, argv[0], name) || !get(env, argv[1], sockets) || sockets.size() == 0) [[unlikely]]
+  if (!get(env, argv[0], size) || size == 0 ||
+      !get(env, argv[1], backlog) || backlog == 0 ||
+      backlog > std::numeric_limits<BaseReqID>::max() ||
+      !get(env, argv[2], fifo) ||
+      !enif_get_uint64(env, argv[3], &fixed_ttl_us) ||
+      !get(env, argv[4], max_waiters)) [[unlikely]]
     return enif_make_badarg(env);
 
-  std::vector<std::unique_ptr<Connection>> connections;
-  connections.reserve(sockets.size());
+  auto pool = construct_resource<ConnectionPool>(
+    size, BaseReqID(backlog), fifo, uint64_t(fixed_ttl_us), size_t(max_waiters));
 
-  for (auto s : sockets)
-    connections.emplace_back(new Connection(s));
-
-  resource_events<ConnectionPool> events(
-    [](Connection* conn, ErlNifEnv* env, ErlNifPid* pid, ErlNifMonitor* mon) {
-      conn->OnPidDown(env, pid, mon);
-    }
-  );
-  auto pool = construct_resource_with_events<ConnectionPool>(events, connections);
-
-  // The call above transfers the ownership of objects to the pool.
-  for (auto& c : connections) {
-    assert(!c);
-  }
-
-  return make(env, make_tuple(am_ok, pool));
+  return make(env, std::make_tuple(am_ok, pool));
 }
 
-static ERL_NIF_TERM destroy_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+ERL_NIF_TERM destroy_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
   assert(argc == 1);
 
@@ -42,28 +40,170 @@ static ERL_NIF_TERM destroy_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
   if (!get(env, argv[0], ptr)) [[unlikely]]
     return enif_make_badarg(env);
 
-
+  return make(env, am_ok);
 }
 
-static ERL_NIF_TERM make_available_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+ERL_NIF_TERM set_socket_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+  assert(argc == 3);
+
+  resource_ptr<ConnectionPool> ptr;
+  unsigned int                 id;
+
+  if (!get(env, argv[0], ptr) || !get(env, argv[1], id)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  return make(env, ptr->SetSocket(id, argv[2]));
+}
+
+ERL_NIF_TERM make_available_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
   assert(argc == 2);
 
   resource_ptr<ConnectionPool> ptr;
-  uint32_t                     idx;
+  unsigned int                 id;
 
-  if (!get(env, argv[0], ptr) || !get(env, argv[1], idx)) [[unlikely]]
+  if (!get(env, argv[0], ptr) || !get(env, argv[1], id)) [[unlikely]]
     return enif_make_badarg(env);
 
-  ptr->Get(idx)
-
+  return make(env, ptr->MakeAvailable(id));
 }
 
-static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
+ERL_NIF_TERM make_unavailable_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+  assert(argc == 2);
+
+  resource_ptr<ConnectionPool> ptr;
+  unsigned int                 id;
+
+  if (!get(env, argv[0], ptr) || !get(env, argv[1], id)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  return make(env, ptr->MakeUnavailable(id));
+}
+
+ERL_NIF_TERM checkout_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+  assert(argc == 2);
+
+  resource_ptr<ConnectionPool> ptr;
+  unsigned int                 samples;
+
+  if (!get(env, argv[0], ptr) || !get(env, argv[1], samples) || samples == 0) [[unlikely]]
+    return enif_make_badarg(env);
+
+  auto [conn, ids] = ptr->CheckOut(samples);
+
+  if (!conn)
+    return make(env, std::make_tuple(am_error, atom(env, "no_connection")));
+
+  std::vector<unsigned int> req_ids(ids.begin(), ids.end());
+
+  return make(env, std::make_tuple(am_ok,
+    std::make_tuple(conn->ID(), TERM(conn->Socket(env)), req_ids)));
+}
+
+ERL_NIF_TERM checkin_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+  assert(argc == 4);
+
+  resource_ptr<ConnectionPool> ptr;
+  unsigned int                 id;
+  std::vector<unsigned int>    req_ids;
+
+  if (!get(env, argv[0], ptr) || !get(env, argv[1], id) ||
+      !get(env, argv[2], req_ids)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  auto* conn = ptr->Get(id);
+  if (!conn) [[unlikely]]
+    return enif_make_badarg(env);
+
+  for (auto rid : req_ids) {
+    conn->Requests().CheckIn(ReqID(rid));
+    ptr->UntrackInflight(ReqID(rid));
+  }
+
+  ptr->CheckIn(id, env, argv[3]);
+
+  return make(env, am_ok);
+}
+
+ERL_NIF_TERM checkout_async_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+  assert(argc == 3);
+
+  resource_ptr<ConnectionPool> ptr;
+  ErlNifPid                    pid;
+  ErlNifUInt64                 ttl_us;
+
+  if (!get(env, argv[0], ptr) ||
+      !enif_get_local_pid(env, argv[1], &pid) ||
+      !enif_get_uint64(env, argv[2], &ttl_us)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  auto result = ptr->CheckOutAsync(pid, uint64_t(ttl_us), 1);
+
+  switch (result.status) {
+    case AsyncCheckoutStatus::Ok: {
+      std::vector<unsigned int> req_ids(result.ids.begin(), result.ids.end());
+      return make(env, std::make_tuple(am_ok,
+        std::make_tuple(result.conn->ID(), TERM(result.conn->Socket(env)), req_ids)));
+    }
+    case AsyncCheckoutStatus::Queued:
+      return make(env, std::make_tuple(atom(env, "queued"),
+        (ErlNifUInt64)result.waiter_id));
+    case AsyncCheckoutStatus::Rejected:
+    default:
+      return make(env, std::make_tuple(am_error, atom(env, "no_connection")));
+  }
+}
+
+ERL_NIF_TERM track_inflight_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+  assert(argc == 5);
+
+  resource_ptr<ConnectionPool> ptr;
+  unsigned int                 conn_id;
+  unsigned int                 req_id;
+  ErlNifPid                    pid;
+  ErlNifUInt64                 ttl_us;
+
+  if (!get(env, argv[0], ptr) || !get(env, argv[1], conn_id) ||
+      !get(env, argv[2], req_id) ||
+      !enif_get_local_pid(env, argv[3], &pid) ||
+      !enif_get_uint64(env, argv[4], &ttl_us)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  auto* conn = ptr->Get(conn_id);
+  if (!conn) [[unlikely]]
+    return enif_make_badarg(env);
+
+  ptr->TrackInflight(ReqID(req_id), pid, conn, uint64_t(ttl_us));
+
+  return make(env, am_ok);
+}
+
+ERL_NIF_TERM sweep_timeouts_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+  assert(argc == 2);
+
+  resource_ptr<ConnectionPool> ptr;
+
+  if (!get(env, argv[0], ptr)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  auto n = ptr->SweepTimeouts(env, argv[1]);
+
+  return make(env, std::make_tuple(am_ok, (unsigned long)n));
+}
+
+int load(ErlNifEnv* env, void**, ERL_NIF_TERM)
+{
   nifpp::initialize_known_atoms(env);
 
-  if (!register_resource<ConnectionPool>(env, "Elixir.Arterial.Pool")) {
-    std::cerr << "Cannot register resource Arterial.Pool ["
+  if (!register_resource<ConnectionPool>(env, "arterial_pool")) {
+    std::cerr << "Cannot register resource arterial_pool ["
               << __FILE__ << ":" << __LINE__ << "]\n";
     return 1;
   }
@@ -71,19 +211,26 @@ static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
   return 0;
 }
 
-static int upgrade(ErlNifEnv* env, void** priv_data, void** old_priv_data, ERL_NIF_TERM load_info) {
-  if (old_priv_data)
-    enif_release_resource(old_priv_data);
+int upgrade(ErlNifEnv*, void**, void** old_priv_data, ERL_NIF_TERM)
+{
+  if (old_priv_data && *old_priv_data)
+    enif_release_resource(*old_priv_data);
+  return 0;
 }
 
-static ErlNifFunc nif_funcs[] = {
-  {"create_nif",       2, create_nif},
-  {"destroy_nif",      1, destroy_nif},
-  {"checkout_nif",     1, checkout_nif},
-  {"checkin_nif",      2, checkin_nif},
-  {"make_available",   2, make_available_nif},
-  {"make_unavailable", 2, make_unavailable_nif},
+ErlNifFunc nif_funcs[] = {
+  {"create_pool",          5, create_nif,           0},
+  {"destroy_pool",         1, destroy_nif,          0},
+  {"set_socket_nif",       3, set_socket_nif,       0},
+  {"make_available_nif",   2, make_available_nif,   0},
+  {"make_unavailable_nif", 2, make_unavailable_nif, 0},
+  {"checkout_nif",         2, checkout_nif,         0},
+  {"checkin_nif",          4, checkin_nif,          0},
+  {"checkout_async_nif",   3, checkout_async_nif,   0},
+  {"track_inflight_nif",   5, track_inflight_nif,   0},
+  {"sweep_timeouts_nif",   2, sweep_timeouts_nif,   0},
 };
 
-ERL_NIF_INIT(Elixir.Arterial.Pool, nif_funcs, load, nullptr, upgrade, nullptr);
+} // namespace
 
+ERL_NIF_INIT(arterial_nif, nif_funcs, load, nullptr, upgrade, nullptr)

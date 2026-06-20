@@ -2,8 +2,8 @@
 -export([random_element/1, calc_timeout/1, calc_expiration/2]).
 
 %% @doc Return a random element from the list
-random_element(L) when is_list(L) ->
-  lists:nth(rand:uniform(length(L), L)).
+random_element(L) when is_list(L), L =/= [] ->
+  lists:nth(rand:uniform(length(L)), L).
 
 %% @doc Calculate a timeout from now to Expiration
 -spec calc_timeout(non_neg_integer() | infinity) -> infinity | non_neg_integer().

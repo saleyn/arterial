@@ -24,7 +24,17 @@
 #pragma once
 
 #include <cstdint>
+#include <cassert>
+#include <algorithm>
+#include <limits>
 #include <time.h>
+
+#ifndef LIKELY
+#define LIKELY(Cond)   __builtin_expect(!!(Cond), 1)
+#endif
+#ifndef UNLIKELY
+#define UNLIKELY(Cond) __builtin_expect(!!(Cond), 0)
+#endif
 
 namespace arterial {
 
@@ -35,8 +45,9 @@ struct nsecs {
   constexpr explicit nsecs(long   ns) : m_nsec(ns)                  {}
   constexpr explicit nsecs(size_t ns) : m_nsec(long(ns))            {}
   constexpr nsecs(long s,  long   ns) : m_nsec(s*1000000000L+ns)    {}
-  constexpr long     value() const { return m_nsec; }
-  constexpr long     nsec()  const { return m_nsec; }
+  constexpr long     value()      const { return m_nsec; }
+  constexpr long     nsec()       const { return m_nsec; }
+  constexpr long     nanoseconds() const { return m_nsec; }
 private:
   long m_nsec;
 };
@@ -50,14 +61,11 @@ struct time_val {
 
   constexpr
   time_val() noexcept         : m_tv(0)                  {}
-  time_val(secs   s)          : m_tv(s.nsec())           {}
-  time_val(msecs ms)          : m_tv(ms.nsec())          {}
-  time_val(usecs us)          : m_tv(us.nsec())          {}
+  constexpr
   time_val(nsecs ns)          : m_tv(ns.nsec())          {}
   time_val(long s, long us)   : m_tv(s*N10e9 + us*1000)  {}
   time_val(time_val tv, long s)          : m_tv(tv.m_tv + s*N10e9)           {}
   time_val(time_val tv, long s, long us) : m_tv(tv.m_tv + s*N10e9 + us*1000) {}
-  time_val(time_val tv, double interval) { set(tv, interval); }
 
   explicit time_val(const struct timeval&  a) : m_tv(long(a.tv_sec)*N10e9 + long(a.tv_usec)*1000){}
   explicit time_val(const struct timespec& a) : m_tv(long(a.tv_sec)*N10e9 + a.tv_nsec){}
@@ -68,27 +76,13 @@ struct time_val {
   long     milliseconds()            const { return m_tv / N10e6; }
   long     nanoseconds()             const { return m_tv; }
 
-
   time_val& add_nsec(long ns)         { m_tv += ns;        return *this; }
-  time_val  add_nsec(long ns)   const { return time_val(m_tv + ns);      }
+  time_val  add_nsec(long ns)   const { return time_val(nsecs(m_tv + ns)); }
 
+  time_val  operator+(nsecs ns)     const { return time_val(nsecs(m_tv + ns.nsec())); }
+  nsecs     operator-(time_val rhs) const { return nsecs(m_tv - rhs.m_tv); }
 
   void now() { m_tv = universal_time().m_tv; }
-
-  time_val now(long add_s) const {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += add_s;
-    return time_val(ts);
-  }
-
-  time_val now(long add_s, long add_us) const {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec  += add_s;
-    ts.tv_nsec += add_us*1000;
-    return time_val(ts);
-  }
 
   static time_val universal_time() {
     struct timespec ts;
@@ -163,8 +157,9 @@ public:
   time_val next_time()   const { return m_next_time;           }
 
   /// Return the number of available samples given \a a_now current time.
+  /// A rate of 0 means "unthrottled", so the max value of T is returned.
   T        available(time_val a_now = now_utc()) const {
-    return UNLIKELY(m_rate == 0) ? m_window_ns : calc_available(a_now);
+    return UNLIKELY(m_rate == 0) ? std::numeric_limits<T>::max() : calc_available(a_now);
   }
 
   /// Return the number of used samples given \a a_now current time.

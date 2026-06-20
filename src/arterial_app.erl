@@ -29,15 +29,15 @@ stop(_State) ->
   ok.
 
 %% supervisor callbacks
--spec init(atom()) -> {ok, {{one_for_one, 5, 10}, [supervisor:child_spec()]}}.
+-spec init(term()) -> {ok, {{simple_one_for_one, non_neg_integer(), non_neg_integer()}, [map()]}}.
 init([]) ->
   {ok, {{simple_one_for_one, 5, 10}, [
     #{
-      id       => undefined,                               % Id       = internal id
-      start    => {arterial_pool, start_link, []},         % StartFun = {M, F, A}
-      restart  => permanent,                               % Restart  = permanent | transient | temporary
-      shutdown => 5000,                                    % Shutdown = brutal_kill | int() >= 0 | infinity
-      type     => supervisor,                              % Type     = worker | supervisor
-      modules  => []                                       % Modules  = [Module] | dynamic
+      id       => undefined,                       % Id       = internal id
+      start    => {arterial_pool, start_link, []}, % StartFun = {M, F, A}
+      restart  => permanent,                       % Restart  = permanent | transient | temporary
+      shutdown => infinity,                        % Shutdown = brutal_kill | int() >= 0 | infinity
+      type     => supervisor,                      % Type     = worker | supervisor
+      modules  => [arterial_pool]                  % Modules  = [Module] | dynamic
     }
   ]}}.

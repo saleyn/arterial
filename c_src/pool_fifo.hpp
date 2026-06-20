@@ -65,8 +65,8 @@ struct BaseObjectPoolFIFO : public BaseObjectPoolLIFO<NodeT> {
   template<typename InitFun>
   BaseObjectPoolFIFO(size_t size, InitFun const& init) : BaseT(size, init) { Init(); }
 
-  template <IsObjOrUniqPtr<ObjT> T>
-  BaseObjectPoolFIFO(std::vector<T> const& objects) : BaseT(objects) { Init(); }
+  template <typename U> requires IsObjOrUniqPtr<U, T>
+  BaseObjectPoolFIFO(std::vector<U>& objects) : BaseT(objects) { Init(); }
 
   ~BaseObjectPoolFIFO() {}
 
@@ -93,7 +93,7 @@ struct BaseObjectPoolFIFO : public BaseObjectPoolLIFO<NodeT> {
   /// the pool.
   ///
   /// @return true if the node was already unavailable
-  bool MakeUnavailable(NodeT& node) { return node->Available(false); }
+  bool MakeUnavailable(NodeT& node) { return node.Available(false); }
 
 
   /// Returns true if the queue is empty.
@@ -273,10 +273,7 @@ bool BaseObjectPoolFIFO<NodeT>::MakeUnavailable(T* obj)
 template<DerivedFromPooledObject NodeT>
 bool BaseObjectPoolFIFO<NodeT>::Empty() const
 {
-  auto   head = m_head.load(std::memory_order_relaxed);
-  if   (!head)  return true;
-  auto&  next = this->m_nodes[head.Index()].Next();
-  return next.load(std::memory_order_relaxed).Invalid();
+  return m_head.load(std::memory_order_relaxed).Invalid();
 }
 
 template<DerivedFromPooledObject NodeT>
