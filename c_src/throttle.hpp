@@ -42,14 +42,15 @@ namespace arterial {
 // SOURCE:
 // https://github.com/saleyn/utxx/blob/master/include/utxx/time_val.hpp
 struct nsecs {
-  constexpr explicit nsecs(long   ns) : m_nsec(ns)                  {}
-  constexpr explicit nsecs(size_t ns) : m_nsec(long(ns))            {}
-  constexpr nsecs(long s,  long   ns) : m_nsec(s*1000000000L+ns)    {}
-  constexpr long     value()      const { return m_nsec; }
-  constexpr long     nsec()       const { return m_nsec; }
-  constexpr long     nanoseconds() const { return m_nsec; }
+  constexpr explicit nsecs(long   ns) : m_nsec(int64_t(ns))                  {}
+  constexpr explicit nsecs(long long ns) : m_nsec(int64_t(ns))               {}
+  constexpr explicit nsecs(size_t ns) : m_nsec(int64_t(ns))                 {}
+  constexpr nsecs(long s,  long   ns) : m_nsec(int64_t(s)*1000000000LL+int64_t(ns))    {}
+  constexpr int64_t   value()      const { return m_nsec; }
+  constexpr int64_t   nsec()       const { return m_nsec; }
+  constexpr int64_t   nanoseconds() const { return m_nsec; }
 private:
-  long m_nsec;
+  int64_t m_nsec;
 };
 
 // Representation of time.
@@ -77,7 +78,7 @@ struct time_val {
   long     nanoseconds()             const { return m_tv; }
 
   time_val& add_nsec(long ns)         { m_tv += ns;        return *this; }
-  time_val  add_nsec(long ns)   const { return time_val(nsecs(m_tv + ns)); }
+  time_val  add_nsec(long ns)   const { return time_val(nsecs(static_cast<long>(m_tv + ns))); }
 
   time_val  operator+(nsecs ns)     const { return time_val(nsecs(m_tv + ns.nsec())); }
   nsecs     operator-(time_val rhs) const { return nsecs(m_tv - rhs.m_tv); }
