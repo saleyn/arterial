@@ -9,7 +9,7 @@ using namespace arterial;
   if ((a)!=(b)) { \
     std::cerr << #a  << " != " << #b  << " ||| " \
               << (a) << " != " << (b) << " ["    \
-              << std::filesystem::path(__FILE__).stem().c_str() \
+              << std::filesystem::path(__FILE__).stem().string().c_str() \
               << ": " << __LINE__ << "]\n"; \
     exit(1); \
   } \
@@ -22,7 +22,7 @@ struct ObjT {
 };
 
 #define OUTPUT(Exec, Str) \
-  std::cout << "==> " << std::filesystem::path(Exec).stem().c_str() \
+  std::cout << "==> " << std::filesystem::path(Exec).stem().string().c_str() \
                       << ":" << __LINE__ << ": " << (Str) << "\n"
 
 constexpr const size_t SIZE = 5;
