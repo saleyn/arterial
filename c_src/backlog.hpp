@@ -1,11 +1,13 @@
 #pragma once
 
-#include <forward_list>
 #include <vector>
 #include <set>
+#include <atomic>
 #include <cstdint>
 #include <limits>
-#include "nifpp.h"
+#include <cassert>
+#include <erl_nif.h>
+#include "throttle.hpp"
 
 namespace arterial {
 
@@ -15,268 +17,213 @@ using ReqID        = uint32_t;  // Request ID for sending over the wire
 //-----------------------------------------------------------------------------
 /// @brief Information about a request sent over the current connection
 //-----------------------------------------------------------------------------
-class RequestInfo {
+struct RequestInfo {
   static constexpr const uint32_t s_bitsize = sizeof(BaseReqID)*8;
-  static constexpr const uint32_t s_lo_mask = (1 << s_bitsize)-1;
-  static constexpr const uint32_t s_hi_mask = s_lo_mask << s_bitsize;
-public:
+  static constexpr const uint32_t s_lo_mask = (1u << s_bitsize)-1;
+  static constexpr const uint32_t s_hi_mask = ~s_lo_mask;
 
-  BaseReqID req_id;             // Internal request ID
-  ReqID     ext_req_id;         // External last assigned semi-unique request ID 
-  uint64_t  ts_create;
-  uint64_t  ts_expire;
-  ErlNifPid pid;
+  BaseReqID req_id     = 0;     // Internal request ID
+  ReqID     ext_req_id = 0;     // External last assigned semi-unique request ID
+  uint64_t  ts_create  = 0;
+  uint64_t  ts_expire  = 0;
+  ErlNifPid pid{};
 
-  template <typename VsnCount>
-  void Update(time_val now, uint32_t ttl_us, VsnCount& vsn)
+  /// @brief Refresh this request's metadata when it's checked out for use.
+  void Update(uint64_t now_us, uint32_t ttl_us, std::atomic<uint32_t>& vsn)
   {
-    ext_req_id = ReqID((++vsn) << s_bitsize) & s_hi_mask | (req_id & s_lo_mask);
-    ts_create  = now.microseconds();
-    ts_expire  = ts_create + ttl_us;
+    ext_req_id = (ReqID(++vsn) << s_bitsize & s_hi_mask) | (req_id & s_lo_mask);
+    ts_create  = now_us;
+    ts_expire  = now_us + ttl_us;
   }
 
-  static BaseReqID DecodeReqID(ReqID id) { return id & s_lo_mask; }
+  static BaseReqID DecodeReqID(ReqID id) { return BaseReqID(id & s_lo_mask); }
 };
 
 //-----------------------------------------------------------------------------
 // Forward declarations
 //-----------------------------------------------------------------------------
-template <class T, bool Init>
-struct BaseCircularBuffer;
-
 struct AbstractBackLog;
 struct FIFOBackLog;
 struct RandomAccessBackLog;
+
+//-----------------------------------------------------------------------------
+/// @brief BackLog maintains a backlog of used requests.
+///
+/// Concrete subclasses determine whether requests are checked back in FIFO
+/// order (when the wire protocol carries no request ID) or by request ID
+/// (when the wire protocol echoes the ID, so replies may be out of order).
+//-----------------------------------------------------------------------------
+struct AbstractBackLog {
+  using Req = RequestInfo;
+
+  explicit AbstractBackLog(size_t capacity)
+  : m_buffer(capacity)
+  {
+    assert(capacity <= std::numeric_limits<BaseReqID>::max());
+    for (size_t i = 0; i < capacity; ++i)
+      m_buffer[i].req_id = BaseReqID(i);
+  }
+
+  virtual ~AbstractBackLog() = default;
+
+  /// @brief Factory method used to create a FIFO/RandomAccess backlog
+  static AbstractBackLog* Create(size_t capacity, bool fifo);
+
+  /// @brief Checkout the next available request from the backlog to be sent
+  /// to a server for processing.
+  /// When a reply is received, use CheckIn() to add it back to the backlog.
+  /// @return nullptr if the backlog is empty/full
+  virtual Req* CheckOut(uint64_t now_us, uint32_t ttl_us, std::atomic<uint32_t>& vsn) = 0;
+
+  /// @brief Check a previously checked-out request back into the backlog.
+  /// @return nullptr if unsuccessful
+  virtual Req* CheckIn(ReqID ext_req_id) = 0;
+
+  /// @brief Reserve `n` request slots without sending anything yet.
+  /// @return {true, ids} if `n` slots were available and reserved (checked
+  /// out); otherwise {false, {}} and no slots are reserved. Each id is the
+  /// request's wire-level ext_req_id (not its internal slot index), since
+  /// that's what's needed both on the wire and to key a timeout registry
+  /// across slot reuse.
+  std::pair<bool, std::vector<ReqID>>
+  UnsafeReserve(size_t n, uint64_t now_us = 0, uint32_t ttl_us = 0)
+  {
+    std::vector<ReqID> ids;
+    ids.reserve(n);
+
+    while (ids.size() < n) {
+      auto req = CheckOut(now_us, ttl_us, m_vsn);
+      if (!req) break;
+      ids.push_back(req->ext_req_id);
+    }
+
+    if (ids.size() == n)
+      return std::make_pair(true, std::move(ids));
+
+    // Not enough free slots: roll back what we reserved.
+    for (auto id : ids)
+      CheckIn(id);
+
+    return std::make_pair(false, std::vector<ReqID>());
+  }
+
+  virtual bool   Full()     const = 0;
+  virtual bool   Empty()    const = 0;
+  size_t         Capacity() const { return m_buffer.size(); }
+
+protected:
+  std::vector<Req>      m_buffer;
+  std::atomic<uint32_t> m_vsn{0};
+};
 
 //-----------------------------------------------------------------------------
 /// @brief BackLog maintains a backlog of used requests in FIFO order.
 ///
 /// It should be used in cases when the wire-level protocol doesn't support
 /// passing a request ID in a request/reply, and the request/reply order is
-/// strictly FIFO. 
+/// strictly FIFO.
 //-----------------------------------------------------------------------------
-struct FIFOBackLog : protected AbstractBackLog
+struct FIFOBackLog : AbstractBackLog
 {
-  using BaseT = AbstractBackLog;
-
   explicit FIFOBackLog(size_t capacity)
   : AbstractBackLog(capacity)
   {}
 
   /// @brief Checkout the next available request from the tail of the backlog
   /// FIFO queue to be sent to a server for processing.
-  /// When a reply is received, use CheckIn() function to added it back to the
-  /// backlog.
   /// @return nullptr if the backlog is full
-  Req* CheckOut(time_val now, uint32_t ttl_us, uint32_t& vsn) override
+  Req* CheckOut(uint64_t now_us, uint32_t ttl_us, std::atomic<uint32_t>& vsn) override
   {
-    if (IsFull()) return nullptr;
-    auto fun = [now, ttl_us, &vsn](Req& req) { req.Update(now, ttl_us, vsn); };
-    return BaseT::Enqueue(fun);
+    if (Full()) return nullptr;
+
+    auto& req = m_buffer[m_tail];
+    req.Update(now_us, ttl_us, vsn);
+    m_tail = (m_tail + 1) % m_buffer.size();
+    ++m_size;
+    return &req;
   }
 
   /// @brief Pop the head item from the backlog.
-  /// NOTE: The FIFO backlog is used when the wire protocol doesn't support 
-  /// passing request IDs to the server and back. It's expected that the replies
-  /// to requests are in the FIFO order, so we don't need to check the ReqID,
-  /// because the client doesn't know it, and it's inferred from the backlog's
-  /// queue.  
+  /// NOTE: the FIFO backlog is used when the wire protocol doesn't support
+  /// passing request IDs to the server and back, so the reply is assumed to
+  /// correspond to the oldest outstanding request.
   /// @return nullptr if the queue is empty
-  Req* CheckIn(ReqID) override { return this->Dequeue(); }
+  Req* CheckIn(ReqID) override
+  {
+    if (Empty()) return nullptr;
 
-  bool Full()  const override { return IsFull();  }
-  bool Empty() const override { return BaseT::Empty(); }
+    auto& req = m_buffer[m_head];
+    m_head = (m_head + 1) % m_buffer.size();
+    --m_size;
+    return &req;
+  }
+
+  bool Full()  const override { return m_size == m_buffer.size(); }
+  bool Empty() const override { return m_size == 0; }
 
 private:
-  bool IsFull()  const override { return BaseT::Full();  }
+  size_t m_head = 0;
+  size_t m_tail = 0;
+  size_t m_size = 0;
 };
 
 //-----------------------------------------------------------------------------
 /// @brief BackLog maintains a backlog of used requests in random order.
 ///
-/// It should be used in cases when the wire-level protocol supports
-/// passing a request ID in a request/reply, so the replies don't follow the
+/// It should be used in cases when the wire-level protocol supports passing
+/// a request ID in a request/reply, so replies don't need to follow the
 /// FIFO order of requests.
 //-----------------------------------------------------------------------------
-struct RandomAccessBackLog : protected AbstractBackLog
+struct RandomAccessBackLog : AbstractBackLog
 {
-  explicit RandomAccessBackLog(size_t capacity) : AbstractBackLog(capacity) {}
-
-  /// @brief Checkout the next available request from the backlog's capacity
-  /// to be sent to a server for processing.
-  /// When a reply is received, use CheckIn() function to added it back to the
-  /// backlog.
-  /// @return nullptr if the backlog is full
-  Req* CheckOut(time_val now, uint32_t ttl_us, uint32_t& vsn) override
+  explicit RandomAccessBackLog(size_t capacity) : AbstractBackLog(capacity)
   {
-    if (Empty()) return nullptr;
-    
+    for (size_t i = 0; i < capacity; ++i)
+      m_available.insert(BaseReqID(i));
+  }
+
+  /// @brief Checkout the next available request slot to be sent to a server
+  /// for processing.
+  /// @return nullptr if the backlog is full
+  Req* CheckOut(uint64_t now_us, uint32_t ttl_us, std::atomic<uint32_t>& vsn) override
+  {
+    if (Full()) return nullptr;
+
     auto idx = *m_available.begin();
     m_available.erase(m_available.begin());
 
-    auto res = &this->m_buffer[idx];
-    res->Update(now, ttl_us, vsn);
-    return res;
+    auto& req = m_buffer[idx];
+    req.Update(now_us, ttl_us, vsn);
+    return &req;
   }
 
-  /// @brief Pop the head item from the backlog
-  /// @return nullptr if the queue is empty
+  /// @brief Check a previously checked-out request back into the backlog,
+  /// resolved by its externally-visible (wire) request ID.
+  /// @return nullptr if unsuccessful (unknown/double check-in)
   Req* CheckIn(ReqID ext_req_id) override
   {
     auto req_id = RequestInfo::DecodeReqID(ext_req_id);
-    if (req_id >= this->Capacity()) [[unlikely]]
+    if (req_id >= Capacity()) [[unlikely]]
       return nullptr;
 
-    m_available.insert(req_id);
+    auto [_, inserted] = m_available.insert(req_id);
+    if (!inserted) [[unlikely]]
+      return nullptr; // double check-in
 
-    return &this->m_buffer[req_id];
+    return &m_buffer[req_id];
   }
 
   bool Full()  const override { return m_available.empty(); }
-  bool Empty() const override { return m_available.size() == BaseT::Size(); }
+  bool Empty() const override { return m_available.size() == Capacity(); }
+
 private:
   std::set<BaseReqID> m_available;
 };
 
-//-----------------------------------------------------------------------------
-/// @brief BackLog maintains a backlog of used requests in FIFO order 
-//-----------------------------------------------------------------------------
-struct AbstractBackLog : protected BaseCircularBuffer<RequestInfo, false>
+inline AbstractBackLog* AbstractBackLog::Create(size_t capacity, bool fifo)
 {
-  using BaseT   = BaseCircularBuffer<RequestInfo, false>;
-  using Req     = RequestInfo;
-  using InitFun = void (*)(ReqID i, Req& req);
-
-  /// @brief Factory method used to create a FIFO/RandomAccess backlog
-  static AbstractBackLog* Create(size_t capacity, bool fifo)
-  {
-    return fifo
-         ? dynamic_cast<AbstractBackLog*>(new FIFOBackLog(capacity))
-         : dynamic_cast<AbstractBackLog*>(new RandomAccessBackLog(capacity));
-  }
-protected:
-  explicit AbstractBackLog(size_t capacity)
-  : BaseT(capacity, [](size_t i, Req& item) { item = Req(); item.req_id = i; })
-  {
-    assert(capacity <= std::numeric_limits<BaseReqID>::max());
-  }
-
-  /// @brief Checkout the next available request from the backlog to be sent
-  /// to a server for processing.
-  /// When reply is received, use CheckIn() function to added it back to the
-  /// backlog. 
-  /// @return nullptr if the backlog is empty
-  virtual Req* CheckOut(time_val now, uint32_t ttl_us, uint32_t& vsn) = 0;
-
-  /// @brief CheckIn a previously checked out request back to the pool.
-  /// @return nullptr if unsuccessful
-  virtual Req* CheckIn(ReqID ext_req_id) = 0;
-
-  Req&       operator[](size_t i)       { assert(i < m_buffer.size()); return m_requests[i]; }
-  const Req& operator[](size_t i) const { assert(i < m_buffer.size()); return m_requests[i]; }
-
-  virtual bool Full()  const = 0;
-  virtual bool Empty() const = 0;
-};
-
-//-----------------------------------------------------------------------------
-// CircularBuffer
-//-----------------------------------------------------------------------------
-template <class T, bool Init = false>
-struct BaseCircularBuffer
-{
-  explicit BaseCircularBuffer(size_t capacity) : m_buffer(capacity) {}
-
-  template <typename InitFun>
-  explicit BaseCircularBuffer(size_t capacity, InitFun init)
-  {
-    resize(capacity, init);
-  }
-
-  /// @brief Return true if this circular buffer is empty
-  bool   Empty() const { return m_head == m_tail; }
-
-  /// @brief Return true if this circular buffer is full
-  bool   Full()  const { return m_head == (m_tail + 1) % m_buffer.size(); }
-
-  /// @brief Return the remaining capacity of the buffer
-  size_t Capacity() const { return m_buffer.size() - size(); }
-
-  /// @brief Return the size of this circular buffer
-  size_t Size()  const {
-    auto   tail = m_tail >= m_head ? m_tail : m_buffer.size() - m_tail;
-    return tail - m_head;
-  }
-
-  /// @brief Remove all items from the buffer and set its size to 0
-  void Clear()
-  {
-    m_head = m_tail = 0;
-    if (Init)
-      for (auto& item : m_buffer)
-        item = T();
-  }
-
-  /// @brief Resize the buffer to the given capacity, and initialize items
-  ///        using given `init` initialization lambda.
-  /// @param capacity  new buffer capacity 
-  /// @param init      the lambda initializer `(size_t i, T& item) -> void`
-  template <typename InitFun>
-  void Resize(size_t capacity, InitFun init)
-  {
-    m_buffer.resize(capacity);
-    m_buffer.shrink_to_fit();
-    if (init)
-      for (auto i = 0u; i < m_buffer.size(); ++i)
-        init(i, std::ref(m_buffer[i]));
-    else if (Init)
-      for (auto i = 0u; i < m_buffer.size(); ++i)
-        m_buffer[i] = T();
-      
-    m_head = m_tail = 0;
-  }
-
-protected:
-  /// @brief Add an item to the circular buffer
-  template <typename Fun>
-  Req* Enqueue(Fun const& fun)
-  {
-    if (Full()) [[unlikely]]
-      return false;
-
-    auto& req = m_buffer[m_tail];
-    fun(req);  // insert item at back of buffer
-    m_tail = ++m_tail % m_buffer.size(); // increment tail
-    return &req;
-  }
-
-  /// @brief Remove the head item from this buffer and return it.
-  /// @return nullptr if the queue is empty, otherwise the head item.
-  T* Dequeue()
-  {
-    if (Empty())
-      return nullptr;
-
-    auto p = &m_buffer[m_head];
-    if (Init)
-      m_buffer[m_head] = T();            // set item at head to be empty
-    m_head = ++m_head % m_buffer.size(); // move head foward
-
-    return p;
-  }
-
-  /// @brief Return the front item (only valid if buffer is not empty)
-  const T& Front() const { return m_buffer[m_head]; }
-  T&       Front()       { return m_buffer[m_head]; }
-  /// @brief Return the back item (only valid if buffer is not empty)
-  const T& Back()  const { return m_buffer[(m_tail ? m_tail : m_buffer.size())-1]; }
-  T&       Back()        { return m_buffer[(m_tail ? m_tail : m_buffer.size())-1]; }
-
-protected:
-  std::vector<T> m_buffer;
-  size_t m_head = 0;
-  size_t m_tail = 0;
-  size_t m_capacity;
-};
+  return fifo ? static_cast<AbstractBackLog*>(new FIFOBackLog(capacity))
+              : static_cast<AbstractBackLog*>(new RandomAccessBackLog(capacity));
+}
 
 } // namespace arterial

@@ -45,6 +45,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #include <unordered_map>
 #include <list>
 #include <cassert>
+#include <cstdint>
 
 namespace arterial {
   namespace {
@@ -78,8 +79,8 @@ namespace arterial {
 
     struct reset_action {
       template <class Map>
-      void operator()(Map& m, typename Map::iterator const& it) {
-        it->second = (typename Map::value_type)();
+      void operator()(Map&, typename Map::iterator const& it) {
+        it->second = typename Map::mapped_type();
       }
     };
   }
@@ -101,7 +102,7 @@ namespace arterial {
     class KeyEqual  = std::equal_to<K>,
     class ValUpdate = val_assigner<T>,
     class ValDelete = erase_action,
-    class Alloc = std::allocator<std::pair<const K, T>>
+    class Alloc = std::allocator<std::pair<const K, val_node<T>>>
   >
   struct unordered_map_with_ttl {
     struct ttl_node {
@@ -143,9 +144,18 @@ namespace arterial {
     , m_eraser(eraser)
     {}
 
-    /// @brief Try to add a given key/value to the map.
+    /// @brief Try to add a given key/value to the map, expiring it at the
+    /// map's fixed `now + ttl`.
     /// @return true if the value was added
     bool try_add(const K& key, T&& value, uint64_t now);
+
+    /// @brief Try to add a given key/value to the map with an explicit
+    /// absolute expiration time, independent of the map's fixed ttl. Use
+    /// this when different entries need different lifetimes (the eviction
+    /// list is kept sorted by `expire_at`, so refresh() stays correct
+    /// regardless of insertion order).
+    /// @return true if the value was added
+    bool try_add_with_ttl(const K& key, T&& value, uint64_t expire_at);
 
     size_t size() const { return m_map.size(); }
 
@@ -160,7 +170,18 @@ namespace arterial {
     /// @brief Erase the given key from the map
     /// @return true when the key was evicted
     template <typename Key>
-    bool erase(Key&& k)                     { return m_map.erase(k) > 0; }
+    bool erase(Key&& k)
+    {
+      if (m_map.erase(k) == 0)
+        return false;
+
+      // Drop the now-dangling entry from the LRU list too, otherwise
+      // refresh() would find it pointing at a missing key.
+      for (auto i = m_lru.begin(); i != m_lru.end(); ++i)
+        if (i->key == k) { m_lru.erase(i); break; }
+
+      return true;
+    }
 
     /// @brief Clear the map
     void clear()                            { m_map.clear(); m_lru.clear(); }
@@ -193,16 +214,18 @@ namespace arterial {
   size_t unordered_map_with_ttl<K,T,Hash,KeyEq,ValUpdate,ValDelete,Alloc>
   ::refresh(uint64_t now, OnErase const& on_erase)
   {
-    assert(now > m_ttl);
-
+    // m_lru is kept sorted by absolute expiration time (ttl_node::time), so
+    // every entry at the front with time <= now is expired, in order.
     size_t res = 0;
-    auto   ttl = now - m_ttl;
 
-    for (auto i = m_lru.begin(); i != m_lru.end() && i->time <= ttl; i = m_lru.begin(), ++res) {
+    for (auto i = m_lru.begin(); i != m_lru.end() && i->time <= now; i = m_lru.begin(), ++res) {
       auto  it  = m_map.find(i->key);
-      if   (it == m_map.end()) continue;
 
-      if (on_erase(i->key, it->second, i->time, now))
+      // i->key may be dangling if it was removed via erase() without going
+      // through this loop (shouldn't happen now that erase() also cleans up
+      // m_lru, but pop_front() unconditionally either way to guarantee this
+      // loop always makes progress).
+      if (it != m_map.end() && on_erase(i->key, it->second.value, i->time, now))
         m_eraser(m_map, it);    // Evict expired node
 
       m_lru.pop_front();
@@ -216,18 +239,30 @@ namespace arterial {
   bool unordered_map_with_ttl<K,T,Hash,KeyEq,ValUpdate,ValDelete,Alloc>
   ::try_add(const K& key, T&& value, uint64_t now)
   {
-    refresh(now);
+    return try_add_with_ttl(key, std::move(value), now + m_ttl);
+  }
 
+  template <class K, class T, class Hash, class KeyEq,
+            class ValUpdate, class ValDelete, class Alloc>
+  bool unordered_map_with_ttl<K,T,Hash,KeyEq,ValUpdate,ValDelete,Alloc>
+  ::try_add_with_ttl(const K& key, T&& value, uint64_t expire_at)
+  {
     auto it        = m_map.find(key);
     auto not_found = it == m_map.end();
 
     if (not_found)
-      m_map.emplace(key, val_node<T>(std::move(value), now));
+      m_map.emplace(key, val_node<T>(std::move(value), expire_at));
     else // maybe replace the existing entry
-      not_found = m_assign(it->second, std::move(value), now);
+      not_found = m_assign(it->second, std::move(value), expire_at);
 
-    if (not_found)
-      m_lru.push_back(ttl_node{now, key});
+    if (not_found) {
+      // Insert into m_lru keeping it sorted by expire_at. New entries
+      // typically expire later than existing ones, so search from the back.
+      auto pos = m_lru.end();
+      while (pos != m_lru.begin() && std::prev(pos)->time > expire_at)
+        --pos;
+      m_lru.insert(pos, ttl_node{expire_at, key});
+    }
 
     return not_found;
   }

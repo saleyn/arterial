@@ -1,6 +1,6 @@
 -module(arterial_socket).
 
--export([connect/5]).
+-export([connect/5, close/1]).
 
 connect(tcp, IP, Port, Opts, Timeout) ->
   case socket:open(inet, stream, tcp) of
@@ -8,14 +8,8 @@ connect(tcp, IP, Port, Opts, Timeout) ->
       try
         case socket:connect(Sock, #{family => inet, addr => IP, port => Port}, Timeout) of
           ok ->
-            lists:foreach(fun({{Level, Opt}, Value}) ->
-              case seket:setopts(Sock, Level, Opt, Value) of
-                ok ->
-                  {ok, Sock};
-                {error, _Reason} = Error ->
-                  throw({bad_sock_option, {Level, Opt}, Error})
-              end
-            end, Opts);
+            apply_opts(Sock, Opts),
+            {ok, Sock};
           {error, _Reason2} = Error2 ->
             throw(Error2)
         end
@@ -33,14 +27,8 @@ connect(udp, _IP, Port, Opts, _Timeout) ->
       try
         case socket:bind(Sock, #{family => inet, addr => {0,0,0,0}, port => Port}) of
           ok ->
-            lists:foreach(fun({{Level, Opt}, Value}) ->
-              case seket:setopts(Sock, Level, Opt, Value) of
-                ok ->
-                  {ok, Sock};
-                {error, _Reason} = Error ->
-                  throw({bad_sock_option, {Level, Opt}, Error})
-              end
-            end, Opts);
+            apply_opts(Sock, Opts),
+            {ok, Sock};
           {error, _Reason2} = Error2 ->
             throw(Error2)
         end
@@ -52,3 +40,15 @@ connect(udp, _IP, Port, Opts, _Timeout) ->
       Error
   end.
 
+apply_opts(Sock, Opts) ->
+  lists:foreach(fun({{Level, Opt}, Value}) ->
+    case socket:setopt(Sock, Level, Opt, Value) of
+      ok ->
+        ok;
+      {error, _Reason} = Error ->
+        throw({bad_sock_option, {Level, Opt}, Error})
+    end
+  end, Opts).
+
+close(Sock) ->
+  socket:close(Sock).

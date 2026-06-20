@@ -72,27 +72,27 @@ private:
 template <typename T>
 struct PooledObject {
   explicit PooledObject()
-  : m_obj(nullptr), m_index(-1), m_available(false), m_magic(0)
+  : m_obj(nullptr), m_available(false), m_index(-1), m_magic(0)
   {}
 
   PooledObject(T* obj, int idx, bool avail, uint32_t magic)
   : m_obj(obj)
-  , m_index(idx)
   , m_available(avail)
+  , m_index(idx)
   , m_magic(magic)
   {}
 
   PooledObject(PooledObject&& rhs)
   : m_obj(rhs.m_obj)
-  , m_index(rhs.m_index)
   , m_available(rhs.m_available.load(std::memory_order_relaxed))
+  , m_index(rhs.m_index)
   , m_magic(rhs.m_magic)
   {}
 
   PooledObject(PooledObject const& rhs)
   : m_obj(rhs.m_obj)
+  , m_available(rhs.m_available.load(std::memory_order_relaxed))
   , m_index(rhs.m_index)
-  , m_available(rhs.m_available)
   , m_magic(rhs.m_magic)
   {}
 
@@ -158,7 +158,7 @@ struct BasePoolNode : PooledObject<T> {
   /// caller uses the same arguments to initialize every object in the pool.
   template <typename... Args>
   explicit BasePoolNode(uint32_t magic, bool avail, int idx = -1, Args... args)
-  : PooledObject<T>(new T(std::forward(args)...), idx, avail, magic)
+  : PooledObject<T>(new T(std::forward<Args>(args)...), idx, avail, magic)
   , m_obj_owner(this->PooledObject<T>::m_obj) // Take ownership
   , m_next(std::max(-1, idx-1))
   {}
@@ -241,8 +241,8 @@ struct BaseObjectPoolLIFO {
     Construct(size, init);
   }
 
-  template <IsObjOrUniqPtr<ObjT> T>
-  BaseObjectPoolLIFO(std::vector<T> const& objects) : m_magic(NewMagic())
+  template <typename U> requires IsObjOrUniqPtr<U, T>
+  BaseObjectPoolLIFO(std::vector<U>& objects) : m_magic(NewMagic())
   {
     auto new_node = [this, &objects](auto i) {
       return NodeT(Ptr(objects[i]), m_magic, false, i);
@@ -252,8 +252,8 @@ struct BaseObjectPoolLIFO {
   }
 
 private:
-  static ObjT* Ptr(ObjT* p) { return p; }
-  static ObjT* Ptr(std::unique_ptr<ObjT>& p) { return p.release(); }
+  static T* Ptr(T* p) { return p; }
+  static T* Ptr(std::unique_ptr<T>& p) { return p.release(); }
 
   template <typename Init>
   void Construct(size_t size, Init const& fun);
@@ -424,20 +424,21 @@ template<DerivedFromPooledObject NodeT>
 std::pair<bool, std::vector<typename BaseObjectPoolLIFO<NodeT>::T*>>
 BaseObjectPoolLIFO<NodeT>::UnsafeReserve(size_t n)
 {
-  size_t result = 0;
-  auto   cursor = m_free_list_head.load(std::memory_order_relaxed);
+  auto cursor = m_free_list_head.load(std::memory_order_relaxed);
 
-  auto   vec = std::vector<T*>();
+  auto vec = std::vector<T*>();
   vec.reserve(n);
 
   while (cursor.Valid() && vec.size() < n) {
-    vec.push_back(cursor.Get()->ID());
+    vec.push_back(m_nodes[cursor.Index()].Value());
     cursor = m_nodes[cursor.Index()].Next();
   }
 
   auto success = vec.size() == n;
   if  (success)
-    m_free_list_head.exchange(cursor);
+    m_free_list_head.store(cursor, std::memory_order_relaxed);
+  else
+    vec.clear();
 
   return std::make_pair(success, vec);
 }
@@ -450,8 +451,9 @@ void BaseObjectPoolLIFO<NodeT>::ForEach(Fun const& fun)
   auto   cursor = m_free_list_head.load(std::memory_order_relaxed);
 
   while (cursor.Valid()) {
-    cursor = m_nodes[cursor.Index()].Next();
-    fun(static_cast<ObjT&>(m_nodes[cursor.Index()]));
+    auto& node = m_nodes[cursor.Index()];
+    fun(static_cast<ObjT&>(node));
+    cursor = node.Next();
   }
 }
 
