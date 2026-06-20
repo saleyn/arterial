@@ -1,4 +1,19 @@
 -module(arterial_connection).
+
+-moduledoc """
+Per-connection `gen_server` worker: owns one pool connection slot's
+socket lifecycle (connect, reconnect-with-backoff, disconnect) and drives
+the paired `arterial_client` callback module's `init/1`/`setup/2`/
+`terminate/2` callbacks around it.
+
+Started once per connection slot by `arterial_pool`'s supervisor. Once
+connected, the worker publishes the socket into the pool's NIF resource
+via `arterial_nif:set_socket/3` + `arterial_nif:make_available/2` so that
+`arterial_client:call/3` and the asynchronous checkout path
+(`arterial_nif:checkout_async/3`) can use it; it is not itself involved
+in individual requests.
+""".
+
 -behaviour(gen_server).
 
 -include_lib("kernel/include/logger.hrl").
@@ -42,9 +57,16 @@
 }).
 
 -type state()           :: #state{}.
+
+-doc "Opaque value passed through to the paired `c:arterial_client:init/1` callback.".
 -type init_options()    :: term().
+
+-doc "The `{Pool, ConnID}` pair identifying a connection slot within a pool.".
 -type id()              :: {arterial_pool:name(), non_neg_integer()}.
+
 -type opts()            :: arterial_client:options().
+
+-doc "Internal reconnect-backoff bookkeeping; opaque to callers.".
 -type reconnect_state() :: #recon_state{}.
 
 -export_type([
@@ -56,8 +78,20 @@
 %%%-----------------------------------------------------------------------------
 %%% Public API
 %%%-----------------------------------------------------------------------------
-%% @doc Start a connection worker for slot `ConnID' (0-based, matching the
-%% pool's NIF-level connection index) of `Pool'.
+-doc """
+Start a connection worker for slot `ConnID` (0-based, matching the pool's
+NIF-level connection index) of `Pool`. The worker connects (and
+reconnects, with backoff) on its own; this call returns as soon as the
+`gen_server` process itself has started, not once a socket is up.
+
+## Examples
+
+```
+1> arterial_connection:start_link(my_pool, 0, my_client,
+2>                                 #{address => "localhost", port => 9000}).
+{ok,<0.142.0>}
+```
+""".
 -spec start_link(arterial_pool:name(), non_neg_integer(), arterial:client(), opts()) ->
   {ok, pid()}.
 start_link(Pool, ConnID, Client, CliOpts)
@@ -67,6 +101,7 @@ start_link(Pool, ConnID, Client, CliOpts)
 %%%-----------------------------------------------------------------------------
 %%% gen_server callbacks
 %%%-----------------------------------------------------------------------------
+-doc false.
 -spec init(list()) -> {ok, state(), {continue, reconnect}}.
 init([Pool, ConnID, Client, CliOpts]) ->
   #{
@@ -103,16 +138,20 @@ init([Pool, ConnID, Client, CliOpts]) ->
       conn_timeout = ConnTimeout
   }}, {continue, reconnect}}.
 
+-doc false.
 handle_continue(reconnect, State) -> handle_info(reconnect, State).
 
+-doc false.
 handle_call(Msg, _From, #state{ss = #srv_state{pfx = Pfx}} = State) ->
   ?LOG_WARNING("~s got unexpected call: ~p", [Pfx, Msg]),
   {reply, {error, unexpected_call}, State}.
 
+-doc false.
 handle_cast(Msg, #state{ss = #srv_state{pfx = Pfx}} = State) ->
   ?LOG_WARNING("~s got unexpected cast: ~p", [Pfx, Msg]),
   {noreply, State}.
 
+-doc false.
 handle_info(reconnect, State) ->
   reconnect(State);
 
@@ -120,6 +159,7 @@ handle_info(Msg, #state{ss = #srv_state{pfx = Pfx}} = State) ->
   ?LOG_WARNING("~s got unexpected msg: ~p", [Pfx, Msg]),
   {noreply, State}.
 
+-doc false.
 terminate(Reason, State) ->
   disconnect(Reason, State),
   ok.

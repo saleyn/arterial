@@ -1,10 +1,35 @@
+//-----------------------------------------------------------------------------
+/// \file   arterial.hpp
+/// \author Serge Aleynikov
+//-----------------------------------------------------------------------------
+/// \brief Lock-free connection pool engine backing the `arterial_nif` NIF.
+///
+/// `ConnectionPool` owns a fixed set of `Connection`s checked out/in via a
+/// lock-free FIFO (pool_fifo.hpp), each with its own per-connection request
+/// backlog (backlog.hpp) and rate throttles (throttle.hpp). On top of that
+/// it provides:
+///   - an in-flight request registry (unordered_map_with_ttl.hpp) that
+///     notifies a request's owning process if no reply arrives before its
+///     TTL, releasing the request's backlog slot automatically;
+///   - an optional bounded queue-when-busy wait-list (wait_list.hpp) for
+///     asynchronous checkouts that arrive while every connection is busy;
+///   - process-death monitoring: every checkout (synchronous or
+///     asynchronous, immediate or served later from the wait-list) is
+///     tracked against the calling Erlang process via `enif_monitor_process`,
+///     so a process that dies while still holding a reservation has it
+///     released automatically instead of stranding the connection forever
+///     (see MonitorOwner(), ReleaseOwnerReservation(), OnProcessDown(),
+///     owner_table.hpp).
+//-----------------------------------------------------------------------------
 #pragma once
 
 #include "connection.hpp"
+#include "owner_table.hpp"
 #include "pool_fifo.hpp"
 #include "unordered_map_with_ttl.hpp"
 #include "wait_list.hpp"
 #include <erl_nif.h>
+#include <algorithm>
 #include <atomic>
 #include <set>
 #include <vector>
@@ -65,6 +90,7 @@ struct ConnectionPool {
   , m_waiting(0)
   , m_fixed_ttl_us(a_fixed_ttl_us)
   , m_waiters(a_max_waiters)
+  , m_owners(size_t(a_size) * size_t(a_backlog))
   {}
 
   /// @brief Register `req_id` as in-flight, owned by `pid`, on behalf of
@@ -182,6 +208,20 @@ struct ConnectionPool {
       for (auto id : ids)
         TrackInflightAt(id, entry.pid, conn, entry.expire_at);
 
+      // The waiter now owns this connection's reserved backlog slot(s),
+      // same as a direct CheckOut()/CheckOutAsync() caller; monitor it so
+      // a dead waiter can't strand them either (see OnProcessDown()). If
+      // the waiter is already gone (lost the race with its own death),
+      // unwind the reservation instead of notifying a dead pid.
+      if (!MonitorOwner(env, entry.pid, conn->ID(), ids)) [[unlikely]] {
+        for (auto id : ids) {
+          conn->Requests().CheckIn(id);
+          UntrackInflight(id);
+        }
+        CheckIn(conn->ID());
+        continue;
+      }
+
       auto* msg_env = enif_alloc_env();
       std::vector<ERL_NIF_TERM> id_terms;
       id_terms.reserve(ids.size());
@@ -256,6 +296,7 @@ struct ConnectionPool {
 
         if (conn) {
           conn->Requests().CheckIn(req_id);
+          ReleaseOwnerReservation(env, pid, conn->ID(), {req_id});
           CheckIn(conn->ID(), env, pool_name);
         }
 
@@ -308,6 +349,112 @@ struct ConnectionPool {
   std::pair<Connection*, std::vector<ReqID>>
   CheckOut(size_t a_samples, time_val a_now = now_utc());
 
+  /// @brief Record that `pid` now owns `req_ids` reserved on connection
+  /// `conn_id` (as just returned by CheckOut()/CheckOutAsync()), and start
+  /// monitoring `pid` if this is its first reservation in this pool. Call
+  /// once per checkout, regardless of whether the caller also calls
+  /// TrackInflight() -- this bookkeeping is solely about releasing
+  /// reservations if `pid` dies, independent of the TTL-based timeout
+  /// registry.
+  /// @return false if `pid` is already dead (the monitor attempt failed);
+  /// the caller should treat this like a checkout that must be unwound.
+  bool MonitorOwner(ErlNifEnv* env, ErlNifPid const& pid, uint32_t conn_id,
+                     std::vector<ReqID> const& req_ids)
+  {
+    bool monitor_failed = false;
+
+    bool claimed = m_owners.WithEntry(pid, [&](OwnerEntry& entry) {
+      // Arm the monitor on a fresh entry, under the slot's lock, so two
+      // threads racing to create `pid`'s first reservation can't both call
+      // enif_monitor_process() on it.
+      if (!entry.monitored) {
+        if (enif_monitor_process(env, this, &pid, &entry.mon) != 0) {
+          monitor_failed = true; // pid already gone
+          return;
+        }
+        entry.monitored = true;
+      }
+      auto& ids = entry.by_conn[conn_id];
+      ids.insert(ids.end(), req_ids.begin(), req_ids.end());
+    });
+
+    if (claimed && monitor_failed) [[unlikely]]
+      // The slot WithEntry() just claimed (or found already-empty) for
+      // `pid` would otherwise sit there forever -- `pid` is already dead,
+      // so nothing will ever come along to release it via
+      // ReleaseOwnerReservation()/OnProcessDown(). Give it back now.
+      m_owners.TakeEntryIf(pid,
+        [](OwnerEntry const& entry) { return entry.by_conn.empty(); },
+        [](OwnerEntry&&) {});
+
+    return claimed && !monitor_failed;
+  }
+
+  /// @brief Drop `req_ids` (reserved on `conn_id`) from `pid`'s bookkeeping
+  /// (the mirror image of MonitorOwner()). Call once per checkin, with
+  /// exactly the ids that were just checked in. Demonitors `pid` once it
+  /// no longer owns any reservation in this pool.
+  void ReleaseOwnerReservation(ErlNifEnv* env, ErlNifPid const& pid,
+                                uint32_t conn_id, std::vector<ReqID> const& req_ids)
+  {
+    bool found = m_owners.WithEntry(pid, [&](OwnerEntry& entry) {
+      auto conn_it = entry.by_conn.find(conn_id);
+      if (conn_it != entry.by_conn.end()) {
+        auto& ids = conn_it->second;
+        for (auto rid : req_ids)
+          ids.erase(std::remove(ids.begin(), ids.end(), rid), ids.end());
+        if (ids.empty())
+          entry.by_conn.erase(conn_it);
+      }
+    });
+
+    if (!found) [[unlikely]]
+      return;
+
+    // Only take (and demonitor) the entry if it's *still* empty under the
+    // slot's lock -- another thread may have added a fresh reservation
+    // (via MonitorOwner()) for the same pid between the update above and
+    // here, in which case TakeEntryIf()'s predicate fails and nothing is
+    // removed.
+    m_owners.TakeEntryIf(pid,
+      [](OwnerEntry const& entry) { return entry.by_conn.empty(); },
+      [&](OwnerEntry&& entry) {
+        if (entry.monitored)
+          enif_demonitor_process(env, this, &entry.mon);
+      });
+  }
+
+  /// @brief Called (via the resource's `down` event) when a process that
+  /// owns one or more reservations in this pool dies. Releases every
+  /// backlog slot it still held -- across every connection -- exactly as
+  /// if checkin_connection/4 had been called for each one, and untracks
+  /// the corresponding in-flight entries.
+  ///
+  /// Does NOT drain the queue-when-busy wait-list: doing so means sending
+  /// a `{arterial_ready, PoolName, ...}` message, which needs the pool's
+  /// Erlang-side atom name -- not available here, since `down` fires
+  /// asynchronously with no Erlang call (and thus no caller-supplied
+  /// pool name) in progress. A waiter queued behind a connection released
+  /// this way is instead serviced lazily, the next time anyone calls
+  /// checkin_connection/2,4 or sweep_timeouts/1 on this pool (both already
+  /// drain the wait-list themselves).
+  void OnProcessDown(ErlNifPid const& pid)
+  {
+    // The monitor already fired (that's why we're here) -- no need to
+    // enif_demonitor_process() it.
+    m_owners.TakeEntry(pid, [&](OwnerEntry&& entry) {
+      for (auto& [conn_id, req_ids] : entry.by_conn) {
+        auto* conn = Get(conn_id);
+        if (conn)
+          for (auto rid : req_ids) {
+            conn->Requests().CheckIn(rid);
+            UntrackInflight(rid);
+          }
+        CheckIn(conn_id);
+      }
+    });
+  }
+
 private:
   std::vector<std::unique_ptr<Connection>> m_scratch;
   ObjectPoolFIFO<Connection>               m_pool;
@@ -316,6 +463,7 @@ private:
   uint64_t                                 m_fixed_ttl_us;
   WaitList                                 m_waiters;
   std::atomic<uint64_t>                    m_next_waiter_id{0};
+  OwnerTable                                m_owners;
 
   bool SetAvailable(uint32_t id, bool available)
   {

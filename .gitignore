@@ -13,6 +13,9 @@
 # Ignore .fetch files in case you like to edit your project deps locally.
 /.fetch
 
+/obj/
+/test/test_pool.so
+
 # If the VM crashes, it generates a dump, let's ignore it too.
 erl_crash.dump
 
@@ -32,4 +35,4 @@ priv/*.so
 # Temporary files, for example, from tests.
 /tmp/
 
-
+rebar3.crashdump
