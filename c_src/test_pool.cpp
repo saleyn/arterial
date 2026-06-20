@@ -51,7 +51,7 @@ void test_lifo_pool(const char* exec) {
   std::vector<ObjT*> objects;
   size_t count = 0;
 
-  for (int i=0; i < SIZE; ++i) {
+  for (size_t i=0; i < SIZE; ++i) {
     auto* node = pool.Get(i);
     objects.push_back(node->Value());
     objects.back()->value = ++count;
@@ -83,7 +83,7 @@ void test_lifo_pool(const char* exec) {
   std::vector<PooledObject<ObjT>*> holder; // Temporarily holds checked out resources
   holder.reserve(SIZE);
 
-  for (int i=0; i < SIZE; ++i) {
+    for (size_t i=0; i < SIZE; ++i) {
     auto obj = pool.CheckOut();
     holder.push_back(obj);
     if (debug)
@@ -112,7 +112,7 @@ void test_lifo_pool(const char* exec) {
   std::vector<PooledObject<ObjT>*> same_indexes;
   same_indexes.reserve(SIZE);
 
-  for (int i = 0; i < SIZE; ++i) {
+    for (size_t i = 0; i < SIZE; ++i) {
     same_indexes.push_back(pool.CheckOut());
     ASSERT_EQUAL(i+1, pool.Get(*same_indexes.back())->value);
   }
@@ -138,7 +138,7 @@ void test_fifo_pool(const char* exec) {
   std::vector<ObjT*> objects;
   size_t count = 0;
 
-  for (int i=0; i < SIZE; ++i) {
+    for (size_t i=0; i < SIZE; ++i) {
     auto* node = pool.Get(i);
     objects.push_back(node->Value());
     objects.back()->value = ++count;
@@ -168,7 +168,7 @@ void test_fifo_pool(const char* exec) {
   std::vector<PooledObject<ObjT>*> holder; // Temporarily holds checked out resources
   holder.reserve(SIZE);
 
-  for (int i=0; i < SIZE; ++i) {
+    for (size_t i=0; i < SIZE; ++i) {
     auto obj = pool.CheckOut();
     holder.push_back(obj);
     if (debug)
@@ -197,7 +197,7 @@ void test_fifo_pool(const char* exec) {
   same_indexes.reserve(SIZE);
 
   count = 1;
-  for (int i = 0; i < SIZE; ++i) {
+    for (size_t i = 0; i < SIZE; ++i) {
     same_indexes.push_back(pool.CheckOut());
     if (debug)
       std::cout << "Object[" << pool.Get(*same_indexes.back())->value << "] (count=" << count << ")\n";
