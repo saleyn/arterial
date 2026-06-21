@@ -8,15 +8,23 @@ Throughput/latency micro-benchmark for `arterial`, driven against a real
 Two `mode`s, both with zero request multiplexing (at most one in-flight
 request per connection at a time -- see `t:opts/0`'s `mode` doc):
 
-- `sync` (default): each worker process blocks directly on
+- `async` (default): each worker process casts through a small, fixed
+  pool of `arterial_async_driver` dispatcher processes (one per
+  connection) instead of blocking on the socket itself -- see that
+  module's doc for why this is "non-blocking dispatch", not wire-level
+  pipelining (arterial's public API has no way to hold a connection
+  checked out across more than one in-flight request). This is the mode
+  comparable to `shackle_bench`: `shackle:call/3` always hands the
+  request off to a `shackle_server` process internally, even in
+  shackle's own default mode -- `arterial_client:call/3`'s `sync` mode
+  below has no such dispatcher in the loop, so benchmarking it against
+  shackle's *any* mode compares two different architectures, not just
+  two pool implementations.
+- `sync`: each worker process blocks directly on
   `arterial_client:call/3`, owning a connection's socket for the whole
-  request/reply round trip.
-- `async`: each worker process casts through a small, fixed pool of
-  `arterial_async_driver` dispatcher processes (one per connection)
-  instead of blocking on the socket itself -- see that module's doc for
-  why this is "non-blocking dispatch", not wire-level pipelining
-  (arterial's public API has no way to hold a connection checked out
-  across more than one in-flight request).
+  request/reply round trip -- no dispatcher process involved at all.
+  Useful to see the ceiling when the caller pays its own socket I/O
+  cost, but not the fair comparison point against `shackle_bench`.
 
 Not part of the regular `rebar3 eunit` run (no `_test`/`_test_` exported
 functions) -- run it via `make bench` (see the top-level Makefile's
@@ -26,8 +34,9 @@ functions) -- run it via `make bench` (see the top-level Makefile's
 $ rebar3 as test shell
 1> arterial_bench:bench().
 === arterial benchmark ===
-mode:         sync
+mode:         async
 pool size:    8
+backlog:      1
 order:        fifo
 workers:      8
 duration:     5000 ms (target), 5007 ms (actual)
@@ -42,7 +51,7 @@ Tune the load shape via `bench/1`; see `help/0` for the full option list:
 
 ```
 1> arterial_bench:bench(#{pool_size => 16, duration_s => 10}).
-2> arterial_bench:bench(#{mode => async}).
+2> arterial_bench:bench(#{mode => sync}).
 ```
 
 From the shell, `BENCH_OPTS` takes a plain comma-separated `key=value`
@@ -89,17 +98,23 @@ help() ->
   io:format(
     "arterial_bench:bench(Opts) -- Opts is a map with any of:~n"
     "~n"
-    "  mode       => sync | async  (default: sync)~n"
-    "                sync: each worker blocks directly on~n"
-    "                arterial_client:call/3, owning a connection's socket~n"
-    "                for the whole request/reply round trip.~n"
+    "  mode       => sync | async  (default: async)~n"
     "                async: each worker casts through a small, fixed pool~n"
     "                of arterial_async_driver dispatcher processes (one~n"
     "                per connection) instead of blocking on the socket~n"
-    "                itself. Still at most one in-flight request per~n"
-    "                connection at a time either way -- arterial's public~n"
-    "                API has no way to hold a connection checked out~n"
-    "                across more than one in-flight request, so this is~n"
+    "                itself. This is the mode comparable to shackle_bench~n"
+    "                -- shackle:call/3 always dispatches to a~n"
+    "                shackle_server process internally, so arterial's~n"
+    "                sync mode (below) would compare a different~n"
+    "                architecture, not just a different pool.~n"
+    "                sync: each worker blocks directly on~n"
+    "                arterial_client:call/3, owning a connection's socket~n"
+    "                for the whole request/reply round trip -- no~n"
+    "                dispatcher process involved.~n"
+    "                Still at most one in-flight request per connection~n"
+    "                at a time either way -- arterial's public API has no~n"
+    "                way to hold a connection checked out across more~n"
+    "                than one in-flight request, so async here is~n"
     "                non-blocking dispatch, not wire-level pipelining.~n"
     "  pool_size  => pos_integer()  (default: 8)~n"
     "                Number of pooled connections to test_tcp_server.~n"
@@ -129,7 +144,7 @@ help() ->
     "Examples:~n"
     "  1> arterial_bench:bench().~n"
     "  2> arterial_bench:bench(#{pool_size => 16, duration_s => 10}).~n"
-    "  3> arterial_bench:bench(#{mode => async}).~n"
+    "  3> arterial_bench:bench(#{mode => sync}).~n"
     "  4> arterial_bench:bench(#{backoff => {backoff, 100, 5000}}).~n"
     "~n"
     "  $ make bench~n"
@@ -148,7 +163,9 @@ return `ok`. Starts and tears down its own `test_tcp_server` and
 bench(Opts) ->
   PoolSize0 = maps:get(pool_size, Opts, 8),
   Defaults = #{
-    mode       => sync,
+    %% async is the architecture comparable to shackle_bench -- see this
+    %% module's moduledoc/help() for why sync isn't a fair head-to-head.
+    mode       => async,
     pool_size  => PoolSize0,
     fifo       => true,
     %% backlog > 1 lets multiple in-flight requests pipeline on the same
@@ -199,7 +216,7 @@ bench(Opts) ->
     {AllLatenciesUs, Rejected} = collect(WorkerPids, [], 0),
     ElapsedMs = erlang:monotonic_time(millisecond) - StartAt,
 
-    report(Mode, PoolSize, Workers, DurationMs, ElapsedMs, AllLatenciesUs, Rejected, Fifo)
+    report(Mode, PoolSize, Backlog, Workers, DurationMs, ElapsedMs, AllLatenciesUs, Rejected, Fifo)
   after
     teardown({Srv, SupPid}, Mode)
   end.
@@ -321,7 +338,7 @@ collect([Pid | Rest], Acc, RejectedAcc) ->
     error({worker_timeout, Pid})
   end.
 
-report(Mode, PoolSize, Workers, DurationMs, ElapsedMs, LatenciesUs, Rejected, Fifo) ->
+report(Mode, PoolSize, Backlog, Workers, DurationMs, ElapsedMs, LatenciesUs, Rejected, Fifo) ->
   N = length(LatenciesUs),
   Sorted = lists:sort(LatenciesUs),
   ThroughputPerSec = N * 1000 / ElapsedMs,
@@ -329,6 +346,7 @@ report(Mode, PoolSize, Workers, DurationMs, ElapsedMs, LatenciesUs, Rejected, Fi
   io:format("=== arterial benchmark ===~n"),
   io:format("mode:         ~p~n", [Mode]),
   io:format("pool size:    ~p~n", [PoolSize]),
+  io:format("backlog:      ~p~n", [Backlog]),
   io:format("order:        ~s~n", [case Fifo of true -> "fifo"; false -> "lifo" end]),
   io:format("workers:      ~p~n", [Workers]),
   io:format("duration:     ~p ms (target), ~p ms (actual)~n", [DurationMs, ElapsedMs]),

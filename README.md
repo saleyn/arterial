@@ -390,6 +390,66 @@ Writing your own backend means implementing the `arterial_observe`
 behaviour: `start/1`, `stop/0`, and `event/3` — see that module's
 moduledoc's "Writing your own backend" section for the exact contract.
 
+## Benchmarking
+
+Arterial's pool/checkout design was inspired by
+[shackle](https://github.com/lpgauth/shackle), an existing Erlang
+connection-pooling library; `test/shackle_bench.erl` exists specifically to
+let arterial be compared against the library that inspired it, using the
+same wire protocol, payload, and workload shape (`test/arterial_bench.erl`
+drives the same workload against `arterial` itself).
+
+```
+make bench           BENCH_OPTS='pool_size=8, duration_s=5'   # arterial
+make bench-shackle   BENCH_OPTS='pool_size=8, duration_s=5'   # shackle
+```
+
+Both accept a comma-separated `key=value` list (or a literal `#{...}` map
+for non-trivial values like binaries) via `BENCH_OPTS`; run
+`make bench-help` / `make bench-shackle-help` to print each module's full
+option/example documentation (`arterial_bench:help/0` /
+`shackle_bench:help/0`). An unrecognized option key raises
+`{unrecognized_bench_opts, Keys}` rather than being silently ignored.
+
+For a fair head-to-head, both benchmarks default to architecturally
+comparable setups rather than just sharing parameter names:
+
+* **Dispatch model.** `arterial_bench`'s default `mode => async` routes
+  requests through `test/arterial_async_driver.erl`, a small fixed pool of
+  dispatcher processes built on `arterial_nif:checkout_async/3` plus
+  `socket:recv(Sock, 0, nowait)` — OTP's completion-based, active-mode-
+  equivalent recv. This matches `shackle_server`'s own architecture (a
+  long-lived process owning its socket, replies delivered into its
+  mailbox), so neither side pays for a blocking-recv-per-request reader
+  process that the other doesn't. `arterial_bench`'s `mode => sync` (the
+  caller blocks directly on the socket via `arterial_client:call/3`, no
+  dispatcher at all) is also available, but is architecturally a different
+  comparison point, not a fair one against shackle's dispatch-based model.
+* **Dispatcher/connection selection.** `arterial_async_driver` picks its
+  next dispatcher round-robin (an `atomics`-backed counter), matching
+  `shackle_pool`'s default `round_robin` `pool_strategy` — uniform-random
+  selection under concurrency lets two callers collide on the same busy
+  dispatcher purely by chance while others sit idle, which has nothing to
+  do with either library's real throughput.
+* **Retry budget.** Shackle's `pool_strategy` probes exactly one fixed
+  slot per attempt with no pool-wide fallback, so `shackle_bench` sets
+  `max_retries => pool_size - 1` by default (enough attempts to reach
+  every slot once) — `max_retries => 0` would reject a large fraction of
+  requests to busy-but-not-actually-exhausted pools purely from
+  round-robin collisions, which arterial's full-pool-scan checkout never
+  does in the first place.
+* **Backlog.** Both benchmarks default to `backlog`/`backlog_size => 1`
+  (one in-flight request per connection) and print the value they ran
+  with, but it's a real, settable option on both sides
+  (`arterial_bench`'s `backlog`, `shackle_bench`'s `backlog_size`), not a
+  hardcoded constant.
+
+Residual throughput differences after matching the above are expected:
+shackle is a mature, heavily-optimized production library, while
+`arterial_async_driver`/`arterial_bench` are minimal test-only drivers
+built directly on arterial's public NIF API, not part of arterial's
+shipped functionality.
+
 ## Documentation
 
 This README is the primary documentation; module-level `@doc`/`-spec`
