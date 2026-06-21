@@ -5,7 +5,7 @@
 [![Hex.pm](https://img.shields.io/hexpm/dt/arterial.svg)](https://hex.pm/packages/glazer)
 
 `arterial` is a high-performance Erlang/Elixir connection-pooling library for
-clients that talk to a server (or cluster of servers) over TCP/UDP.
+clients that talk to a server (or cluster of servers) over SSL/TCP/UDP.
 The design is structurally a shared-nothing/lock-free concurrent model.
 The pool, per-connection backlog tracking, and rate throttling are implemented
 in a C++ NIF for performance; connection lifecycle, supervision, and socket
@@ -98,7 +98,7 @@ that periodically evicts timed-out in-flight requests.
 | `arterial_pool` | Per-pool `supervisor`; creates the NIF pool resource, then starts one `arterial_connection` worker per connection slot and one `arterial_sweeper`. |
 | `arterial_connection` | One `gen_server` per pooled connection. Owns the socket, runs the connect/reconnect state machine with exponential backoff, and drives the user-supplied client callback module (`arterial_client`). |
 | `arterial_sweeper` | Per-pool timer process; calls `arterial_nif:sweep_timeouts/1` on an interval to evict expired in-flight async requests. |
-| `arterial_socket` | Thin wrapper over Erlang's `socket` module for TCP/UDP connect. |
+| `arterial_socket` | Thin wrapper over Erlang's `socket` module for `tcp`/`udp` connect, plus `ssl` (requires OTP 28+ — see [SSL/TLS guide](docs/ssl-guide.md)). |
 | `arterial_client` | Behaviour for the connection lifecycle/codec (`init/1`, `setup/2`, `handle_request/2`, `handle_data/2`, `handle_timeout/2`, `terminate/2`); also implements `call/3`, the synchronous request API. |
 | `arterial_protocol` | Behaviour for the wire transport and per-request codec (`connect/3`, `send/2`, `recv/2`, `encode_request/3`, `decode_reply/2`). |
 | `arterial_proxy` | **Not yet working.** Originally intended as the asynchronous request/queuing path; largely superseded by `arterial_nif:checkout_async/3` (see [Implementation status](#implementation-status)) — whether this module still needs a rewrite is an open follow-up. |
@@ -242,16 +242,21 @@ Two behaviours decouple the wire transport from request/response encoding:
 * **`arterial_protocol`** ([src/arterial_protocol.erl](src/arterial_protocol.erl)) — the transport and per-request codec: `connect/3`, `close/1`, `send/2`, `recv/2`, `setopts/2`, `encode_request/3`, `decode_reply/2`.
 * **`arterial_client`** ([src/arterial_client.erl](src/arterial_client.erl)) — the connection lifecycle: `init/1`, `setup/2`, `handle_request/2`, `handle_data/2`, `handle_timeout/2` (optional), `terminate/2`. Also implements `call/3`, the synchronous request API used by callers (the caller's own process owns the socket for the call's duration via `arterial_protocol`; `arterial_connection`'s `gen_server` is not involved in the call itself).
 
-Pool/connection options (`t:arterial_client:options/0`) include `address`/`ip`,
-`port`, `protocol`, `reconnect`, `reconnect_time_min`/`reconnect_time_max`,
-`bounce_interval_ms`, and `socket_options`. `t:arterial_pool:options/0` (passed
-to `arterial_pool:start_link/2`) additionally controls `size`, `backlog`,
-`fifo`, `fixed_timeout_us`, `sweep_interval_ms`, `protocol`, `client`, and
-`client_opts` (the per-connection options map above).
+Pool/connection options (`t:arterial_client:options/0`) include `address`/`ip`
+(or `addresses`, for failover across several), `port`, `protocol` (`tcp` |
+`udp` | `ssl` — see [docs/ssl-guide.md](docs/ssl-guide.md) for `ssl`, which
+needs OTP 28+), `reconnect`, `reconnect_time`, `bounce_interval_ms`,
+`socket_options`, and `tls_options` (only used when `protocol => ssl`).
+`t:arterial_pool:options/0` (passed to `arterial_pool:start_link/2`)
+additionally controls `size`, `backlog`, `fifo`, `fixed_timeout_us`,
+`sweep_interval_ms`, `protocol` (here, the wire codec module — not the
+same `protocol` key as above), `client`, and `client_opts` (the
+per-connection options map above).
 
 For a full step-by-step walkthrough of implementing both behaviours,
 wiring them into a pool, and testing against a real server, see
-[docs/clent-guide.md](docs/clent-guide.md).
+[docs/clent-guide.md](docs/clent-guide.md). For the `ssl` transport
+specifically (OTP 28+ required), see [docs/ssl-guide.md](docs/ssl-guide.md).
 
 ## Documentation
 

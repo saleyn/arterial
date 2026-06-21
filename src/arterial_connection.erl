@@ -49,10 +49,11 @@ in individual requests.
   init_opts    :: init_options(),
   addresses    :: [address_entry(), ...], % non-empty
   port         :: arterial:inet_port(),
-  proto        :: arterial:protocol(),
+  proto        :: tcp | udp | ssl, % wire-level transport, NOT arterial:protocol() (the codec module)
   recon_state  :: undefined | reconnect_state(),
   conn_timeout :: non_neg_integer(),
-  sock_opts    :: arterial:socket_options()
+  sock_opts    :: arterial:socket_options(),
+  tls_opts     :: arterial:tls_options()
 }).
 
 -type impl_state()      :: any().
@@ -82,9 +83,9 @@ in individual requests.
 
 -doc """
 One entry of the `addresses` option: either a plain address (using the
-connection's shared `port`/`sock_opts`), or a map overriding either (or
-both) for that entry alone -- e.g. several independent server instances
-on localhost, each on its own port.
+connection's shared `port`/`sock_opts`/`tls_options`), or a map
+overriding any of those for that entry alone -- e.g. several independent
+server instances on localhost, each on its own port.
 
 ## Examples
 
@@ -97,12 +98,17 @@ on localhost, each on its own port.
 4>            sock_opts => [{{socket, reuseaddr}, true}]}.
 #{address => "127.0.0.1",port => 9002,
   sock_opts => [{{socket,reuseaddr},true}]}
+5> Entry4 = #{address => "ssl.internal", port => 9443,
+6>            tls_opts => [{verify, verify_peer}, {cacertfile, "/etc/ssl/ca.pem"}]}.
+#{address => "ssl.internal",port => 9443,
+  tls_opts => [{verify,verify_peer},{cacertfile,"/etc/ssl/ca.pem"}]}
 ```
 """.
 -type address_entry()  :: arterial:inet_address() | #{
   address   := arterial:inet_address(),
   port      => arterial:inet_port(),
-  sock_opts => arterial:socket_options()
+  sock_opts => arterial:socket_options(),
+  tls_opts  => arterial:tls_options()
 }.
 
 -doc """
@@ -220,15 +226,17 @@ bounce(Pid, DrainTimeoutMs) when is_integer(DrainTimeoutMs), DrainTimeoutMs > 0 
 -spec init(list()) -> {ok, state(), {continue, reconnect}}.
 init([Pool, ConnID, Client, CliOpts]) ->
   #{
-    init_options := InitOptions,
-    protocol     := Protocol,
-    sockopts     := SockOpts,
-    conn_timeout := ConnTimeout
+    init_options   := InitOptions,
+    protocol       := Protocol,
+    socket_options := SockOpts,
+    tls_options    := TlsOpts,
+    conn_timeout   := ConnTimeout
   } = maps:merge(#{
-    init_options => #{},
-    protocol     => tcp,
-    sockopts     => [],
-    conn_timeout => 15000
+    init_options   => #{},
+    protocol       => tcp,
+    socket_options => [],
+    tls_options    => [],
+    conn_timeout   => 15000
   }, CliOpts),
   Addresses  = addresses(CliOpts),
   Port       = maps:get(port, CliOpts, undefined),
@@ -254,6 +262,7 @@ init([Pool, ConnID, Client, CliOpts]) ->
       proto        = Protocol,
       recon_state  = ReconState,
       sock_opts    = SockOpts,
+      tls_opts     = TlsOpts,
       conn_timeout = ConnTimeout
   }}, {continue, reconnect}}.
 
@@ -314,13 +323,14 @@ reconnect(#state{ss = #srv_state{addresses = Addresses}} = State) ->
 try_addresses([], State) ->
   {noreply, recon_timer(State)};
 try_addresses([Entry | Rest], #state{
-  ss = #srv_state{pfx=Pfx, port=DefaultPort, proto=Proto, sock_opts=DefaultOpts, conn_timeout=Timeout}
+  ss = #srv_state{pfx=Pfx, port=DefaultPort, proto=Proto, sock_opts=DefaultOpts,
+                  tls_opts=DefaultTlsOpts, conn_timeout=Timeout}
 } = State) ->
-  {Address, Port, Opts} = resolve_entry(Entry, DefaultPort, DefaultOpts),
+  {Address, Port, Opts, TlsOpts} = resolve_entry(Entry, DefaultPort, DefaultOpts, DefaultTlsOpts),
   case inet:getaddrs(Address, inet) of
     {ok, IPs} ->
       IP = arterial_util:random_element(IPs),
-      case arterial_socket:connect(Proto, IP, Port, Opts, Timeout) of
+      case arterial_socket:connect(Proto, IP, Port, Opts, Timeout, TlsOpts) of
         {ok, Sock} ->
           client_init(State#state{sock = Sock});
         {error, Reason} ->
@@ -333,13 +343,16 @@ try_addresses([Entry | Rest], #state{
   end.
 
 %% A list entry is either a plain address (string/IP), using the
-%% connection's shared `port`/`sock_opts`, or a map overriding either
-%% (or both) per-entry -- e.g. multiple independent server instances on
-%% localhost, each on its own port.
-resolve_entry(#{address := Address} = Entry, DefaultPort, DefaultOpts) ->
-  {Address, maps:get(port, Entry, DefaultPort), maps:get(sock_opts, Entry, DefaultOpts)};
-resolve_entry(Address, DefaultPort, DefaultOpts) ->
-  {Address, DefaultPort, DefaultOpts}.
+%% connection's shared `port`/`sock_opts`/`tls_opts`, or a map overriding
+%% any of those per-entry -- e.g. multiple independent server instances
+%% on localhost, each on its own port.
+resolve_entry(#{address := Address} = Entry, DefaultPort, DefaultOpts, DefaultTlsOpts) ->
+  {Address,
+   maps:get(port, Entry, DefaultPort),
+   maps:get(sock_opts, Entry, DefaultOpts),
+   maps:get(tls_opts, Entry, DefaultTlsOpts)};
+resolve_entry(Address, DefaultPort, DefaultOpts, DefaultTlsOpts) ->
+  {Address, DefaultPort, DefaultOpts, DefaultTlsOpts}.
 
 needs_default_port(#{port := _}) -> false;
 needs_default_port(_)            -> true.
@@ -405,12 +418,12 @@ bounce_check(#state{
   end.
 
 disconnect(Reason, #state{ss = #srv_state{pfx=Pfx, pool=Pool, conn_id=ConnID,
-                                           client=Cli}, is=ImplState, sock=Sock} = State) ->
+                                           client=Cli, proto=Proto}, is=ImplState, sock=Sock} = State) ->
   case Sock of
     undefined -> ok;
     _         ->
       arterial_nif:make_unavailable(Pool, ConnID),
-      arterial_socket:close(Sock)
+      arterial_socket:close(Proto, Sock)
   end,
   case ImplState of
     undefined -> ok;

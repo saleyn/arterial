@@ -74,18 +74,25 @@ Pool/connection options accepted under the `client_opts` key of
 one connects) takes priority over the single-address `address`/`ip` if
 both are given; useful for failing over across a fixed set of
 known-good backup addresses. Each entry is either a plain address
-(sharing this `port`/`socket_options`) or a map overriding either (or
-both) for that entry alone -- see `t:arterial_connection:address_entry/0`,
-e.g. to reach several independent server instances on localhost, each
-on its own port. Once the whole list has been tried and failed, the
-connection backs off (`reconnect_time`) before restarting from the first
-address again.
+(sharing this `port`/`socket_options`/`tls_options`) or a map overriding
+any of those for that entry alone -- see
+`t:arterial_connection:address_entry/0`, e.g. to reach several
+independent server instances on localhost, each on its own port. Once
+the whole list has been tried and failed, the connection backs off
+(`reconnect_time`) before restarting from the first address again.
 
 `reconnect_time` controls that backoff: a fixed interval (plain
 integer), or `{backoff, Min, Max}` for exponential backoff -- see
 `t:arterial_connection:reconnect_time/0`. The legacy `reconnect_time_min`/
 `reconnect_time_max` pair still works (folded into the equivalent
 `{backoff, Min, Max}`) if `reconnect_time` isn't given.
+
+`tls_options` (requires **OTP 28+**) is only used when this connection's
+transport (the `client_opts` `protocol` key, distinct from
+`t:arterial_pool:options/0`'s `protocol` key, which names the wire codec
+module) is `ssl` -- passed straight through to `ssl:connect/3` after
+this connection's `socket_options` are applied via the `socket` module.
+See `m:arterial_socket`'s moduledoc for why `ssl` needs OTP 28+.
 
 ## Examples
 
@@ -104,6 +111,10 @@ integer), or `{backoff, Min, Max}` for exponential backoff -- see
 #{addresses => [#{address => "127.0.0.1",port => 9001},
                  #{address => "127.0.0.1",port => 9002}],
   protocol => tcp}
+8> Opts4 = #{address => "db.internal", port => 5432, protocol => ssl,
+9>           tls_options => [{verify, verify_peer}, {cacertfile, "/etc/ssl/ca.pem"}]}.
+#{address => "db.internal",port => 5432,protocol => ssl,
+  tls_options => [{verify,verify_peer},{cacertfile,"/etc/ssl/ca.pem"}]}
 ```
 """.
 -type options() :: #{
@@ -112,13 +123,14 @@ integer), or `{backoff, Min, Max}` for exponential backoff -- see
   addresses          => [arterial_connection:address_entry(), ...],
   ip                 => arterial:inet_address(),
   port               => arterial:inet_port(),
-  protocol           => arterial:protocol(),
+  protocol           => tcp | udp | ssl,
   reconnect          => boolean(),
   reconnect_time     => arterial_connection:reconnect_time(),
   reconnect_time_max => arterial:time()   | infinity, % deprecated, use reconnect_time
   reconnect_time_min => arterial:time(),              % deprecated, use reconnect_time
   bounce_interval_ms => non_neg_integer() | infinity,
-  socket_options     => arterial:socket_options()
+  socket_options     => arterial:socket_options(),
+  tls_options        => arterial:tls_options()
 }.
 
 -export_type([options/0]).

@@ -11,7 +11,10 @@ how to open/close the transport, send/receive raw data on it, and
 encode/decode individual requests and replies.
 
 See `test/test_protocol.erl` in the `arterial` source tree for a minimal
-example implementation used by the test suite.
+example implementation used by the test suite, or `test/ssl_echo_protocol.erl`
+for an `ssl`-transport example (`send/2`/`recv/2` over `ssl:send/2`/
+`ssl:recv/3` instead of `socket:send/2`/`socket:recv/3` -- see
+`m:arterial_socket`'s moduledoc for why `ssl` needs OTP 28+).
 """.
 
 -doc """
