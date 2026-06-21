@@ -53,7 +53,7 @@ test:
 # needs its own target. Pass options either as a plain comma-separated
 # `key=value` list:
 #   make bench BENCH_OPTS='pool_size=16, duration_s=10'
-#   make bench BENCH_OPTS='mode=async'
+#   make bench BENCH_OPTS='mode=sync'
 # or, if you need a non-trivial value (e.g. a binary), as a full Erlang
 # map literal -- detected by a leading '#{' and passed through as-is:
 #   make bench BENCH_OPTS='#{pool_size => 16, payload => <<"hi">>}'
