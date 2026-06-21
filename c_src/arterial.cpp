@@ -18,25 +18,28 @@ void on_pool_down(ConnectionPool* pool, ErlNifEnv*, ErlNifPid* pid, ErlNifMonito
 
 ERL_NIF_TERM create_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
 {
-  assert(argc == 5);
+  assert(argc == 6);
 
   unsigned int size;
   unsigned int backlog;
   bool         fifo;
   ErlNifUInt64 fixed_ttl_us;
   unsigned int max_waiters;
+  unsigned int ttl_shards;
 
   if (!get(env, argv[0], size) || size == 0 ||
       !get(env, argv[1], backlog) || backlog == 0 ||
       backlog > std::numeric_limits<BaseReqID>::max() ||
       !get(env, argv[2], fifo) ||
       !enif_get_uint64(env, argv[3], &fixed_ttl_us) ||
-      !get(env, argv[4], max_waiters)) [[unlikely]]
+      !get(env, argv[4], max_waiters) ||
+      !get(env, argv[5], ttl_shards)) [[unlikely]]
     return enif_make_badarg(env);
 
   auto pool = construct_resource_with_events<ConnectionPool>(
     resource_events<ConnectionPool>(on_pool_down),
-    size, BaseReqID(backlog), fifo, uint64_t(fixed_ttl_us), size_t(max_waiters));
+    size, BaseReqID(backlog), fifo, uint64_t(fixed_ttl_us), size_t(max_waiters),
+    size_t(ttl_shards));
 
   return make(env, std::make_tuple(am_ok, pool));
 }
@@ -258,7 +261,7 @@ int upgrade(ErlNifEnv*, void**, void** old_priv_data, ERL_NIF_TERM)
 }
 
 ErlNifFunc nif_funcs[] = {
-  {"create_pool",          5, create_nif,           0},
+  {"create_pool",          6, create_nif,           0},
   {"destroy_pool",         1, destroy_nif,          0},
   {"set_socket_nif",       3, set_socket_nif,       0},
   {"make_available_nif",   2, make_available_nif,   0},

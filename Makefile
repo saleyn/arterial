@@ -17,7 +17,7 @@ compile: nif
 	rebar3 $@
 
 nif:
-	$(MAKE) --no-print-directory -C c_src
+	$(MAKE) -C c_src
 
 cover:
 	$(REBAR) cover --verbose
@@ -47,6 +47,17 @@ doc docs:
 test:
 	$(MAKE) --no-print-directory -C c_src test
 	rebar3 eunit
+
+# Runs test/arterial_bench.erl against a real test_tcp_server over
+# loopback TCP -- not part of `test`/eunit (no _test exports), so it
+# needs its own target. Pass options as an Erlang map literal, e.g.:
+#   make bench BENCH_OPTS='#{pool_size => 16, duration_s => 10}'
+BENCH_OPTS ?= \#{}
+bench bench-help:
+	@$(REBAR) as test compile
+	@erl -noshell -noinput -pa _build/test/lib/arterial/ebin \
+	  -pa _build/test/lib/arterial/test \
+	  -eval "arterial_bench:$(subst -,_,$@)($(BENCH_OPTS)), halt()."
 
 clean:
 	$(MAKE) -C c_src $@

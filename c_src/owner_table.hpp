@@ -25,6 +25,7 @@
 #pragma once
 
 #include "backlog.hpp"
+#include "arterial_util.hpp"
 #include <erl_nif.h>
 #include <atomic>
 #include <cstddef>
@@ -174,13 +175,6 @@ private:
 
   size_t                             m_mask;
   std::vector<std::unique_ptr<Slot>> m_slots;
-
-  static size_t RoundUpPow2(size_t n)
-  {
-    size_t p = 1;
-    while (p < n) p <<= 1;
-    return p;
-  }
 
   static bool PidEquals(ErlNifPid const& a, ErlNifPid const& b)
   {

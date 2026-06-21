@@ -8,9 +8,13 @@
 /// lock-free FIFO (pool_fifo.hpp), each with its own per-connection request
 /// backlog (backlog.hpp) and rate throttles (throttle.hpp). On top of that
 /// it provides:
-///   - an in-flight request registry (unordered_map_with_ttl.hpp) that
-///     notifies a request's owning process if no reply arrives before its
-///     TTL, releasing the request's backlog slot automatically;
+///   - an in-flight request registry and a queue-when-busy waiter registry
+///     (both ShardedTTLMap, sharded_ttl_map.hpp) that notify a request's or
+///     waiter's owning process if no reply/service arrives before its TTL,
+///     releasing the request's backlog slot automatically. Reachable
+///     concurrently from multiple NIF entry points with no dirty-scheduler
+///     serialization, hence the sharding: each shard is independently
+///     mutex-guarded, so unrelated keys never contend;
 ///   - an optional bounded queue-when-busy wait-list (wait_list.hpp) for
 ///     asynchronous checkouts that arrive while every connection is busy;
 ///   - process-death monitoring: every checkout (synchronous or
@@ -26,7 +30,7 @@
 #include "connection.hpp"
 #include "owner_table.hpp"
 #include "pool_fifo.hpp"
-#include "unordered_map_with_ttl.hpp"
+#include "sharded_ttl_map.hpp"
 #include "wait_list.hpp"
 #include <erl_nif.h>
 #include <algorithm>
@@ -64,8 +68,8 @@ struct AsyncCheckoutResult {
 struct ConnectionPool {
   using PooledConnection = PooledObject<Connection>;
   using InflightEntry    = std::pair<ErlNifPid, Connection*>;
-  using InflightMap      = unordered_map_with_ttl<ReqID, InflightEntry>;
-  using WaiterMap        = unordered_map_with_ttl<uint64_t, ErlNifPid>;
+  using InflightMap      = ShardedTTLMap<ReqID, InflightEntry>;
+  using WaiterMap        = ShardedTTLMap<uint64_t, ErlNifPid>;
 
   /// @brief Create a pool of `a_size` connections, each with a backlog of
   /// `a_backlog` in-flight requests, using a FIFO or random-access backlog
@@ -82,12 +86,20 @@ struct ConnectionPool {
   /// arrive while the pool is busy (up to this many waiters) instead of
   /// failing immediately; see CheckOutAsync(). Zero disables queuing
   /// entirely (CheckOutAsync() then behaves like CheckOut()).
+  ///
+  /// @param a_ttl_shards shard count for the in-flight/waiter registries
+  /// (ShardedTTLMap, sharded_ttl_map.hpp). Zero (the default) picks
+  /// ShardedTTLMap::DefaultShardCount(), scaled off
+  /// std::thread::hardware_concurrency() -- pass a specific value to
+  /// override that guess (e.g. if many pools share a small machine, or
+  /// one pool alone should claim more shards on a large one).
   ConnectionPool(uint32_t a_size, BaseReqID a_backlog, bool a_fifo,
-                 uint64_t a_fixed_ttl_us = 0, size_t a_max_waiters = 0)
+                 uint64_t a_fixed_ttl_us = 0, size_t a_max_waiters = 0,
+                 size_t a_ttl_shards = 0)
   : m_scratch(MakeConnections(a_size, a_backlog, a_fifo))
   , m_pool(m_scratch)
-  , m_inflight(a_fixed_ttl_us)
-  , m_waiting(0)
+  , m_inflight(a_fixed_ttl_us, a_ttl_shards)
+  , m_waiting(0, a_ttl_shards)
   , m_fixed_ttl_us(a_fixed_ttl_us)
   , m_waiters(a_max_waiters)
   , m_owners(size_t(a_size) * size_t(a_backlog))
@@ -194,7 +206,7 @@ struct ConnectionPool {
     while (requeued < round_cap && m_waiters.TryDequeue(entry)) {
       // Skip waiters that already timed out (evicted from m_waiting by a
       // concurrent/prior SweepTimeouts -- nothing to notify, just drop).
-      if (m_waiting.find(entry.waiter_id) == m_waiting.end())
+      if (!m_waiting.contains(entry.waiter_id))
         continue;
 
       auto [conn, ids] = CheckOut(entry.samples, a_now);

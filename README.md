@@ -249,6 +249,10 @@ to `arterial_pool:start_link/2`) additionally controls `size`, `backlog`,
 `fifo`, `fixed_timeout_us`, `sweep_interval_ms`, `protocol`, `client`, and
 `client_opts` (the per-connection options map above).
 
+For a full step-by-step walkthrough of implementing both behaviours,
+wiring them into a pool, and testing against a real server, see
+[docs/clent-guide.md](docs/clent-guide.md).
+
 ## Documentation
 
 This README is the primary documentation; module-level `@doc`/`-spec`
@@ -257,4 +261,7 @@ yet published to Hex, so there are no hosted hexdocs.
 
 ## License
 
-[MIT License](LICENSE)
+Arterial uses [MIT License](LICENSE). You can use the source code freely
+in any project, including commercial applications, as long as you give
+credit by publishing the contents of the LICENSE file somewhere in your
+documentation.

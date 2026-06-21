@@ -16,6 +16,12 @@ socket, real `gen_tcp`-style connect, real bytes on the wire -- works
 together.
 """.
 
+%% If anything after arterial_pool:start_link/2 fails (most likely
+%% wait_until_available/3 exhausting its retries), this runs *before* any
+%% test body's own try/after -- so without cleaning up here, the pool's
+%% registered supervisor name, its buffer ETS table, and the listening
+%% test_tcp_server would all leak past this test, making every subsequent
+%% setup/0 in the suite fail with {already_started, _}.
 setup() ->
   {ok, Srv} = test_tcp_server:start(0),
   Port = test_tcp_server:port(Srv),
@@ -25,10 +31,16 @@ setup() ->
     client      => test_echo_client,
     client_opts => #{address => "127.0.0.1", port => Port, protocol => tcp}
   }),
-  %% Give the pool's connections a moment to dial in before the test
-  %% issues its first call/3.
-  wait_until_available(tcp_echo_pool, 2, 50),
-  {Srv, SupPid}.
+  try
+    %% Give the pool's connections a moment to dial in before the test
+    %% issues its first call/3.
+    wait_until_available(tcp_echo_pool, 2, 50),
+    {Srv, SupPid}
+  catch
+    Class:Reason:Stack ->
+      teardown({Srv, SupPid}),
+      erlang:raise(Class, Reason, Stack)
+  end.
 
 teardown({Srv, SupPid}) ->
   ok = supervisor:stop(SupPid),

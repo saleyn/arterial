@@ -17,15 +17,27 @@ peer for a `dgram` socket) and registers it directly with the pool via
 socket instead of the atom `dummy_socket`.
 """.
 
+%% arterial_nif:create/5 stores the pool's resource in persistent_term,
+%% which silently overwrites rather than failing on a name collision --
+%% so if anything after create/5 fails here (before any test body's own
+%% try/after runs), clean up what was already started instead of leaking
+%% udp_echo_pool's C++ pool resource, buffer ETS table, and server/socket
+%% past this test.
 setup() ->
   {ok, Srv} = test_udp_server:start(0),
   Port = test_udp_server:port(Srv),
   {ok, Sock} = socket:open(inet, dgram, udp),
   ok = socket:connect(Sock, #{family => inet, addr => {127,0,0,1}, port => Port}),
   ok = arterial_nif:create(udp_echo_pool, 1, 1, true, test_echo_protocol),
-  true = arterial_nif:set_socket(udp_echo_pool, 0, Sock),
-  true = arterial_nif:make_available(udp_echo_pool, 0),
-  {Srv, Sock}.
+  try
+    true = arterial_nif:set_socket(udp_echo_pool, 0, Sock),
+    true = arterial_nif:make_available(udp_echo_pool, 0),
+    {Srv, Sock}
+  catch
+    Class:Reason:Stack ->
+      teardown({Srv, Sock}),
+      erlang:raise(Class, Reason, Stack)
+  end.
 
 teardown({Srv, Sock}) ->
   ok = arterial_nif:destroy(udp_echo_pool),
