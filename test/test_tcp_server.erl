@@ -56,7 +56,11 @@ init(Parent, Port) ->
   {ok, LSock} = socket:open(inet, stream, tcp),
   ok = socket:setopt(LSock, socket, reuseaddr, true),
   ok = socket:bind(LSock, #{family => inet, addr => {127,0,0,1}, port => Port}),
-  ok = socket:listen(LSock),
+  %% Default backlog is small on some platforms; a pool with many
+  %% connections all dialing in at once (e.g. arterial_bench) can exceed
+  %% it, leaving extra SYNs queued at the kernel level until the single
+  %% accept-at-a-time loop below catches up.
+  ok = socket:listen(LSock, 128),
   {ok, #{port := ListenPort}} = socket:sockname(LSock),
   Parent ! {self(), ready, ListenPort},
   accept_loop(LSock, ListenPort, []).
@@ -73,7 +77,14 @@ accept_loop(LSock, ListenPort, Conns) ->
         ConnPid = spawn(fun() -> conn_recv_loop(ASock, <<>>) end),
         ok = socket:setopt(ASock, otp, controlling_process, ConnPid),
         Self ! {self(), accepted, ConnPid};
-      {error, _} -> ok
+      {error, Reason} ->
+        %% loop/4 only re-arms the next acceptor upon {accepted,...} --
+        %% an accept error (can happen transiently under a burst of
+        %% near-simultaneous connection attempts) must still notify the
+        %% loop, or every connection still queued in the kernel's accept
+        %% backlog is silently never accepted, hanging those clients'
+        %% connect/5 calls forever instead of just failing this one.
+        Self ! {self(), accept_error, Reason}
     end
   end),
   loop(LSock, ListenPort, AcceptorPid, Conns).
@@ -82,6 +93,8 @@ loop(LSock, ListenPort, AcceptorPid, Conns) ->
   receive
     {AcceptorPid, accepted, ConnPid} ->
       accept_loop(LSock, ListenPort, [ConnPid | Conns]);
+    {AcceptorPid, accept_error, _Reason} ->
+      accept_loop(LSock, ListenPort, Conns);
     {From, get_port} ->
       From ! {self(), port, ListenPort},
       loop(LSock, ListenPort, AcceptorPid, Conns);

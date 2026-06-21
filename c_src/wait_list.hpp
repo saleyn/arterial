@@ -22,6 +22,7 @@
 //-----------------------------------------------------------------------------
 #pragma once
 
+#include "arterial_util.hpp"
 #include <erl_nif.h>
 #include <atomic>
 #include <cstddef>
@@ -147,13 +148,6 @@ struct WaitList {
   }
 
 private:
-  static size_t RoundUpPow2(size_t n)
-  {
-    size_t p = 1;
-    while (p < n) p <<= 1;
-    return p;
-  }
-
   MpmcRing<WaitEntry> m_ring;
   bool                m_enabled;
 };

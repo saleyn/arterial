@@ -23,7 +23,7 @@ independent of (and in addition to) the TTL-based timeout registry (see
 in-flight.
 """.
 
--export([create/5, create/6, create/7, destroy/1]).
+-export([create/5, create/6, create/7, create/8, destroy/1]).
 -export([checkout_connection/2, checkin_connection/2, checkin_connection/4]).
 -export([checkout_async/3]).
 -export([set_socket/3, make_available/2, make_unavailable/2]).
@@ -113,18 +113,84 @@ ok
 """.
 -spec create(pool(), pos_integer(), pos_integer(), boolean(), module(),
               non_neg_integer(), non_neg_integer()) -> ok.
-create(Pool, Size, Backlog, Fifo, Protocol, FixedTimeoutUs, MaxWaiters)
+create(Pool, Size, Backlog, Fifo, Protocol, FixedTimeoutUs, MaxWaiters) ->
+  create(Pool, Size, Backlog, Fifo, Protocol, FixedTimeoutUs, MaxWaiters, nproc).
+
+-doc """
+Like `create/7`, but additionally controls the shard count of the pool's
+internal in-flight-request/queued-waiter registries (see
+`c_src/sharded_ttl_map.hpp`) via `TtlShards`:
+
+* `nproc` (the default via `create/5`, `create/6`, `create/7`) picks a
+  shard count scaled to `std::thread::hardware_concurrency()` on the C++
+  side (see `ShardedTTLMap::DefaultShardCount()`) -- a good default for a
+  pool that doesn't share its scheduler budget with many sibling pools.
+* `{nproc, N}` multiplies that same core count by `N` instead of the
+  fixed factor `DefaultShardCount()` uses internally -- e.g. `{nproc, 4}`
+  for a pool expected to see unusually high concurrent contention, or
+  `{nproc, 1}` to shard more conservatively than the default on a pool
+  that mostly serves one caller at a time.
+* A positive integer overrides this directly with an exact shard count,
+  e.g. if many pools run on one machine and each should claim a smaller,
+  fixed share rather than each independently sizing itself off the whole
+  machine's core count.
+
+Contention on a single shard's lock only happens when multiple concurrent
+calls hash to the *same* shard at the *same* instant -- `nproc`/`{nproc,
+N}` bound how many calls can truly run concurrently (BEAM schedulers), but
+hashing isn't perfectly uniform, so a hot pool under heavy load may still
+see occasional collisions even with core-scaled sharding; pass a larger
+fixed value if profiling shows this registry's lock as a bottleneck for a
+specific pool.
+
+## Examples
+
+```
+1> arterial_nif:create(my_pool, 4, 16, true, my_protocol, 5000000, 100, nproc).
+ok
+2> arterial_nif:create(my_pool2, 4, 16, true, my_protocol, 5000000, 100, {nproc, 4}).
+ok
+3> arterial_nif:create(my_pool3, 4, 16, true, my_protocol, 5000000, 100, 8).
+ok
+```
+""".
+-spec create(pool(), pos_integer(), pos_integer(), boolean(), module(),
+              non_neg_integer(), non_neg_integer(),
+              non_neg_integer() | nproc | {nproc, pos_integer()}) -> ok.
+create(Pool, Size, Backlog, Fifo, Protocol, FixedTimeoutUs, MaxWaiters, TtlShards)
     when is_atom(Pool), is_integer(Size), Size > 0,
          is_integer(Backlog), Backlog > 0, is_boolean(Fifo), is_atom(Protocol),
          is_integer(FixedTimeoutUs), FixedTimeoutUs >= 0,
          is_integer(MaxWaiters), MaxWaiters >= 0 ->
-  {ok, Resource} = create_pool(Size, Backlog, Fifo, FixedTimeoutUs, MaxWaiters),
+  TtlShards1 = ttl_shards(TtlShards),
+  {ok, Resource} = create_pool(Size, Backlog, Fifo, FixedTimeoutUs, MaxWaiters, TtlShards1),
   persistent_term:put(pool_key(Pool), Resource),
   persistent_term:put(proto_key(Pool), Protocol),
   Owner = ensure_table_owner(),
   Owner ! {new_table, self(), buf_table(Pool)},
   receive {Owner, table_ready} -> ok end,
   ok.
+
+%% `nproc` -> 0, which create_pool/6 (the create_nif NIF) reads as "pick
+%% ShardedTTLMap::DefaultShardCount() based on
+%% std::thread::hardware_concurrency()". Resolving plain `nproc` to an
+%% actual number here instead would just duplicate that core-count logic
+%% on the Erlang side with a different (and possibly inconsistent)
+%% source of "how many cores" -- simplest to let the C++ side own that
+%% one default. `{nproc, N}` can't defer to C++ the same way (it needs
+%% its own core count, not DefaultShardCount()'s fixed multiplier), so it
+%% resolves the core count on the Erlang side via
+%% erlang:system_info/1 instead.
+ttl_shards(nproc) ->
+  0;
+ttl_shards({nproc, N}) when is_integer(N), N > 0 ->
+  Cores = case erlang:system_info(logical_processors_available) of
+    unknown -> erlang:system_info(logical_processors);
+    Known   -> Known
+  end,
+  N * max(1, Cores);
+ttl_shards(N) when is_integer(N), N >= 0 ->
+  N.
 
 -doc """
 Destroy `Pool`'s NIF resource and release its associated bookkeeping
@@ -498,7 +564,7 @@ table_owner_loop() ->
 %%% NIF functions
 %%%-----------------------------------------------------------------------------
 
-create_pool(_Size, _Backlog, _Fifo, _FixedTtlUs, _MaxWaiters) -> ?NOT_LOADED_ERROR.
+create_pool(_Size, _Backlog, _Fifo, _FixedTtlUs, _MaxWaiters, _TtlShards) -> ?NOT_LOADED_ERROR.
 destroy_pool(_Rsrc)                                      -> ?NOT_LOADED_ERROR.
 set_socket_nif(_Rsrc, _ConnID, _Socket)                  -> ?NOT_LOADED_ERROR.
 make_available_nif(_Rsrc, _ConnID)                       -> ?NOT_LOADED_ERROR.

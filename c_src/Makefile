@@ -11,8 +11,12 @@ ERL_INC := $(shell erl -noshell -noinput \
 CXXFLAGS = -std=c++23 -fPIC -Wall -Wextra -finline-functions -fvisibility=hidden \
            -I$(ERL_INC)
 
-
-# On macOS `libatomic` is not provided/needed; only link -latomic on Linux
+# On macOS `libatomic` is not provided/needed; only link -latomic on Linux.
+# LDFLAGS (common to both the NIF .so and the test_pool executable) vs.
+# SHARED_LDFLAGS (the .so-only bits) are kept separate -- test_pool is a
+# plain executable invoked directly (see the `test` target below), so
+# linking it with -shared/-dynamiclib would produce something that isn't
+# runnable as a program.
 UNAME := $(shell uname -s)
 ifeq ($(UNAME),Linux)
   LDFLAGS += -latomic
@@ -20,9 +24,9 @@ endif
 
 # Shared library flags: use -dynamiclib and permissive undefined symbol handling on macOS
 ifeq ($(UNAME),Darwin)
-  LDFLAGS += -dynamiclib -undefined dynamic_lookup
+  SHARED_LDFLAGS += -dynamiclib -undefined dynamic_lookup
 else
-  LDFLAGS  = -shared
+  SHARED_LDFLAGS += -shared
 endif
 
 # erlang:load_nif/2 appends the platform-specific extension itself
@@ -33,12 +37,12 @@ else
   EXT := .so
 endif
 
-SRC    := arterial.cpp
-OBJ    := $(OBJ_DIR)/arterial.o
-TARGET := $(PRIV_DIR)/arterial$(EXT)
+SRC         := arterial.cpp
+OBJ         := $(OBJ_DIR)/arterial.o
+TARGET      := $(PRIV_DIR)/arterial$(EXT)
 
 TEST_OBJ    := $(OBJ_DIR)/test_pool.o
-TEST_TARGET  = $(TEST_DIR)/test_pool$(EXT)
+TEST_TARGET  = $(TEST_DIR)/test_pool
 
 # Detect compiler family for LTO flags.
 # AppleClang uses ld64 which handles thin-LTO natively — no -fuse-ld=lld.
@@ -46,7 +50,7 @@ TEST_TARGET  = $(TEST_DIR)/test_pool$(EXT)
 # GCC uses -flto=auto with GNU ld/gold.
 CXX_ID := $(shell $(CXX) --version 2>&1 | head -1)
 ifneq ($(findstring clang,$(CXX_ID)),)
-  LDFLAGS := -fuse-ld=lld
+  LDFLAGS += -fuse-ld=lld
 endif
 
 ifeq ($(DEBUG),1)
@@ -58,7 +62,7 @@ endif
 all: $(TARGET) $(TEST_TARGET)
 
 $(TARGET): $(OBJ) | $(PRIV_DIR)
-	$(CXX) $(LDFLAGS) -I$(ERL_INC) -o $@ $<
+	$(CXX) $(LDFLAGS) $(SHARED_LDFLAGS) -I$(ERL_INC) -o $@ $<
 
 $(TEST_TARGET): $(TEST_OBJ) | $(TEST_DIR)
 	$(CXX) $(LDFLAGS) -I$(ERL_INC) -o $@ $<
@@ -72,9 +76,9 @@ $(TEST_OBJ) : test_pool.cpp pool_lifo.hpp pool_fifo.hpp nifpp.h | $(OBJ_DIR)
 $(PRIV_DIR) $(OBJ_DIR) $(TEST_DIR):
 	@mkdir -p $@
 
-run test: test_pool
-	@echo "==> Testing c_src/$<"
-	@./$< $(if $(debug),-d)
+run test: $(TEST_TARGET)
+	@echo "==> Testing $<"
+	@$< $(if $(debug),-d)
 
 ../priv:
 	mkdir -p ../priv

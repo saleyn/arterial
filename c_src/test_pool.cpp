@@ -1,5 +1,8 @@
 #include <iostream>
 #include <filesystem>
+#include <atomic>
+#include <thread>
+#include <vector>
 
 #include "pool_fifo.hpp"
 
@@ -31,6 +34,7 @@ bool debug = false;
 
 void test_lifo_pool(const char*);
 void test_fifo_pool(const char*);
+void test_fifo_pool_concurrent(const char*);
 
 int main(int argc, char* argv[]) {
 
@@ -38,6 +42,7 @@ int main(int argc, char* argv[]) {
 
   test_lifo_pool(argv[0]);
   test_fifo_pool(argv[0]);
+  test_fifo_pool_concurrent(argv[0]);
 }
 
 //-----------------------------------------------------------------------------
@@ -210,6 +215,68 @@ void test_fifo_pool(const char* exec) {
     pool.CheckIn(*nd);
 
   ASSERT_EQUAL(SIZE, pool.UnsafeSize());
+
+  OUTPUT(exec, "success");
+}
+
+//-----------------------------------------------------------------------------
+// Test FIFO under concurrent CheckOut()/CheckIn() load.
+//
+// Regression test for a real bug found via arterial_bench at pool_size=16
+// (== 2x nproc on the box where it was first reproduced): the pool's
+// CheckOut()/CheckIn() pair is on the hot path for every checkout/checkin
+// NIF call, called concurrently from many Erlang schedulers with no
+// dirty-scheduler serialization. The original hand-rolled Michael & Scott
+// style lock-free FIFO had multiple distinct concurrency bugs that only
+// manifested under sustained concurrent load at this scale -- none of
+// which the single-threaded test above (or the rest of the eunit suite,
+// whose pools are all size<=2) ever exercised. Each thread repeatedly
+// checks a node out and back in; correctness here means every thread
+// finishes all its iterations (no livelock/hang) and no two threads ever
+// observe the same node checked out at once (which would otherwise
+// silently corrupt per-connection state with zero internal synchronization
+// of its own, since it relies entirely on the pool for mutual exclusion).
+//-----------------------------------------------------------------------------
+void test_fifo_pool_concurrent(const char* exec) {
+  constexpr int kPoolSize   = 16;
+  constexpr int kThreads    = 16;
+  constexpr int kIterations = 200000;
+
+  struct Slot { std::atomic<int> owner{-1}; };
+
+  ObjectPoolFIFO<Slot> pool(kPoolSize);
+  for (uint32_t i = 0; i < kPoolSize; ++i)
+    pool.MakeAvailable(*pool.Get(i));
+
+  std::atomic<int>  violations{0};
+  std::atomic<int>  finished{0};
+
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      for (int i = 0; i < kIterations; ++i) {
+        auto* node = pool.CheckOut();
+        if (!node) continue; // pool momentarily empty; legitimate, retry
+
+        auto* slot = node->Value();
+        int expected = -1;
+        if (!slot->owner.compare_exchange_strong(expected, t))
+          violations.fetch_add(1, std::memory_order_relaxed);
+        else
+          slot->owner.store(-1, std::memory_order_relaxed);
+
+        pool.CheckIn(*node);
+      }
+      finished.fetch_add(1, std::memory_order_relaxed);
+    });
+  }
+
+  for (auto& th : threads)
+    th.join();
+
+  ASSERT_EQUAL(kThreads, finished.load());
+  ASSERT_EQUAL(0, violations.load());
 
   OUTPUT(exec, "success");
 }

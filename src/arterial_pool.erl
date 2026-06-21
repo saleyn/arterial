@@ -39,6 +39,7 @@ the defaults shown in the example below.
   fifo              => boolean(),
   fixed_timeout_us  => non_neg_integer(),
   sweep_interval_ms => pos_integer(),
+  ttl_shards        => non_neg_integer() | nproc | {nproc, pos_integer()},
   protocol          => arterial:protocol(),
   client            => arterial:client(),
   client_opts       => arterial_client:options()
@@ -81,6 +82,7 @@ init([Name, Opts]) ->
     fifo              := Fifo,
     fixed_timeout_us  := FixedTimeoutUs,
     sweep_interval_ms := SweepIntervalMs,
+    ttl_shards        := TtlShards,
     protocol          := Protocol,
     client            := Client,
     client_opts       := ClientOpts
@@ -90,10 +92,11 @@ init([Name, Opts]) ->
     fifo              => true,
     fixed_timeout_us  => 0,
     sweep_interval_ms => 1000,
+    ttl_shards        => nproc,
     client_opts       => #{}
   }, Opts),
 
-  ok = arterial_nif:create(Name, Size, Backlog, Fifo, Protocol, FixedTimeoutUs),
+  ok = arterial_nif:create(Name, Size, Backlog, Fifo, Protocol, FixedTimeoutUs, 0, TtlShards),
 
   ConnChildren = [
     #{

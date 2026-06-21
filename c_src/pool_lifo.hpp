@@ -209,9 +209,9 @@ concept DerivedFromPooledObject = requires(T obj) {
   []<typename U>(PooledObject<U>&){}(obj);
 };
 
-  template<class U, class ObjT>
-  concept IsObjOrUniqPtr = std::is_same_v<U, ObjT*>
-                        || std::is_same_v<U, std::unique_ptr<ObjT>>;
+template<class U, class ObjT>
+concept IsObjOrUniqPtr = std::is_same_v<U, ObjT*>
+                      || std::is_same_v<U, std::unique_ptr<ObjT>>;
 
 //-----------------------------------------------------------------------------
 /// @brief Lock-free object pool
