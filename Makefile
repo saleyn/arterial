@@ -50,14 +50,27 @@ test:
 
 # Runs test/arterial_bench.erl against a real test_tcp_server over
 # loopback TCP -- not part of `test`/eunit (no _test exports), so it
-# needs its own target. Pass options as an Erlang map literal, e.g.:
-#   make bench BENCH_OPTS='#{pool_size => 16, duration_s => 10}'
-BENCH_OPTS ?= \#{}
+# needs its own target. Pass options either as a plain comma-separated
+# `key=value` list:
+#   make bench BENCH_OPTS='pool_size=16, duration_s=10'
+# or, if you need a non-trivial value (e.g. a binary), as a full Erlang
+# map literal -- detected by a leading '#{' and passed through as-is:
+#   make bench BENCH_OPTS='#{pool_size => 16, payload => <<"hi">>}'
+HASH := \#
+BENCH_OPTS ?=
+override BENCH_OPTS := $(strip $(BENCH_OPTS))
+ifeq ($(BENCH_OPTS),)
+BENCH_OPTS_MAP := $(HASH){}
+else ifneq ($(findstring $(HASH){,$(BENCH_OPTS)),)
+BENCH_OPTS_MAP := $(BENCH_OPTS)
+else
+BENCH_OPTS_MAP := $(HASH){$(shell echo '$(BENCH_OPTS)' | sed -E 's/([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*=[[:space:]]*([^,]+)/\1 => \2/g')}
+endif
 bench bench-help:
 	@$(REBAR) as test compile
 	@erl -noshell -noinput -pa _build/test/lib/arterial/ebin \
 	  -pa _build/test/lib/arterial/test \
-	  -eval "arterial_bench:$(subst -,_,$@)($(BENCH_OPTS)), halt()."
+	  -eval "arterial_bench:$(subst -,_,$@)($(BENCH_OPTS_MAP)), halt()."
 
 clean:
 	$(MAKE) -C c_src $@

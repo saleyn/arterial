@@ -26,7 +26,7 @@ in-flight.
 -export([create/5, create/6, create/7, create/8, destroy/1]).
 -export([checkout_connection/2, checkin_connection/2, checkin_connection/4]).
 -export([checkout_async/3]).
--export([set_socket/3, make_available/2, make_unavailable/2]).
+-export([set_socket/3, make_available/2, make_unavailable/2, connection_drained/2]).
 -export([track_inflight/5, sweep_timeouts/1]).
 -export([start_link/0]).
 
@@ -267,6 +267,25 @@ true
 -spec make_unavailable(pool(), non_neg_integer()) -> boolean().
 make_unavailable(Pool, ConnID) ->
   make_unavailable_nif(resource(Pool), ConnID).
+
+-doc """
+Returns `true` if connection `ConnID` of `Pool` currently has zero
+in-flight requests checked out of its backlog -- i.e. it's safe to
+disconnect without abandoning a pending request. Used to implement a
+"bounce" cycle: mark the connection unavailable (see `make_unavailable/2`)
+so no new request selects it, poll this until it drains, then disconnect
+and reconnect.
+
+## Examples
+
+```
+1> arterial_nif:connection_drained(my_pool, 0).
+true
+```
+""".
+-spec connection_drained(pool(), non_neg_integer()) -> boolean().
+connection_drained(Pool, ConnID) ->
+  connection_drained_nif(resource(Pool), ConnID).
 
 -doc """
 Check out a connection able to accept one new request. `Mode` does not
@@ -569,6 +588,7 @@ destroy_pool(_Rsrc)                                      -> ?NOT_LOADED_ERROR.
 set_socket_nif(_Rsrc, _ConnID, _Socket)                  -> ?NOT_LOADED_ERROR.
 make_available_nif(_Rsrc, _ConnID)                       -> ?NOT_LOADED_ERROR.
 make_unavailable_nif(_Rsrc, _ConnID)                     -> ?NOT_LOADED_ERROR.
+connection_drained_nif(_Rsrc, _ConnID)                    -> ?NOT_LOADED_ERROR.
 checkout_nif(_Rsrc, _Pid, _Samples)                      -> ?NOT_LOADED_ERROR.
 checkin_nif(_Rsrc, _ConnID, _ReqIDs, _PoolName, _Pid)    -> ?NOT_LOADED_ERROR.
 checkout_async_nif(_Rsrc, _Pid, _TtlUs)                  -> ?NOT_LOADED_ERROR.

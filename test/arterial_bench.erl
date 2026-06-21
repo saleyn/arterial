@@ -30,6 +30,16 @@ Tune the load shape via `bench/1`; see `help/0` for the full option list:
 ```
 1> arterial_bench:bench(#{pool_size => 16, duration_s => 10}).
 ```
+
+From the shell, `BENCH_OPTS` takes a plain comma-separated `key=value`
+list (the Makefile converts it to a map literal); for values that need
+real Erlang syntax (e.g. a binary), pass a map literal directly --
+detected by a leading `#{` and passed through as-is:
+
+```
+$ make bench BENCH_OPTS='pool_size=16, duration_s=10'
+$ make bench BENCH_OPTS='#{pool_size => 16, payload => <<"hi">>}'
+```
 """.
 
 -export([bench/0, bench/1, help/0, bench_help/1]).
@@ -55,7 +65,8 @@ bench_help(_) -> help().
 -doc """
 Print the supported `t:opts/0` keys, their defaults, and how to pass them
 -- from a shell (`arterial_bench:help().`) or via `make bench
-BENCH_OPTS='#{...}'`.
+BENCH_OPTS='key=value, ...'` (or `BENCH_OPTS='#{...}'` for values that
+need real Erlang syntax).
 """.
 -spec help() -> ok.
 help() ->
@@ -92,6 +103,7 @@ help() ->
     "  2> arterial_bench:bench(#{pool_size => 16, duration_s => 10}).~n"
     "~n"
     "  $ make bench~n"
+    "  $ make bench BENCH_OPTS='pool_size=16, duration_s=10'~n"
     "  $ make bench BENCH_OPTS='#{pool_size => 16, duration_s => 10}'~n"
   ),
   ok.

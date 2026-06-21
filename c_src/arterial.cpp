@@ -94,6 +94,19 @@ ERL_NIF_TERM make_unavailable_nif(ErlNifEnv* env, [[maybe_unused]] int argc, con
   return make(env, ptr->MakeUnavailable(id));
 }
 
+ERL_NIF_TERM connection_drained_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
+{
+  assert(argc == 2);
+
+  resource_ptr<ConnectionPool> ptr;
+  unsigned int                 id;
+
+  if (!get(env, argv[0], ptr) || !get(env, argv[1], id)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  return make(env, ptr->IsDrained(id));
+}
+
 ERL_NIF_TERM checkout_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
 {
   assert(argc == 3);
@@ -266,6 +279,7 @@ ErlNifFunc nif_funcs[] = {
   {"set_socket_nif",       3, set_socket_nif,       0},
   {"make_available_nif",   2, make_available_nif,   0},
   {"make_unavailable_nif", 2, make_unavailable_nif, 0},
+  {"connection_drained_nif", 2, connection_drained_nif, 0},
   {"checkout_nif",         3, checkout_nif,         0},
   {"checkin_nif",          5, checkin_nif,          0},
   {"checkout_async_nif",   3, checkout_async_nif,   0},

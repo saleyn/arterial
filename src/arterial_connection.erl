@@ -23,8 +23,11 @@ in individual requests.
 -compile({no_auto_import, [min/2]}).
 
 -export([start_link/4]).
+-export([bounce/2]).
 -export([init/1, handle_continue/2, handle_call/3, handle_cast/2, handle_info/2,
           terminate/2]).
+
+-define(BOUNCE_DRAIN_POLL_INTERVAL_MS, 100).
 
 -record(recon_state, {
   cur :: undefined | arterial:time(),
@@ -49,11 +52,17 @@ in individual requests.
 
 -type impl_state()      :: any().
 
+-record(bounce_state, {
+  from        :: gen_server:from(),
+  deadline    :: integer() % erlang:monotonic_time(millisecond)
+}).
+
 -record(state, {
   ss                    :: #srv_state{},
   is                    :: impl_state(),
   sock                  :: undefined | arterial:socket(),
-  timer_ref             :: undefined | reference()
+  timer_ref             :: undefined | reference(),
+  bounce                :: undefined | #bounce_state{}
 }).
 
 -type state()           :: #state{}.
@@ -97,6 +106,34 @@ reconnects, with backoff) on its own; this call returns as soon as the
 start_link(Pool, ConnID, Client, CliOpts)
     when is_atom(Pool), is_integer(ConnID), ConnID >= 0, is_map(CliOpts) ->
   gen_server:start_link(?MODULE, [Pool, ConnID, Client, CliOpts], []).
+
+-doc """
+Bounce this connection: mark it unavailable for new checkouts, wait (up
+to `DrainTimeoutMs`) for its backlog to drain of in-flight requests, then
+disconnect and attempt one immediate reconnect, replying only once that
+full cycle finishes (successfully or not).
+
+Used by `arterial_bouncer` to recycle pool connections periodically (see
+`arterial_pool`'s `bounce_interval_ms` option); not meant to be called
+directly by callers of the library.
+
+Returns `ok` once the connection is available again (reconnected) or has
+entered the normal backoff/retry path after a failed reconnect attempt;
+`{error, timeout}` if the backlog never drained within `DrainTimeoutMs`
+(the connection is left marked unavailable and disconnected regardless,
+since forcibly bouncing it is the whole point -- a stuck request
+shouldn't be able to block recycling forever).
+
+## Examples
+
+```
+1> arterial_connection:bounce(ConnPid, 30000).
+ok
+```
+""".
+-spec bounce(pid(), pos_integer()) -> ok | {error, timeout}.
+bounce(Pid, DrainTimeoutMs) when is_integer(DrainTimeoutMs), DrainTimeoutMs > 0 ->
+  gen_server:call(Pid, {bounce, DrainTimeoutMs}, DrainTimeoutMs + 5000).
 
 %%%-----------------------------------------------------------------------------
 %%% gen_server callbacks
@@ -142,6 +179,19 @@ init([Pool, ConnID, Client, CliOpts]) ->
 handle_continue(reconnect, State) -> handle_info(reconnect, State).
 
 -doc false.
+handle_call({bounce, _}, _From, #state{bounce = #bounce_state{}} = State) ->
+  % Already bouncing (e.g. a stale/duplicate request from the bouncer) --
+  % don't start a second drain-poll cycle on top of the first.
+  {reply, {error, already_bouncing}, State};
+
+handle_call({bounce, DrainTimeoutMs}, From, #state{
+  ss = #srv_state{pool = Pool, conn_id = ConnID}
+} = State) ->
+  arterial_nif:make_unavailable(Pool, ConnID),
+  Deadline = erlang:monotonic_time(millisecond) + DrainTimeoutMs,
+  self() ! bounce_check,
+  {noreply, State#state{bounce = #bounce_state{from = From, deadline = Deadline}}};
+
 handle_call(Msg, _From, #state{ss = #srv_state{pfx = Pfx}} = State) ->
   ?LOG_WARNING("~s got unexpected call: ~p", [Pfx, Msg]),
   {reply, {error, unexpected_call}, State}.
@@ -154,6 +204,9 @@ handle_cast(Msg, #state{ss = #srv_state{pfx = Pfx}} = State) ->
 -doc false.
 handle_info(reconnect, State) ->
   reconnect(State);
+
+handle_info(bounce_check, #state{bounce = #bounce_state{}} = State) ->
+  bounce_check(State);
 
 handle_info(Msg, #state{ss = #srv_state{pfx = Pfx}} = State) ->
   ?LOG_WARNING("~s got unexpected msg: ~p", [Pfx, Msg]),
@@ -210,6 +263,43 @@ client_init(#state{
     disconnect(R, State)
   end.
 
+%% Poll for `State`'s connection (the one currently being bounced; see
+%% handle_call({bounce, _}, ...)) to drain of in-flight requests. Once
+%% drained (or the bounce's deadline passes), disconnect and make exactly
+%% one immediate reconnect attempt -- bypassing the normal backoff timer,
+%% since this is a deliberate recycle, not a failure -- then reply to the
+%% bouncer and clear `State#state.bounce` regardless of whether that
+%% attempt succeeded (a failed attempt falls back to the normal
+%% reconnect/backoff loop on its own, same as any other disconnect).
+bounce_check(#state{
+  bounce = #bounce_state{from = From, deadline = Deadline},
+  ss     = #srv_state{pool = Pool, conn_id = ConnID, pfx = Pfx}
+} = State) ->
+  Drained  = arterial_nif:connection_drained(Pool, ConnID),
+  TimedOut = erlang:monotonic_time(millisecond) >= Deadline,
+  case Drained orelse TimedOut of
+    true ->
+      (TimedOut andalso not Drained) andalso
+        ?LOG_NOTICE("~s bounce: backlog did not drain before deadline, forcing it anyway", [Pfx]),
+      {noreply, State1} = disconnect(bounce, State#state{bounce = undefined}),
+      % disconnect/2 always schedules a backoff-delayed reconnect via
+      % recon_timer/1 -- cancel it before making our own immediate
+      % attempt below, otherwise a second, redundant reconnect would fire
+      % later (harmless if it finds itself already connected, but wasteful,
+      % and racy if it fires mid-handshake of this immediate attempt).
+      cancel_timer(State1#state.timer_ref),
+      {noreply, State2} = reconnect(State1#state{timer_ref = undefined}),
+      Reply = case TimedOut andalso not Drained of
+        true  -> {error, timeout};
+        false -> ok
+      end,
+      gen_server:reply(From, Reply),
+      {noreply, State2};
+    false ->
+      erlang:send_after(?BOUNCE_DRAIN_POLL_INTERVAL_MS, self(), bounce_check),
+      {noreply, State}
+  end.
+
 disconnect(Reason, #state{ss = #srv_state{pfx=Pfx, pool=Pool, conn_id=ConnID,
                                            client=Cli}, is=ImplState, sock=Sock} = State) ->
   case Sock of
@@ -227,6 +317,9 @@ disconnect(Reason, #state{ss = #srv_state{pfx=Pfx, pool=Pool, conn_id=ConnID,
       end
   end,
   {noreply, recon_timer(State#state{sock = undefined, is = undefined})}.
+
+cancel_timer(undefined) -> ok;
+cancel_timer(TimerRef)  -> erlang:cancel_timer(TimerRef), ok.
 
 address(Opts) ->
   case maps:get(address, Opts, undefined) of
