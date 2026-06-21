@@ -33,10 +33,12 @@ an already-parsed `inet:ip_address()`.
 -type inet_port() :: inet:port_number().
 
 -doc """
-The underlying transport socket, as returned by `arterial_socket:connect/5`
-(an OTP `socket` module handle, not a legacy `gen_tcp`/`gen_udp` port).
+The underlying transport socket, as returned by `arterial_socket:connect/5`:
+an OTP `socket` module handle for `tcp`/`udp` (not a legacy
+`gen_tcp`/`gen_udp` port), or an opaque `ssl:sslsocket()` for `ssl` (see
+`m:arterial_socket`'s moduledoc).
 """.
--type socket() :: socket:socket().
+-type socket() :: socket:socket() | ssl:sslsocket().
 
 -doc """
 Low-level socket options applied right after connecting, expressed as
@@ -50,6 +52,22 @@ Low-level socket options applied right after connecting, expressed as
 ```
 """.
 -type socket_options() :: [{{Level::atom(), Opt::atom()}, Value::term()}].
+
+-doc """
+TLS options passed straight through to `ssl:connect/3` when a connection's
+transport is `ssl` (requires OTP 28+, see `m:arterial_socket`'s moduledoc).
+Not validated or wrapped by `arterial` -- any `ssl:tls_client_option()` is
+accepted as-is, e.g. `verify`, `cacertfile`, `certfile`, `keyfile`,
+`server_name_indication`.
+
+## Examples
+
+```
+1> Opts = [{verify, verify_peer}, {cacertfile, "/etc/ssl/ca.pem"}].
+[{verify,verify_peer},{cacertfile,"/etc/ssl/ca.pem"}]
+```
+""".
+-type tls_options() :: [ssl:tls_client_option()].
 
 -doc "A duration in milliseconds, e.g. a reconnect backoff or sweep interval.".
 -type time() :: non_neg_integer().
@@ -71,6 +89,7 @@ A wire-level request identifier, as encoded by
   inet_port/0,
   socket/0,
   socket_options/0,
+  tls_options/0,
   time/0,
   request_id/0,
   response/0
