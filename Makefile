@@ -53,6 +53,7 @@ test:
 # needs its own target. Pass options either as a plain comma-separated
 # `key=value` list:
 #   make bench BENCH_OPTS='pool_size=16, duration_s=10'
+#   make bench BENCH_OPTS='mode=async'
 # or, if you need a non-trivial value (e.g. a binary), as a full Erlang
 # map literal -- detected by a leading '#{' and passed through as-is:
 #   make bench BENCH_OPTS='#{pool_size => 16, payload => <<"hi">>}'
@@ -71,6 +72,18 @@ bench bench-help:
 	@erl -noshell -noinput -pa _build/test/lib/arterial/ebin \
 	  -pa _build/test/lib/arterial/test \
 	  -eval "arterial_bench:$(subst -,_,$@)($(BENCH_OPTS_MAP)), halt()."
+
+# Runs test/shackle_bench.erl -- the same workload shape/wire framing as
+# `bench` above, but driven through https://github.com/lpgauth/shackle
+# instead of arterial, for a direct throughput/latency comparison. The
+# `shackle` dependency is only pulled in under the `test` profile (see
+# rebar.config), so this needs every dep app's ebin on the code path,
+# not just arterial's.
+bench-shackle bench-shackle-help:
+	@$(REBAR) as test compile
+	@erl -noshell -noinput -pa _build/test/lib/*/ebin \
+	  -pa _build/test/lib/arterial/test \
+	  -eval "shackle_bench:$(subst -,_,$(subst bench-shackle,bench,$@))($(BENCH_OPTS_MAP)), halt()."
 
 clean:
 	$(MAKE) -C c_src $@
