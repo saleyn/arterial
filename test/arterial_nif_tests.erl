@@ -23,9 +23,10 @@ setup(Pool, Size, Backlog, Fifo, FixedTtlUs, MaxWaiters) ->
 teardown(Pool) ->
   ok = arterial_nif:destroy(Pool),
   %% Guard against cross-test mailbox contamination: any stray message
-  %% for this pool (e.g. a {arterial_ready,...}/{arterial_timeout,...}
-  %% the test forgot to assert on) must not leak into the next test.
-  Leftover = flush_timeouts(Pool) ++ flush_ready(Pool),
+  %% for this pool (e.g. a {arterial_ready,...}/{arterial_timeout,...}/
+  %% {arterial_disconnected,...} the test forgot to assert on) must not
+  %% leak into the next test.
+  Leftover = flush_timeouts(Pool) ++ flush_ready(Pool) ++ flush_disconnected(Pool),
   [] = Leftover.
 
 %% Test helpers for protocol-based tests that use `test_protocol`.
@@ -48,6 +49,12 @@ flush_timeouts(Pool) ->
 flush_ready(Pool) ->
   receive
     {arterial_ready, Pool, _, _, _, _} = M -> [M | flush_ready(Pool)]
+  after 0 -> []
+  end.
+
+flush_disconnected(Pool) ->
+  receive
+    {arterial_disconnected, Pool, _} = M -> [M | flush_disconnected(Pool)]
   after 0 -> []
   end.
 
@@ -250,6 +257,214 @@ checkout_async_fifo_order_test() ->
     teardown(Pool)
   end.
 
+%% Mode (d): a single connection with backlog>1 accepts multiple
+%% concurrently outstanding requests (multiplexing) via checkout_connection/3's
+%% Samples argument, reserving several backlog slots on one connection in a
+%% single call -- this is what backlog>1 buys over backlog=1, and is only
+%% safe when the server preserves send order in its replies (see
+%% docs/client-guide.md's "Surrogate request IDs" and README.md section
+%% 2.1's FIFO-ordering warning). FIFOBackLog::CheckIn ignores the ReqID
+%% argument it's given and always pops the head, so this test also pins
+%% that down: checking in with the *wrong* (non-head) ReqID still resolves
+%% the actual head request, never the one named.
+fifo_backlog_multiplexing_test() ->
+  Pool = setup(arterial_fifo_multiplex, 1, 3, true, 0, 0),
+  try
+    {ok, #{conn_id := 0, req_ids := [ReqID1, ReqID2, ReqID3]}} =
+      arterial_nif:checkout_connection(Pool, sync, 3),
+    true = ReqID1 =/= ReqID2,
+    true = ReqID2 =/= ReqID3,
+
+    %% Backlog capacity (3) is now fully reserved AND the connection itself
+    %% is checked out of the pool's available ring: a 2nd checkout (even
+    %% for just 1 sample) must fail rather than multiplex past capacity or
+    %% land on the same connection concurrently.
+    {error, no_connection} = arterial_nif:checkout_connection(Pool, sync),
+    false = arterial_nif:connection_drained(Pool, 0),
+
+    %% Check in using ReqID3 (the *last* one checked out, not the head) --
+    %% FIFOBackLog::CheckIn ignores the argument and pops the head (ReqID1)
+    %% regardless of which id is named, since the only contract this mode
+    %% offers is "replies arrive in send order". This also re-adds the
+    %% connection to the pool's available ring (checkin_nif always does,
+    %% independent of how many of the original Samples are still
+    %% outstanding), so a fresh 1-sample checkout below succeeds again.
+    ok = arterial_nif:checkin_connection(Pool, 0, [ReqID3], <<>>),
+    false = arterial_nif:connection_drained(Pool, 0),
+
+    %% Capacity freed by the checkin above is reusable immediately.
+    {ok, #{conn_id := 0, req_ids := [ReqID4]}} =
+      arterial_nif:checkout_connection(Pool, sync),
+
+    ok = arterial_nif:checkin_connection(Pool, 0, [ReqID2], <<>>),
+    ok = arterial_nif:checkin_connection(Pool, 0, [ReqID1], <<>>),
+    false = arterial_nif:connection_drained(Pool, 0),
+
+    ok = arterial_nif:checkin_connection(Pool, 0, [ReqID4], <<>>),
+    true = arterial_nif:connection_drained(Pool, 0)
+  after
+    teardown(Pool)
+  end.
+
+%% Mode (d) also works through the async/queue-when-busy path: a single
+%% checkout_async/4 call with Samples=2 reserves 2 backlog slots on one
+%% connection in one shot, exactly like checkout_connection/3.
+fifo_backlog_multiplexing_async_test() ->
+  Pool = setup(arterial_fifo_multiplex_async, 1, 2, true, 0, 4),
+  try
+    {ok, #{conn_id := 0, req_ids := [ReqID1, ReqID2]}} =
+      arterial_nif:checkout_async(Pool, self(), 1000000, 2),
+    true = ReqID1 =/= ReqID2,
+
+    %% A 3rd-sample request can't fit on the busy connection and there's
+    %% nowhere else to put it (pool size 1), so it queues instead of
+    %% failing immediately (MaxWaiters=4 here, unlike the sync test above).
+    {queued, _WaiterID} = arterial_nif:checkout_async(Pool, self(), 1000000, 1),
+    [] = flush_ready(Pool),
+
+    %% Checking in just one of the two multiplexed slots frees the
+    %% connection (checkin_nif unconditionally re-adds it to the pool's
+    %% available ring) and lets the queued waiter's 1-sample request
+    %% through immediately.
+    ok = arterial_nif:checkin_connection(Pool, 0, [ReqID1], <<>>),
+    [{arterial_ready, Pool, ReqID3, 0, dummy_socket, [ReqID3]}] = flush_ready(Pool),
+
+    ok = arterial_nif:checkin_connection(Pool, 0, [ReqID2], <<>>),
+    ok = arterial_nif:checkin_connection(Pool, 0, [ReqID3], <<>>),
+    true = arterial_nif:connection_drained(Pool, 0)
+  after
+    teardown(Pool)
+  end.
+
+%% Mode (f-2): a cumulative ack (checkin_up_to/3) releases every
+%% outstanding FIFO slot up to and including the named req_id in one
+%% call, in send order, even though each slot may belong to a different
+%% owning process (each reserved by its own checkout_async/4 call).
+checkin_up_to_releases_fifo_span_test() ->
+  Pool = setup(arterial_checkin_up_to, 1, 3, true, 0, 0),
+  try
+    {ok, #{conn_id := 0, req_ids := [ReqID1, ReqID2, ReqID3]}} =
+      arterial_nif:checkout_connection(Pool, sync, 3),
+    ok = arterial_nif:track_inflight(Pool, 0, ReqID1, self(), 1000000),
+    ok = arterial_nif:track_inflight(Pool, 0, ReqID2, self(), 1000000),
+    ok = arterial_nif:track_inflight(Pool, 0, ReqID3, self(), 1000000),
+
+    %% Ack only through ReqID2 -- ReqID3 must remain outstanding.
+    {ok, Released} = arterial_nif:checkin_up_to(Pool, 0, ReqID2),
+    [ReqID1, ReqID2] = Released,
+    false = arterial_nif:connection_drained(Pool, 0),
+
+    %% The freed capacity (2 of 3 slots) is immediately reusable.
+    {ok, #{conn_id := 0, req_ids := [ReqID4, ReqID5]}} =
+      arterial_nif:checkout_connection(Pool, sync, 2),
+
+    %% Ack the rest (ReqID3, then the two fresh ones) to fully drain.
+    {ok, [ReqID3]} = arterial_nif:checkin_up_to(Pool, 0, ReqID3),
+    {ok, [ReqID4, ReqID5]} = arterial_nif:checkin_up_to(Pool, 0, ReqID5),
+    true = arterial_nif:connection_drained(Pool, 0),
+
+    %% No {arterial_disconnected,...} (that's connection_down/2's job, not
+    %% checkin_up_to/3's) and no leftover {arterial_timeout,...} either.
+    [] = flush_disconnected(Pool),
+    [] = flush_timeouts(Pool)
+  after
+    teardown(Pool)
+  end.
+
+%% An ack for an id that was never outstanding (already checked in, or
+%% never reserved) is a no-op: {ok, []}, nothing released, no crash.
+checkin_up_to_noop_for_unknown_id_test() ->
+  Pool = setup(arterial_checkin_up_to_unknown, 1, 2, true, 0, 0),
+  try
+    {ok, #{conn_id := 0, req_ids := [ReqID1]}} =
+      arterial_nif:checkout_connection(Pool, sync),
+
+    {ok, []} = arterial_nif:checkin_up_to(Pool, 0, ReqID1 + 1000),
+    false = arterial_nif:connection_drained(Pool, 0),
+
+    ok = arterial_nif:checkin_connection(Pool, 0, [ReqID1], <<>>)
+  after
+    teardown(Pool)
+  end.
+
+%% checkin_up_to/3 against a random-access (fifo => false) backlog is a
+%% no-op: there's no FIFO order to bulk-collapse, since each request
+%% there is already individually id-matched.
+checkin_up_to_noop_for_random_access_backlog_test() ->
+  Pool = setup(arterial_checkin_up_to_ra, 1, 2, false, 0, 0),
+  try
+    {ok, #{conn_id := 0, req_ids := [ReqID1]}} =
+      arterial_nif:checkout_connection(Pool, sync),
+
+    {ok, []} = arterial_nif:checkin_up_to(Pool, 0, ReqID1),
+    false = arterial_nif:connection_drained(Pool, 0),
+
+    ok = arterial_nif:checkin_connection(Pool, 0, [ReqID1], <<>>)
+  after
+    teardown(Pool)
+  end.
+
+%% Disconnect notification: connection_down/2 must tell every owner of an
+%% in-flight (track_inflight/5-registered) request on a connection that it
+%% died, one {arterial_disconnected, Pool, ReqID} message per request, then
+%% free the backlog slot(s) and make the connection available again.
+connection_down_notifies_inflight_test() ->
+  Pool = setup(arterial_conn_down_notify, 1, 2, true, 0, 0),
+  try
+    {ok, #{conn_id := 0, req_ids := [ReqID1, ReqID2]}} =
+      arterial_nif:checkout_connection(Pool, sync, 2),
+    ok = arterial_nif:track_inflight(Pool, 0, ReqID1, self(), 1000000),
+    ok = arterial_nif:track_inflight(Pool, 0, ReqID2, self(), 1000000),
+
+    ok = arterial_nif:connection_down(Pool, 0),
+
+    Got = lists:sort(flush_disconnected(Pool)),
+    Want = lists:sort([
+      {arterial_disconnected, Pool, ReqID1},
+      {arterial_disconnected, Pool, ReqID2}
+    ]),
+    Want = Got,
+
+    %% Both backlog slots are released and the connection is reusable.
+    true = arterial_nif:connection_drained(Pool, 0),
+    {ok, #{conn_id := 0, req_ids := [_ReqID3]}} =
+      arterial_nif:checkout_connection(Pool, sync)
+  after
+    teardown(Pool)
+  end.
+
+%% A connection with no outstanding (tracked) in-flight requests is a
+%% no-op: no message, and the connection's drained/available state is
+%% unaffected.
+connection_down_noop_when_idle_test() ->
+  Pool = setup(arterial_conn_down_idle, 1, true, 0),
+  try
+    ok = arterial_nif:connection_down(Pool, 0),
+    [] = flush_disconnected(Pool),
+    true = arterial_nif:connection_drained(Pool, 0)
+  after
+    teardown(Pool)
+  end.
+
+%% A synchronous checkout (never registered via track_inflight/5) is not
+%% covered by connection_down/2 -- it's released (so the connection is
+%% reusable) but no {arterial_disconnected,...} message is sent, since the
+%% synchronous caller is expected to learn about the dead connection from
+%% its own recv/2 call instead.
+connection_down_skips_untracked_test() ->
+  Pool = setup(arterial_conn_down_untracked, 1, true, 0),
+  try
+    {ok, #{conn_id := 0, req_ids := [_ReqID]}} =
+      arterial_nif:checkout_connection(Pool, sync),
+
+    ok = arterial_nif:connection_down(Pool, 0),
+
+    [] = flush_disconnected(Pool),
+    true = arterial_nif:connection_drained(Pool, 0)
+  after
+    teardown(Pool)
+  end.
+
 %% checkout_async/3 also works with multiple real connections: queuing
 %% only happens once ALL connections are busy.
 checkout_async_multi_connection_test() ->
@@ -273,13 +488,19 @@ checkout_async_multi_connection_test() ->
     teardown(Pool)
   end.
 
-
 %%-----------------------------------------------------------------------------
 %% Protocol tests (sync + async) using `test_protocol` and an in-process
 %% test server.
 %%-----------------------------------------------------------------------------
 
 protocol_server_loop() ->
+  protocol_server_loop(undefined).
+
+%% `Observer`, if set, is sent every {cast_received, Term} the fake server
+%% decodes -- used by protocol_cast_test/0 to confirm a send-and-forget
+%% request actually reached the "wire" with no reply ever sent back
+%% (mode (e); see arterial_client:cast/2).
+protocol_server_loop(Observer) ->
   receive
     {request, From, Bin} ->
       %% decode the request; term is {ReqID, Payload}
@@ -289,13 +510,18 @@ protocol_server_loop() ->
             From ! {reply, term_to_binary({ReqID, Reply})};
           {ReqID, {async, DelayMs, Reply}} ->
             spawn(fun() -> timer:sleep(DelayMs), From ! {reply, term_to_binary({ReqID, Reply})} end);
+          {_ReqID, {cast, Term}} when Observer =/= undefined ->
+            %% Send-and-forget: no reply, ever -- just prove the server saw it.
+            Observer ! {cast_received, Term};
           _ ->
             ok
         end
       catch _:E:ST ->
         io:format("Server error ~p:\n  ~p\n", [E, ST])
       end,
-      protocol_server_loop();
+      protocol_server_loop(Observer);
+    {set_observer, Pid} ->
+      protocol_server_loop(Pid);
     stop -> ok
   end.
 
@@ -305,6 +531,40 @@ protocol_sync_call_test() ->
   try
     {ok, Resp} = arterial_client:call(Pool, {sync, hello}, 1000),
     ?assertEqual(hello, Resp)
+  after
+    Server ! stop,
+    teardown(Pool)
+  end.
+
+%% Mode (e), send-and-forget: cast/2 hands the request to the transport
+%% and returns immediately, with no reply ever expected or waited for.
+%% The fake server below never sends anything back for a {cast, Term}
+%% request; it just notifies the test process it was received, proving
+%% the bytes reached the wire without cast/2 blocking on (or needing) a
+%% response.
+protocol_cast_test() ->
+  Server = spawn(fun protocol_server_loop/0),
+  Server ! {set_observer, self()},
+  Pool =
+    try
+      setup_protocol(protocol_cast_pool, Server, 1)
+    catch _:E:ST -> {error, E, ST}
+    end,
+  try
+    case Pool of
+      {error, R, STrace} -> erlang:raise(error, R, STrace);
+      _                  -> ok
+    end,
+
+    ok = arterial_client:cast(Pool, {cast, hello}),
+    receive
+      {cast_received, hello} -> ok
+    after 200 -> ?assert(false, cast_never_reached_server)
+    end,
+
+    %% The connection must be immediately reusable -- cast/2 doesn't hold
+    %% the backlog slot, unlike call/3's hold-until-reply.
+    {ok, again} = arterial_client:call(Pool, {sync, again}, 1000)
   after
     Server ! stop,
     teardown(Pool)

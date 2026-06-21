@@ -479,6 +479,106 @@ struct ConnectionPool {
     });
   }
 
+  /// @brief Bulk/cumulative ack (mode (f-2)): release every backlog slot
+  /// on connection `conn_id` up to and including `upto_ext_req_id`, in
+  /// FIFO order, as if `checkin_connection/4` had been called once per
+  /// slot -- for a protocol whose acks confirm "everything through
+  /// sequence N" in one message instead of acking each request
+  /// individually. Each released request may belong to a *different*
+  /// owning process (unlike `checkin_nif`, which assumes one caller owns
+  /// every id it passes) -- this looks the owner up per-id via the
+  /// in-flight registry instead of taking a single `pid` argument, and
+  /// silently skips untracked (e.g. synchronous-path) ids the same way
+  /// `OnConnectionDown()` does.
+  ///
+  /// Only meaningful for a FIFO backlog (`fifo => true`); a no-op
+  /// returning an empty list against a random-access backlog (each
+  /// request there is already individually id-matched, so there's no
+  /// FIFO order to bulk-collapse) or if `upto_ext_req_id` doesn't match
+  /// any currently outstanding slot on `conn_id`.
+  ///
+  /// Does NOT send any notification itself -- this only releases
+  /// capacity; if the caller also wants `{arterial_disconnected,...}`-
+  /// style notification for each released id, that's a different
+  /// feature (see `OnConnectionDown()`), not implied by acking.
+  ///
+  /// @return the `ext_req_id` of every slot released (oldest first).
+  std::vector<ReqID> CheckInUpTo(ErlNifEnv* env, ERL_NIF_TERM pool_name,
+                                  uint32_t conn_id, ReqID upto_ext_req_id)
+  {
+    auto* conn = Get(conn_id);
+    if (!conn) [[unlikely]]
+      return {};
+
+    auto released = conn->Requests().CheckInUpTo(upto_ext_req_id);
+    if (released.empty())
+      return released;
+
+    for (auto ext_id : released) {
+      m_inflight.take(ext_id, [&](InflightEntry& entry) {
+        auto& [pid, entry_conn] = entry;
+        ReleaseOwnerReservation(env, pid, conn_id, {ext_id});
+      });
+    }
+
+    CheckIn(conn_id, env, pool_name);
+
+    return released;
+  }
+
+  /// @brief Call when connection `id`'s socket has died (e.g.
+  /// `arterial_connection`'s `disconnect/2`, right before closing the
+  /// socket and before the connection is reused for a reconnect): notifies
+  /// every process that still has an in-flight, unconfirmed request on
+  /// this connection with `{arterial_disconnected, PoolName, ReqID}` (one
+  /// message per outstanding request, not batched), so it can resubmit or
+  /// persist that request outside arterial. Then releases every backlog
+  /// slot and owner-table reservation those requests held, and makes the
+  /// connection itself available again (mirrors OnProcessDown(), but from
+  /// the connection side instead of the pid side -- a request can be
+  /// abandoned either because its owning *process* died (OnProcessDown())
+  /// or because its *connection* died (this), independently).
+  ///
+  /// Only requests registered via `TrackInflight()` (i.e. checked out
+  /// through `checkout_async_nif`/`checkout_nif` + `track_inflight_nif`)
+  /// are covered -- a synchronous caller blocked in its own `recv/2` call
+  /// is not in `m_inflight` and learns about the dead connection directly
+  /// from that call's `{error, closed}` return instead.
+  ///
+  /// Does nothing (no-op, not an error) if `id` does not name a
+  /// connection in this pool, or if it currently has no outstanding
+  /// requests.
+  void OnConnectionDown(ErlNifEnv* env, ERL_NIF_TERM pool_name, uint32_t id)
+  {
+    auto* conn = Get(id);
+    if (!conn) [[unlikely]]
+      return;
+
+    auto ext_ids = conn->Requests().OutstandingReqIDs();
+    if (ext_ids.empty())
+      return;
+
+    for (auto ext_id : ext_ids) {
+      m_inflight.take(ext_id, [&](InflightEntry& entry) {
+        auto& [pid, entry_conn] = entry;
+
+        auto* msg_env = enif_alloc_env();
+        auto  msg     = enif_make_tuple3(msg_env,
+                          enif_make_atom(msg_env, "arterial_disconnected"),
+                          enif_make_copy(msg_env, pool_name),
+                          enif_make_uint(msg_env, ext_id));
+        enif_send(env, &pid, msg_env, msg);
+        enif_free_env(msg_env);
+
+        ReleaseOwnerReservation(env, pid, id, {ext_id});
+      });
+
+      conn->Requests().CheckIn(ext_id);
+    }
+
+    CheckIn(id, env, pool_name);
+  }
+
 private:
   std::vector<std::unique_ptr<Connection>> m_scratch;
   ObjectPoolFIFO<Connection>               m_pool;

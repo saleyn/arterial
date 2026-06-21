@@ -1,5 +1,5 @@
 //-----------------------------------------------------------------------------
-/// \file   unordered_map_with_ttl.hpp
+/// \file   unordered_ttl_map.hpp
 /// \author Serge Aleynikov
 //-----------------------------------------------------------------------------
 /// \brief A Key/Value hashmap with TTL eviction.
@@ -102,7 +102,7 @@ namespace arterial {
     class ValDelete = erase_action,
     class Alloc     = std::allocator<std::pair<const K, val_node<T>>>
   >
-  struct unordered_map_with_ttl {
+  struct UnorderedTTLMap {
     struct ttl_node {
       uint64_t time;
       K        key;
@@ -114,20 +114,20 @@ namespace arterial {
     using iterator       = typename hash_map::iterator;
     using const_iterator = typename hash_map::const_iterator;
 
-    explicit unordered_map_with_ttl(uint64_t ttl)
+    explicit UnorderedTTLMap(uint64_t ttl)
       : m_ttl(ttl)
       , m_map()
       , m_lru()
       , m_assign(val_assigner<T>())
     {}
 
-    unordered_map_with_ttl(uint64_t ttl, const Alloc& alloc)
+    UnorderedTTLMap(uint64_t ttl, const Alloc& alloc)
       : m_ttl(ttl)
       , m_map(alloc)
       , m_assign(val_assigner<T>())
     {}
 
-    unordered_map_with_ttl(
+    UnorderedTTLMap(
       uint64_t         ttl,
       size_t           bucket_count,
       const Hash&      hash   = Hash(),
@@ -209,7 +209,7 @@ namespace arterial {
   template <class K, class T, class Hash, class KeyEq,
             class ValUpdate, class ValDelete, class Alloc>
   template <typename OnErase>
-  size_t unordered_map_with_ttl<K,T,Hash,KeyEq,ValUpdate,ValDelete,Alloc>
+  size_t UnorderedTTLMap<K,T,Hash,KeyEq,ValUpdate,ValDelete,Alloc>
   ::refresh(uint64_t now, OnErase const& on_erase)
   {
     // m_lru is kept sorted by absolute expiration time (ttl_node::time), so
@@ -234,7 +234,7 @@ namespace arterial {
 
   template <class K, class T, class Hash, class KeyEq,
             class ValUpdate, class ValDelete, class Alloc>
-  bool unordered_map_with_ttl<K,T,Hash,KeyEq,ValUpdate,ValDelete,Alloc>
+  bool UnorderedTTLMap<K,T,Hash,KeyEq,ValUpdate,ValDelete,Alloc>
   ::try_add(const K& key, T&& value, uint64_t now)
   {
     return try_add_with_ttl(key, std::move(value), now + m_ttl);
@@ -242,7 +242,7 @@ namespace arterial {
 
   template <class K, class T, class Hash, class KeyEq,
             class ValUpdate, class ValDelete, class Alloc>
-  bool unordered_map_with_ttl<K,T,Hash,KeyEq,ValUpdate,ValDelete,Alloc>
+  bool UnorderedTTLMap<K,T,Hash,KeyEq,ValUpdate,ValDelete,Alloc>
   ::try_add_with_ttl(const K& key, T&& value, uint64_t expire_at)
   {
     auto it        = m_map.find(key);

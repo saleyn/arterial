@@ -14,7 +14,7 @@ Implementations are passed to `arterial_pool:start_link/2` via the
 `client` and `client_opts` options.
 """.
 
--export([call/3]).
+-export([call/3, cast/2]).
 
 -optional_callbacks([handle_timeout/2]).
 
@@ -162,7 +162,14 @@ monitoring between calls.
 -spec call(arterial_pool:name(), term(), non_neg_integer()) ->
   {ok, arterial:response()} | {error, term()}.
 call(Pool, Request, Timeout) ->
-  case arterial_nif:checkout_connection(Pool, sync) of
+  arterial_observability:span([call], #{pool => Pool}, fun() ->
+    Result = do_call(Pool, Request, Timeout),
+    Outcome = case Result of {ok, _} -> ok; _ -> error end,
+    {Result, #{pool => Pool, result => Outcome}}
+  end).
+
+do_call(Pool, Request, Timeout) ->
+  case checkout(Pool, sync) of
     {ok, #{
       conn_id  := ConnID,
       protocol := Proto,
@@ -172,29 +179,100 @@ call(Pool, Request, Timeout) ->
     }} ->
       try
         TS = os:system_time(microsecond),
-        case Proto:encode_request(ReqID, Request, Timeout) of
-          {ok, Data} ->
-            case Proto:send(Socket, Data) of
-              ok ->
-                Expire = arterial_util:calc_expiration(TS, Timeout),
-                case receive_response(Socket, Proto, ReqID, Buffer, Expire) of
-                  {ok, Result, Rest} ->
-                    ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, Rest),
-                    {ok, Result};
-                  {error, _} = Error ->
-                    ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, <<>>),
-                    Error
-                end;
-              {error, _} = Error ->
-                ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, <<>>),
-                Error
-            end;
+        maybe
+          {ok, Data}         ?= Proto:encode_request(ReqID, Request, Timeout),
+          ok                 ?= Proto:send(Socket, Data),
+          Expire              = arterial_util:calc_expiration(TS, Timeout),
+          {ok, Result, Rest} ?= receive_response(Socket, Proto, ReqID, Buffer, Expire),
+          ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, Rest),
+          {ok, Result}
+        else
           {error, _} = Error ->
             ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, <<>>),
             Error
         end
       catch E:R:ST ->
         arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, <<>>),
+        erlang:raise(E, R, ST)
+      end;
+    {error, _} = Error ->
+      Error
+  end.
+
+%% Wraps arterial_nif:checkout_connection/2 with a [arterial, checkout, ...]
+%% span -- shared by call/3 (Mode = sync) and cast/2 (Mode = async).
+checkout(Pool, Mode) ->
+  arterial_observability:span([checkout], #{pool => Pool, mode => Mode}, fun() ->
+    Result = arterial_nif:checkout_connection(Pool, Mode),
+    Outcome = case Result of {ok, _} -> ok; {error, Reason} -> Reason end,
+    {Result, #{pool => Pool, mode => Mode, outcome => Outcome}}
+  end).
+
+-doc """
+Send `Request` on a connection checked out from `Pool` without waiting
+for (or expecting) any reply -- mode (e) of the backlog/protocol design:
+send-and-forget protocols (e.g. fire-and-forget logging/metrics) where
+every message is inherently one-way. The backlog slot is reserved and
+released back-to-back within this one call, never actually left
+in-flight: there's nothing to check in later, so unlike `call/3` there's
+no `req_ids` for a caller to hold onto, and `checkout_connection/2,3`'s
+`backlog`/multiplexing settings don't matter here -- `cast/2` never holds
+a slot long enough to contend with itself.
+
+Returns as soon as the bytes are handed to the transport's `send/2`
+(e.g. accepted into the OS socket buffer), not when (or whether) the
+remote peer actually processes them -- there is no protocol-level
+acknowledgement to wait for. If the underlying protocol needs delivery
+confirmation, use mode (f) (ack-based protocols) instead, which has a
+real reply to correlate (see `c:arterial_protocol:decode_reply/2`'s
+moduledoc).
+
+## Examples
+
+```
+1> arterial_pool:start_link(my_pool, #{protocol => my_log_proto, client => my_client,
+2>                                      client_opts => #{address => "localhost", port => 9000}}).
+{ok,<0.123.0>}
+2> arterial_client:cast(my_pool, {log, info, <<"started">>}).
+ok
+```
+""".
+-spec cast(arterial_pool:name(), term()) -> ok | {error, term()}.
+cast(Pool, Request) ->
+  arterial_observability:span([cast], #{pool => Pool}, fun() ->
+    Result = do_cast(Pool, Request),
+    Outcome = case Result of ok -> ok; _ -> error end,
+    {Result, #{pool => Pool, result => Outcome}}
+  end).
+
+do_cast(Pool, Request) ->
+  case checkout(Pool, async) of
+    {ok, #{
+      conn_id  := ConnID,
+      protocol := Proto,
+      socket   := Socket,
+      buffer   := Buffer,
+      req_ids  := [ReqID | _] = ReqIDs
+    }} ->
+      try
+        case Proto:encode_request(ReqID, Request, infinity) of
+          {ok, Data} ->
+            Result = Proto:send(Socket, Data),
+            %% Preserve Buffer as-is on checkin: cast/2 never reads from
+            %% the socket, so any bytes already buffered from a prior
+            %% call/3 on this connection (e.g. a reply's trailing bytes
+            %% belonging to the next response) must not be discarded here.
+            ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, Buffer),
+            case Result of
+              ok -> ok;
+              {error, _} = Error -> Error
+            end;
+          {error, _} = Error ->
+            ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, Buffer),
+            Error
+        end
+      catch E:R:ST ->
+        arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, Buffer),
         erlang:raise(E, R, ST)
       end;
     {error, _} = Error ->

@@ -208,22 +208,155 @@ per-test.
 ## Step 4: choosing `backlog`/`fifo`, and how requests get matched to replies
 
 This choice depends entirely on what your wire protocol's messages look
-like — see the README's [Protocol](../README.md#protocol) section for the
-three cases. In short:
+like — see the README's [Protocol](../README.md#protocol) section for all
+6 cases. In short:
 
 * **Messages carry a request id, replies may be out of order** → any
-  `backlog` value, `fifo` doesn't matter (`RandomAccessBackLog` is used
+  `backlog` value, `fifo => false` (`RandomAccessBackLog` is used
   internally); `decode_reply/2` must actually check the id.
-* **Messages carry no request id, but you want concurrent in-flight
-  requests on one connection** → `backlog > 1`, `fifo => true`
-  (`FIFOBackLog`); replies *must* arrive in the order requests were sent.
+* **Messages don't natively carry a request id, but the protocol has some
+  other extensible/free-form field you can repurpose as one** → same as
+  above, `fifo => false`. See [Surrogate request IDs](#surrogate-request-ids)
+  below — this is the same `RandomAccessBackLog` path, just with arterial
+  (rather than the protocol's own spec) defining what the ID field means.
+* **Messages carry no request id at all, and no field can be repurposed
+  as one, but you still want concurrent in-flight requests on one
+  connection** → `backlog > 1`, `fifo => true` (`FIFOBackLog`); replies
+  *must* arrive in the order requests were sent, and **arterial cannot
+  verify this** — see the warning in [Surrogate request IDs](#surrogate-request-ids)'s
+  sibling section in the README. Prefer a real or repurposed ID whenever
+  possible; only reach for this when the protocol genuinely has no
+  ID-capable field.
 * **One request reserves the whole connection until its reply arrives**
   (the synchronous `call/3` use case) → `backlog => 1` (the default), `fifo`
   irrelevant.
+* **There is no reply at all** (send-and-forget, e.g. fire-and-forget
+  logging/metrics) → use `arterial_client:cast/2` instead of `call/3`;
+  `backlog`/`fifo` don't apply to that traffic since nothing is ever held
+  in flight. See [Step 5](#step-5-calling-it) below.
+* **The "reply" is just a per-message acknowledgement, not a real
+  response payload** → no different from the native/surrogate-ID case
+  above: `fifo => false`, and `decode_reply/2` returns whatever small ack
+  term the protocol uses (even just the atom `ack`) once it sees the
+  matching id. See [Per-message acks](#per-message-acks) below.
+* **A single ack confirms several previous requests at once** (a
+  cumulative/bulk ack, e.g. a heartbeat carrying "processed through
+  sequence N") → `fifo => true`, `backlog > 1`, and
+  `arterial_nif:checkin_up_to/3` instead of `checkin_connection/4`. See
+  [Bulk/cumulative acks](#bulkcumulative-acks) below.
 
 The echo example uses request ids (`backlog => 1, fifo => true` in the
 tests, since each test only issues one call at a time) but the framing
 itself supports any backlog size.
+
+### Surrogate request IDs
+
+If your wire protocol doesn't define a "request ID" of its own, but its
+messages have *some* field you can use as one (an opaque correlation
+tag, an unused header word, a client-supplied cookie the server is
+required to echo back verbatim), you can synthesize and inject your own
+IDs exactly the way a protocol with native IDs would — `arterial`'s
+backlog matching has no concept of which side "owns" the ID field's
+meaning; `RandomAccessBackLog::CheckIn` just decodes whatever bits
+`encode_request/3` put there and looks up the matching slot. There is
+no separate API or pool option for this — it's the *same* `fifo => false`
+configuration as a protocol with native IDs, the only difference is
+where the ID comes from in `encode_request/3`.
+
+Concretely, suppose a protocol has an 8-byte opaque "client tag" field
+the spec says the server must copy unchanged into its response, but
+doesn't call it a request ID and doesn't guarantee anything about its
+structure:
+
+```erlang
+encode_request(ReqID, Term, _Timeout) ->
+  Tag = <<ReqID:64>>,                         % synthesize: pack ReqID into the tag field
+  {ok, <<Tag/binary, (term_to_binary(Term))/binary>>}.
+
+decode_reply(ReqID, <<Tag:8/binary, Rest/binary>>) ->
+  case Tag of
+    <<ReqID:64>> -> {ok, binary_to_term(Rest), <<>>};
+    _OtherTag    -> {more, <<Tag/binary, Rest/binary>>} % not this request's reply yet
+  end;
+decode_reply(_ReqID, Buffer) ->
+  {more, Buffer}.
+```
+
+This is exactly `test_echo_protocol`'s pattern (compare its
+`encode_request/3`/`decode_reply/2`) — the only thing that makes an ID
+"surrogate" rather than "native" is that the protocol's own spec doesn't
+call that field a request ID; from `arterial`'s perspective the two
+cases are identical. The one real constraint: the field must have
+enough bits to disambiguate up to `backlog` concurrent in-flight
+requests (the internal index, `BaseReqID`, is 16 bits, so `backlog` is
+capped at 65,536 regardless), and the server must actually round-trip
+it unchanged — if the server can silently drop, truncate, or rewrite the
+field, surrogate IDs won't survive the trip and matching breaks the same
+way it would for a "real" ID under the same conditions.
+
+### Per-message acks
+
+Some protocols don't really have a "response" — the server just
+acknowledges receipt of each message individually, possibly carrying the
+same id back, possibly not even doing that (a bare `ok`/`ACK` byte is
+enough if your framing can still tell which message it closes out). This
+needs no new mechanism: it's matched exactly like a native or surrogate
+request id (`fifo => false`, any `backlog`), the only difference is what
+`decode_reply/2` hands back once it recognizes the ack:
+
+```erlang
+encode_request(ReqID, Term, _Timeout) ->
+  {ok, frame(ReqID, term_to_binary(Term))}.   % same framing as a normal request
+
+decode_reply(ReqID, Buffer) ->
+  case unframe(Buffer) of                      % e.g. test_echo_protocol:unframe/1
+    {ok, ReqID, _AckPayload, Rest} -> {ok, ack, Rest};  % the "reply" is just an ack
+    {ok, _OtherReqID, _, _}        -> {more, Buffer};
+    more                           -> {more, Buffer}
+  end.
+```
+
+`arterial_client:call/3` then returns `{ok, ack}` once the matching ack
+arrives — there's no special "ack mode" to opt into; the backlog slot is
+released exactly the same way a real response would release it. (`ack`
+here is just an ordinary atom your own `decode_reply/2` chose to return —
+any term works, since `arterial` never inspects `arterial:response()`'s
+value itself.) The distinction between "per-message ack" and "real
+reply" is purely in what your own `decode_reply/2` extracts from the
+wire bytes, not in anything `arterial` itself needs to know about.
+
+### Bulk/cumulative acks
+
+If instead a single ack can confirm *several* messages at once (e.g. a
+heartbeat carrying "I've processed everything up through sequence N"),
+per-message acking above doesn't fit — there's no single `req_id` to
+match against, since one ack closes out a whole span of previously
+checked-out requests at once. This needs `fifo => true` (the span only
+makes sense in send order) and `arterial_nif:checkin_up_to/3`:
+
+```erlang
+%% Build your own async dispatch loop on top of checkout_async/3,4 +
+%% track_inflight/5 (arterial doesn't ship one yet -- see
+%% test/arterial_async_driver.erl for the pattern). When that loop
+%% decodes an incoming cumulative-ack message and maps the protocol's
+%% own sequence number back to the req_id it assigned that request at
+%% send time:
+{ok, ReleasedReqIDs} = arterial_nif:checkin_up_to(Pool, ConnID, UptoReqID).
+```
+
+This releases every backlog slot from the oldest still-outstanding one
+up through (and including) `UptoReqID` in one call, exactly as if
+`checkin_connection/4` had been called once per slot — even if those
+slots were originally reserved by different callers/processes (each
+`checkout_async/3,4` call owns its own reservation independently).
+Unlike per-message acks, there's no `decode_reply/2` convention for this
+-- decoding the cumulative sequence number out of the wire bytes and
+mapping it to a `req_id` is entirely up to your own async dispatch
+loop's bookkeeping, since `arterial`'s NIF layer only knows FIFO order,
+never the protocol's own numbering scheme. `checkin_up_to/3` does **not**
+send any notification to the released requests' owners by itself — it
+only frees backlog capacity; pair it with your own application-level
+acknowledgement if callers need to know their request succeeded.
 
 ## Step 5: calling it
 
@@ -239,6 +372,21 @@ connection, `encode_request/3`, `send/2`, loop on `recv/2`/`decode_reply/2`
 until a full reply or the timeout expires, then `checkin_connection/4`
 with whatever unconsumed buffer is left over (so a partial next-frame
 doesn't get dropped).
+
+**Send-and-forget** — hand off a request with no reply at all:
+
+```erlang
+ok = arterial_client:cast(my_pool, Request).
+```
+
+Checks out a connection, `encode_request/3`, `send/2`, and checks the
+connection back in immediately — returns as soon as the bytes are handed
+to the transport, never waiting on `recv/2`/`decode_reply/2` since there's
+nothing to wait for. Use this for protocols that are inherently one-way
+(see [Step 4](#step-4-choosing-backlogfifo-and-how-requests-get-matched-to-replies)
+above); for a protocol where the server *does* reply (even just an ack),
+use `call/3` instead so the reply is actually consumed off the connection's
+buffer.
 
 **Asynchronous** — check out a connection without blocking, get notified
 later:

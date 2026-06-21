@@ -111,6 +111,25 @@ struct AbstractBackLog {
   virtual bool   Empty()    const = 0;
   size_t         Capacity() const { return m_buffer.size(); }
 
+  /// @brief List every currently checked-out-but-not-checked-in request's
+  /// wire-level `ext_req_id`, in arbitrary order (callers needing FIFO
+  /// send order should sort/zip against their own bookkeeping; this just
+  /// enumerates "what's still outstanding"). Used by disconnect
+  /// notification (see ConnectionPool::OnConnectionDown()) to tell a
+  /// connection's owning processes which of their in-flight requests were
+  /// never confirmed before the socket died.
+  virtual std::vector<ReqID> OutstandingReqIDs() const = 0;
+
+  /// @brief Bulk/cumulative ack (mode (f-2); see FIFOBackLog::CheckInUpTo
+  /// for the real implementation). Meaningless for a random-access
+  /// backlog -- replies there are already individually id-matched, so
+  /// there's no FIFO "everything before this" to collapse -- hence the
+  /// default no-op here; only FIFOBackLog overrides it.
+  /// @return every `ext_req_id` released (oldest first), empty if
+  /// `upto_ext_req_id` doesn't match any outstanding slot or this backlog
+  /// doesn't support cumulative ack at all.
+  virtual std::vector<ReqID> CheckInUpTo(ReqID /*upto_ext_req_id*/) { return {}; }
+
 protected:
   std::vector<Req>      m_buffer;
   std::atomic<uint32_t> m_vsn{0};
@@ -158,8 +177,45 @@ struct FIFOBackLog : AbstractBackLog
     return &req;
   }
 
+  /// @brief Bulk/cumulative ack (mode (f-2)): pop every outstanding slot
+  /// from the head up to and including the one whose `ext_req_id` equals
+  /// `upto_ext_req_id`, in FIFO order. For a protocol whose acks carry a
+  /// cumulative sequence number rather than per-message ids, the caller
+  /// (Erlang side) is responsible for mapping that sequence number to the
+  /// `ext_req_id` of the corresponding `checkout`-returned slot -- this
+  /// only knows FIFO order, not the wire protocol's own numbering scheme.
+  /// @return the `ext_req_id` of every slot popped (oldest first), empty
+  /// if `upto_ext_req_id` doesn't match any currently outstanding slot
+  /// (the backlog is left unmodified in that case -- this is "all or
+  /// nothing": a caller acking an id that was already checked in, or was
+  /// never outstanding, gets no partial effect).
+  std::vector<ReqID> CheckInUpTo(ReqID upto_ext_req_id) override
+  {
+    std::vector<ReqID> popped;
+
+    for (size_t i = 0, idx = m_head; i < m_size; ++i, idx = (idx + 1) % m_buffer.size()) {
+      popped.push_back(m_buffer[idx].ext_req_id);
+      if (m_buffer[idx].ext_req_id == upto_ext_req_id) {
+        m_head  = (idx + 1) % m_buffer.size();
+        m_size -= popped.size();
+        return popped;
+      }
+    }
+
+    return {}; // upto_ext_req_id not found among outstanding slots: no-op
+  }
+
   bool Full()  const override { return m_size == m_buffer.size(); }
   bool Empty() const override { return m_size == 0; }
+
+  std::vector<ReqID> OutstandingReqIDs() const override
+  {
+    std::vector<ReqID> ids;
+    ids.reserve(m_size);
+    for (size_t i = 0, idx = m_head; i < m_size; ++i, idx = (idx + 1) % m_buffer.size())
+      ids.push_back(m_buffer[idx].ext_req_id);
+    return ids;
+  }
 
 private:
   size_t m_head = 0;
@@ -215,6 +271,16 @@ struct RandomAccessBackLog : AbstractBackLog
 
   bool Full()  const override { return m_available.empty(); }
   bool Empty() const override { return m_available.size() == Capacity(); }
+
+  std::vector<ReqID> OutstandingReqIDs() const override
+  {
+    std::vector<ReqID> ids;
+    ids.reserve(Capacity() - m_available.size());
+    for (BaseReqID i = 0; i < Capacity(); ++i)
+      if (m_available.find(i) == m_available.end())
+        ids.push_back(m_buffer[i].ext_req_id);
+    return ids;
+  }
 
 private:
   std::set<BaseReqID> m_available;

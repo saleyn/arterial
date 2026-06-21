@@ -24,9 +24,11 @@ in-flight.
 """.
 
 -export([create/5, create/6, create/7, create/8, destroy/1]).
--export([checkout_connection/2, checkin_connection/2, checkin_connection/4]).
--export([checkout_async/3]).
+-export([checkin_connection/2, checkin_connection/4]).
+-export([checkout_connection/2, checkout_connection/3]).
+-export([checkout_async/3, checkout_async/4]).
 -export([set_socket/3, make_available/2, make_unavailable/2, connection_drained/2]).
+-export([connection_down/2, checkin_up_to/3]).
 -export([track_inflight/5, sweep_timeouts/1]).
 -export([start_link/0]).
 
@@ -288,16 +290,83 @@ connection_drained(Pool, ConnID) ->
   connection_drained_nif(resource(Pool), ConnID).
 
 -doc """
-Check out a connection able to accept one new request. `Mode` does not
-change the underlying reservation (always 1 backlog slot); it only
-selects how the caller intends to use the connection (kept for callers
-that want to log/instrument sync vs async use).
+Notify every process with an in-flight, unconfirmed request on connection
+`ConnID` of `Pool` that the connection has died, then release those
+requests' backlog slots and make the connection available again. Call
+this from `arterial_connection`'s disconnect path right before closing a
+connection's socket (and before any reconnect attempt reuses `ConnID`).
 
-The calling process is monitored for as long as it holds the returned
-reservation: if it dies before calling `checkin_connection/2,4`, the
-reserved backlog slot(s) are released and the connection is made
-available again automatically (see `c:arterial_protocol`/death handling
-in the moduledoc).
+Each owning process receives one `{arterial_disconnected, Pool, ReqID}`
+message per outstanding request it still held on this connection (not
+batched into a single message, even if a process owned more than one),
+so it can resubmit or persist that specific request outside `arterial`.
+Only requests registered via `track_inflight/5` (the asynchronous path)
+are covered -- a synchronous caller blocked in its own `recv/2` call is
+not tracked here and instead learns about the dead connection directly
+from that call's `{error, closed}` return.
+
+A no-op if `ConnID` currently has no outstanding requests (e.g. a
+connection that was idle, or whose last request already timed out via
+`sweep_timeouts/1` or was checked in normally).
+
+## Examples
+
+```
+1> arterial_nif:connection_down(my_pool, 0).
+ok
+```
+""".
+-spec connection_down(pool(), non_neg_integer()) -> ok.
+connection_down(Pool, ConnID) ->
+  connection_down_nif(resource(Pool), ConnID, Pool).
+
+-doc """
+Bulk/cumulative ack (mode (f-2)): release every backlog slot on
+connection `ConnID` of `Pool` up to and including `UptoReqID`, in FIFO
+order -- as if `checkin_connection/4` had been called once per slot --
+for a protocol whose acks confirm "everything through sequence N" in one
+message instead of acking each request individually (e.g. a heartbeat
+carrying the last sequence number the server has fully processed).
+
+`UptoReqID` must be one of the `req_ids` returned by a prior
+`checkout_connection/2,3`/`checkout_async/3,4` call on this connection --
+it is not a raw protocol sequence number; mapping your protocol's own
+cumulative sequence number to the corresponding `req_id` is the caller's
+responsibility (e.g. by recording each `req_id` alongside the sequence
+number your protocol assigned it at send time).
+
+Only meaningful for a connection created with `fifo => true`
+(`create/6,7,8`) -- a no-op returning `{ok, []}` against a random-access
+backlog (`fifo => false`), since each of its requests is already
+individually id-matched and there's no FIFO order to collapse. Also a
+no-op if `UptoReqID` doesn't match any currently outstanding slot on
+`ConnID` (already checked in, never reserved, or belongs to a different
+connection) -- this is all-or-nothing, never a partial release.
+
+Unlike `checkin_connection/4`, the released requests may belong to
+*different* owning processes (each may have been reserved by a separate
+`checkout_async/3,4` call over time) -- each is released under its own
+owner's bookkeeping automatically. This does NOT send any notification
+to those owners (compare `connection_down/2`); it only releases backlog
+capacity. Only requests registered via `track_inflight/5` have their
+owner-table reservation released here -- this is expected to always be
+the case in practice, since a synchronous `call/3` caller has no way to
+participate in a bulk ack (it blocks for its own individual reply).
+
+## Examples
+
+```
+1> arterial_nif:checkin_up_to(my_pool, 0, 47).
+{ok, [42, 43, 47]}
+```
+""".
+-spec checkin_up_to(pool(), non_neg_integer(), non_neg_integer()) ->
+  {ok, [non_neg_integer()]}.
+checkin_up_to(Pool, ConnID, UptoReqID) ->
+  checkin_up_to_nif(resource(Pool), ConnID, UptoReqID, Pool).
+
+-doc """
+Equivalent to `checkout_connection/3` with `Samples = 1`.
 
 ## Examples
 
@@ -318,7 +387,57 @@ in the moduledoc).
     req_ids  => [non_neg_integer()]
   }} | {error, no_connection}.
 checkout_connection(Pool, Mode) when Mode =:= sync; Mode =:= async ->
-  case checkout_nif(resource(Pool), self(), 1) of
+  checkout_connection(Pool, Mode, 1).
+
+-doc """
+Check out a connection able to accept `Samples` new requests in one shot
+-- i.e. reserve `Samples` backlog slots on a single connection, so the
+caller can multiplex that many concurrently outstanding requests on it
+(mode (d) of the backlog-matching design: `backlog > 1, fifo => true`).
+This only succeeds if one connection currently has `Samples` free slots
+AND is itself available (not already checked out by another caller);
+it never spreads `Samples` across multiple connections. `Mode` does not
+change the underlying reservation; it only selects how the caller
+intends to use the connection (kept for callers that want to log/
+instrument sync vs async use).
+
+`req_ids` in the result has exactly `Samples` entries, in the order the
+underlying backlog will expect replies back -- for a FIFO backlog
+(`fifo => true`), check them in in the same order with
+`checkin_connection/4` (one at a time or all together), since
+`FIFOBackLog::CheckIn` always resolves the oldest still-outstanding
+slot regardless of which `req_id` is passed; the protocol's wire-level
+reply order is the only thing keeping them lined up correctly. For a
+random-access backlog (`fifo => false`), `req_ids` order doesn't matter
+since each slot is resolved by its own id independently.
+
+Like `checkout_connection/2`, the calling process is monitored for as
+long as it holds the returned reservation: if it dies before calling
+`checkin_connection/2,4`, all `Samples` reserved backlog slots are
+released and the connection is made available again automatically (see
+`c:arterial_protocol`/death handling in the moduledoc).
+
+## Examples
+
+```
+1> arterial_nif:checkout_connection(my_pool, sync, 3).
+{ok,#{conn_ref => #Ref<0.123.456.789>,conn_id => 0,
+      protocol => my_protocol,socket => Socket,buffer => <<>>,
+      req_ids => [42,43,44]}}
+```
+""".
+-spec checkout_connection(pool(), mode(), pos_integer()) ->
+  {ok, #{
+    conn_ref => reference(),
+    conn_id  => non_neg_integer(),
+    protocol => module(),
+    socket   => arterial:socket(),
+    buffer   => binary(),
+    req_ids  => [non_neg_integer()]
+  }} | {error, no_connection}.
+checkout_connection(Pool, Mode, Samples)
+    when (Mode =:= sync orelse Mode =:= async), is_integer(Samples), Samples > 0 ->
+  case checkout_nif(resource(Pool), self(), Samples) of
     {ok, {ConnID, Socket, ReqIDs}} ->
       Buffer = case ets:lookup(buf_table(Pool), ConnID) of
         [{_, Buf}] -> Buf;
@@ -387,41 +506,7 @@ checkin_connection(Pool, ConnID, ReqIDs, Buffer)
   ets:insert(buf_table(Pool), {ConnID, Buffer}),
   checkin_nif(resource(Pool), ConnID, ReqIDs, Pool, self()).
 
--doc """
-Check out a connection for asynchronous use, queuing the request (up to
-`Pool`'s `MaxWaiters`, see `create/7`) if every connection is currently
-busy instead of failing immediately. `TtlUs` bounds the total time from
-this call until a reply is checked in (covering both time spent queued
-and time spent in-flight once a connection is assigned); it's ignored if
-`Pool` was created with a fixed timeout (see `create/7`).
-
-Three outcomes:
-
-- `{ok, Map}` -- a connection was available immediately, exactly like
-  `checkout_connection/2`. No message will follow; `req_ids` in the
-  returned map is the correlation id to use with `checkin_connection/4`.
-- `{queued, WaiterID}` -- every connection was busy but the request was
-  queued; the caller's process will later receive either
-  `{arterial_ready, Pool, ReqID, ConnID, Socket, ReqIDs}` (call
-  `checkin_connection/4` when done, using the real wire-level
-  `ReqID`/`ReqIDs` from that message, exactly as with a synchronous
-  checkout) or `{arterial_timeout, Pool, WaiterID}` if `TtlUs`
-  microseconds pass first while still queued. `WaiterID` (an opaque
-  internal id, NOT a wire-level request id) is only ever used to match
-  that eventual message back to this call.
-- `{error, no_connection}` -- every connection was busy AND the wait-list
-  was disabled (`MaxWaiters = 0`) or already full.
-
-## Examples
-
-```
-1> arterial_nif:checkout_async(my_pool, self(), 5000000).
-{ok,#{conn_id => 0,protocol => my_protocol,socket => Socket,
-      buffer => <<>>,req_ids => [42]}}
-2> arterial_nif:checkout_async(my_pool, self(), 5000000). % all connections busy
-{queued,7}
-```
-""".
+-doc "Equivalent to `checkout_async/4` with `Samples = 1`.".
 -spec checkout_async(pool(), pid(), non_neg_integer()) ->
   {ok, #{
     conn_id  => non_neg_integer(),
@@ -430,9 +515,59 @@ Three outcomes:
     buffer   => binary(),
     req_ids  => [non_neg_integer()]
   }} | {queued, non_neg_integer()} | {error, no_connection}.
-checkout_async(Pool, Pid, TtlUs)
-    when is_pid(Pid), is_integer(TtlUs), TtlUs >= 0 ->
-  case checkout_async_nif(resource(Pool), Pid, TtlUs) of
+checkout_async(Pool, Pid, TtlUs) ->
+  checkout_async(Pool, Pid, TtlUs, 1).
+
+-doc """
+Check out a connection for asynchronous use with `Samples` backlog slots
+reserved on it in one shot (see `checkout_connection/3` for what
+multiplexing `Samples > 1` slots on a single connection means and its
+FIFO-ordering caveat), queuing the request (up to `Pool`'s `MaxWaiters`,
+see `create/7`) if no connection currently has `Samples` free slots
+instead of failing immediately. `TtlUs` bounds the total time from this
+call until a reply is checked in (covering both time spent queued and
+time spent in-flight once a connection is assigned); it's ignored if
+`Pool` was created with a fixed timeout (see `create/7`).
+
+Three outcomes:
+
+- `{ok, Map}` -- a connection was available immediately, exactly like
+  `checkout_connection/3`. No message will follow; `req_ids` in the
+  returned map (with `Samples` entries) are the correlation ids to use
+  with `checkin_connection/4`.
+- `{queued, WaiterID}` -- no connection currently had `Samples` free
+  slots, so the request was queued; the caller's process will later
+  receive either `{arterial_ready, Pool, ReqID, ConnID, Socket, ReqIDs}`
+  (call `checkin_connection/4` when done, using the real wire-level
+  `ReqID`/`ReqIDs` from that message, exactly as with a synchronous
+  checkout) or `{arterial_timeout, Pool, WaiterID}` if `TtlUs`
+  microseconds pass first while still queued. `WaiterID` (an opaque
+  internal id, NOT a wire-level request id) is only ever used to match
+  that eventual message back to this call.
+- `{error, no_connection}` -- no connection qualified AND the wait-list
+  was disabled (`MaxWaiters = 0`) or already full.
+
+## Examples
+
+```
+1> arterial_nif:checkout_async(my_pool, self(), 5000000, 1).
+{ok,#{conn_id => 0,protocol => my_protocol,socket => Socket,
+      buffer => <<>>,req_ids => [42]}}
+2> arterial_nif:checkout_async(my_pool, self(), 5000000, 1). % all connections busy
+{queued,7}
+```
+""".
+-spec checkout_async(pool(), pid(), non_neg_integer(), pos_integer()) ->
+  {ok, #{
+    conn_id  => non_neg_integer(),
+    protocol => module(),
+    socket   => arterial:socket(),
+    buffer   => binary(),
+    req_ids  => [non_neg_integer()]
+  }} | {queued, non_neg_integer()} | {error, no_connection}.
+checkout_async(Pool, Pid, TtlUs, Samples)
+    when is_pid(Pid), is_integer(TtlUs), TtlUs >= 0, is_integer(Samples), Samples > 0 ->
+  case checkout_async_nif(resource(Pool), Pid, TtlUs, Samples) of
     {ok, {ConnID, Socket, ReqIDs}} ->
       Buffer = case ets:lookup(buf_table(Pool), ConnID) of
         [{_, Buf}] -> Buf;
@@ -589,9 +724,11 @@ set_socket_nif(_Rsrc, _ConnID, _Socket)                  -> ?NOT_LOADED_ERROR.
 make_available_nif(_Rsrc, _ConnID)                       -> ?NOT_LOADED_ERROR.
 make_unavailable_nif(_Rsrc, _ConnID)                     -> ?NOT_LOADED_ERROR.
 connection_drained_nif(_Rsrc, _ConnID)                    -> ?NOT_LOADED_ERROR.
+connection_down_nif(_Rsrc, _ConnID, _PoolName)            -> ?NOT_LOADED_ERROR.
+checkin_up_to_nif(_Rsrc, _ConnID, _UptoReqID, _PoolName)  -> ?NOT_LOADED_ERROR.
 checkout_nif(_Rsrc, _Pid, _Samples)                      -> ?NOT_LOADED_ERROR.
 checkin_nif(_Rsrc, _ConnID, _ReqIDs, _PoolName, _Pid)    -> ?NOT_LOADED_ERROR.
-checkout_async_nif(_Rsrc, _Pid, _TtlUs)                  -> ?NOT_LOADED_ERROR.
+checkout_async_nif(_Rsrc, _Pid, _TtlUs, _Samples)        -> ?NOT_LOADED_ERROR.
 track_inflight_nif(_Rsrc, _ConnID, _ReqID, _Pid, _TtlUs) -> ?NOT_LOADED_ERROR.
 sweep_timeouts_nif(_Rsrc, _PoolName)                     -> ?NOT_LOADED_ERROR.
 

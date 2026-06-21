@@ -2,11 +2,11 @@
 /// \file   sharded_ttl_map.hpp
 /// \author Serge Aleynikov
 //-----------------------------------------------------------------------------
-/// \brief A concurrency-safe wrapper around unordered_map_with_ttl.hpp,
+/// \brief A concurrency-safe wrapper around unordered_ttl_map.hpp,
 /// partitioning keys across N independently-locked shards so that callers
 /// touching different keys never contend with each other.
 ///
-/// unordered_map_with_ttl itself has no synchronization (it's a plain
+/// UnorderedTTLMap itself has no synchronization (it's a plain
 /// std::unordered_map + std::list); ConnectionPool's m_inflight/m_waiting
 /// instances are reachable concurrently from multiple NIF call sites
 /// (checkin_nif, checkout_async_nif, track_inflight_nif, sweep_timeouts_nif
@@ -37,7 +37,7 @@
 #pragma once
 
 #include "arterial_util.hpp"
-#include "unordered_map_with_ttl.hpp"
+#include "hashmap_with_ttl.hpp"
 #include <algorithm>
 #include <cstddef>
 #include <functional>
@@ -49,11 +49,11 @@
 namespace arterial {
 
 //-----------------------------------------------------------------------------
-/// @brief Sharded, concurrency-safe wrapper around unordered_map_with_ttl<K,V>.
+/// @brief Sharded, concurrency-safe wrapper around UnorderedTTLMap<K,V>.
 //-----------------------------------------------------------------------------
 template <typename K, typename V>
 struct ShardedTTLMap {
-  using Map = unordered_map_with_ttl<K, V>;
+  using Map = UnorderedTTLMap<K, V>;
 
   /// @brief @return a shard count scaled to the machine's parallelism:
   /// the next power of 2 >= 2x the number of hardware threads, clamped to
@@ -69,7 +69,7 @@ struct ShardedTTLMap {
     return std::clamp(n, size_t(4), size_t(256));
   }
 
-  /// @param ttl per-shard fixed TTL (see unordered_map_with_ttl).
+  /// @param ttl per-shard fixed TTL (see UnorderedTTLMap).
   /// @param shards shard count; rounded up to a power of 2. `0` (the
   /// default) picks DefaultShardCount().
   explicit ShardedTTLMap(uint64_t ttl, size_t shards = 0)
@@ -113,9 +113,29 @@ struct ShardedTTLMap {
     return shard.map.find(key) != shard.map.end();
   }
 
+  /// @brief If `key` is present, call `fn(value)` then erase it -- a
+  /// combined find+erase under the same shard lock, so the caller can
+  /// observe the value exactly once (e.g. to notify the owning pid before
+  /// dropping the in-flight entry). `fn` runs while the shard's mutex is
+  /// held; keep it short (no callbacks back into this same map for the
+  /// same shard).
+  /// @return true if `key` was present (and `fn` was called).
+  template <typename Fn>
+  bool take(K const& key, Fn&& fn)
+  {
+    auto& shard = ShardFor(key);
+    const std::lock_guard<std::mutex> lock(shard.mtx);
+    auto it = shard.map.find(key);
+    if (it == shard.map.end())
+      return false;
+    fn(it->second.value);
+    shard.map.erase(key);
+    return true;
+  }
+
   /// @brief Evict every expired entry across every shard, invoking
   /// `on_erase(key, value, expire_at, now)` for each one. Unlike
-  /// unordered_map_with_ttl::refresh(), `on_erase` always runs *after* the
+  /// UnorderedTTLMap::refresh(), `on_erase` always runs *after* the
   /// owning shard's lock has been released (eviction itself is
   /// unconditional, decided purely by TTL) -- so, unlike that lower-level
   /// method, `on_erase` here MAY safely call back into this same
