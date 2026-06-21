@@ -28,7 +28,7 @@ arterial-*.tar
 *.tgz
 
 # C files
-c_src/nifpp.h
+c_src/enif.hpp
 c_src/test_pool
 c_src/*.o
 priv/*.so

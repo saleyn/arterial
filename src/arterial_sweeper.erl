@@ -56,8 +56,9 @@ handle_cast(_Msg, State) ->
   {noreply, State}.
 
 -doc false.
-handle_info(sweep, State) ->
-  arterial_nif:sweep_timeouts(State#state.pool),
+handle_info(sweep, #state{pool = Pool} = State) ->
+  {ok, Count} = arterial_nif:sweep_timeouts(Pool),
+  arterial_observability:event([sweep, stop], #{expired_count => Count}, #{pool => Pool}),
   schedule(State),
   {noreply, State}.
 

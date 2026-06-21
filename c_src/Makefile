@@ -67,10 +67,10 @@ $(TARGET): $(OBJ) | $(PRIV_DIR)
 $(TEST_TARGET): $(TEST_OBJ) | $(TEST_DIR)
 	$(CXX) $(LDFLAGS) -I$(ERL_INC) -o $@ $<
 
-$(OBJ): $(SRC) $(wildcard *.hpp *.h) | $(OBJ_DIR)
+$(OBJ): $(SRC) $(wildcard *.hpp) enif.hpp | $(OBJ_DIR)
 	$(CXX) -c $(CXXFLAGS) -o $@ $<
 
-$(TEST_OBJ) : test_pool.cpp pool_lifo.hpp pool_fifo.hpp nifpp.h | $(OBJ_DIR)
+$(TEST_OBJ) : test_pool.cpp pool_fifo.hpp enif.hpp | $(OBJ_DIR)
 	$(CXX) -c -g -O0 $(CXXFLAGS) -o $@ $<
 
 $(PRIV_DIR) $(OBJ_DIR) $(TEST_DIR):
@@ -83,9 +83,8 @@ run test: $(TEST_TARGET)
 ../priv:
 	mkdir -p ../priv
 
-nifpp.h:
-	curl -s -O https://raw.githubusercontent.com/saleyn/nifpp/main/nifpp.h
+enif.hpp:
+	curl -s -O https://raw.githubusercontent.com/saleyn/nifpp/main/enif.hpp
 
 clean:
 	rm -f *.o $(TEST_DIR)/test_pool $(PRIV_DIR)/arterial.so $(OBJ_DIR)/*.o
-

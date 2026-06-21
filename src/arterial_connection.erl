@@ -323,14 +323,19 @@ reconnect(#state{ss = #srv_state{addresses = Addresses}} = State) ->
 try_addresses([], State) ->
   {noreply, recon_timer(State)};
 try_addresses([Entry | Rest], #state{
-  ss = #srv_state{pfx=Pfx, port=DefaultPort, proto=Proto, sock_opts=DefaultOpts,
-                  tls_opts=DefaultTlsOpts, conn_timeout=Timeout}
+  ss = #srv_state{pfx=Pfx, pool=Pool, conn_id=ConnID, port=DefaultPort, proto=Proto,
+                  sock_opts=DefaultOpts, tls_opts=DefaultTlsOpts, conn_timeout=Timeout}
 } = State) ->
   {Address, Port, Opts, TlsOpts} = resolve_entry(Entry, DefaultPort, DefaultOpts, DefaultTlsOpts),
   case inet:getaddrs(Address, inet) of
     {ok, IPs} ->
       IP = arterial_util:random_element(IPs),
-      case arterial_socket:connect(Proto, IP, Port, Opts, Timeout, TlsOpts) of
+      StartMeta = #{pool => Pool, conn_id => ConnID, address => IP, port => Port},
+      case arterial_observability:span([connect], StartMeta, fun() ->
+        Result = arterial_socket:connect(Proto, IP, Port, Opts, Timeout, TlsOpts),
+        Outcome = case Result of {ok, _} -> ok; {error, R} -> R end,
+        {Result, StartMeta#{result => Outcome}}
+      end) of
         {ok, Sock} ->
           client_init(State#state{sock = Sock});
         {error, Reason} ->
@@ -423,6 +428,11 @@ disconnect(Reason, #state{ss = #srv_state{pfx=Pfx, pool=Pool, conn_id=ConnID,
     undefined -> ok;
     _         ->
       arterial_nif:make_unavailable(Pool, ConnID),
+      %% Notify owners of any in-flight, unconfirmed requests on this
+      %% connection (see arterial_nif:connection_down/2's doc) before the
+      %% socket closes and ConnID becomes eligible for reconnect/reuse.
+      ok = arterial_nif:connection_down(Pool, ConnID),
+      arterial_observability:event([disconnect], #{pool => Pool, conn_id => ConnID, reason => Reason}),
       arterial_socket:close(Proto, Sock)
   end,
   case ImplState of

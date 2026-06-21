@@ -13,10 +13,10 @@ all: deps.get compile
 deps.get:
 	rebar3 get-deps
 
-compile: nif
+compile:
 	rebar3 $@
 
-nif:
+nif:	# Invoked by rebar3 through compile pre-hook
 	$(MAKE) -C c_src
 
 cover:

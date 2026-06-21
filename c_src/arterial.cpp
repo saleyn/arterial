@@ -1,5 +1,5 @@
 #include "arterial.hpp"
-#include "nifpp.h"
+#include "enif.hpp"
 #include <cassert>
 #include <iostream>
 
@@ -107,6 +107,39 @@ ERL_NIF_TERM connection_drained_nif(ErlNifEnv* env, [[maybe_unused]] int argc, c
   return make(env, ptr->IsDrained(id));
 }
 
+ERL_NIF_TERM connection_down_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
+{
+  assert(argc == 3);
+
+  resource_ptr<ConnectionPool> ptr;
+  unsigned int                 id;
+
+  if (!get(env, argv[0], ptr) || !get(env, argv[1], id)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  ptr->OnConnectionDown(env, argv[2], id);
+
+  return am_ok;
+}
+
+ERL_NIF_TERM checkin_up_to_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
+{
+  assert(argc == 4);
+
+  resource_ptr<ConnectionPool> ptr;
+  unsigned int                 conn_id;
+  unsigned int                 upto_ext_req_id;
+
+  if (!get(env, argv[0], ptr) || !get(env, argv[1], conn_id) ||
+      !get(env, argv[2], upto_ext_req_id)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  auto released = ptr->CheckInUpTo(env, argv[3], conn_id, upto_ext_req_id);
+
+  std::vector<unsigned int> ids(released.begin(), released.end());
+  return make(env, std::make_tuple(am_ok, ids));
+}
+
 ERL_NIF_TERM checkout_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
 {
   assert(argc == 3);
@@ -176,18 +209,20 @@ ERL_NIF_TERM checkin_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NI
 
 ERL_NIF_TERM checkout_async_nif(ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
 {
-  assert(argc == 3);
+  assert(argc == 4);
 
   resource_ptr<ConnectionPool> ptr;
   ErlNifPid                    pid;
   ErlNifUInt64                 ttl_us;
+  unsigned int                 samples;
 
   if (!get(env, argv[0], ptr) ||
       !enif_get_local_pid(env, argv[1], &pid) ||
-      !enif_get_uint64(env, argv[2], &ttl_us)) [[unlikely]]
+      !enif_get_uint64(env, argv[2], &ttl_us) ||
+      !get(env, argv[3], samples) || samples == 0) [[unlikely]]
     return enif_make_badarg(env);
 
-  auto result = ptr->CheckOutAsync(pid, uint64_t(ttl_us), 1);
+  auto result = ptr->CheckOutAsync(pid, uint64_t(ttl_us), samples);
 
   switch (result.status) {
     case AsyncCheckoutStatus::Ok: {
@@ -280,9 +315,11 @@ ErlNifFunc nif_funcs[] = {
   {"make_available_nif",   2, make_available_nif,   0},
   {"make_unavailable_nif", 2, make_unavailable_nif, 0},
   {"connection_drained_nif", 2, connection_drained_nif, 0},
+  {"connection_down_nif",  3, connection_down_nif,  0},
   {"checkout_nif",         3, checkout_nif,         0},
   {"checkin_nif",          5, checkin_nif,          0},
-  {"checkout_async_nif",   3, checkout_async_nif,   0},
+  {"checkin_up_to_nif",    4, checkin_up_to_nif,    0},
+  {"checkout_async_nif",   4, checkout_async_nif,   0},
   {"track_inflight_nif",   5, track_inflight_nif,   0},
   {"sweep_timeouts_nif",   2, sweep_timeouts_nif,   0},
 };
