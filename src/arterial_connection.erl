@@ -331,7 +331,7 @@ try_addresses([Entry | Rest], #state{
     {ok, IPs} ->
       IP = arterial_util:random_element(IPs),
       StartMeta = #{pool => Pool, conn_id => ConnID, address => IP, port => Port},
-      case arterial_observability:span([connect], StartMeta, fun() ->
+      case arterial_observe:span([connect], StartMeta, fun() ->
         Result = arterial_socket:connect(Proto, IP, Port, Opts, Timeout, TlsOpts),
         Outcome = case Result of {ok, _} -> ok; {error, R} -> R end,
         {Result, StartMeta#{result => Outcome}}
@@ -432,7 +432,7 @@ disconnect(Reason, #state{ss = #srv_state{pfx=Pfx, pool=Pool, conn_id=ConnID,
       %% connection (see arterial_nif:connection_down/2's doc) before the
       %% socket closes and ConnID becomes eligible for reconnect/reuse.
       ok = arterial_nif:connection_down(Pool, ConnID),
-      arterial_observability:event([disconnect], #{pool => Pool, conn_id => ConnID, reason => Reason}),
+      arterial_observe:event([disconnect], #{pool => Pool, conn_id => ConnID, reason => Reason}),
       arterial_socket:close(Proto, Sock)
   end,
   case ImplState of

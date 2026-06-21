@@ -1,5 +1,5 @@
 //-----------------------------------------------------------------------------
-/// \file   unordered_ttl_map.hpp
+/// \file   hashmap_with_ttl.hpp
 /// \author Serge Aleynikov
 //-----------------------------------------------------------------------------
 /// \brief A Key/Value hashmap with TTL eviction.

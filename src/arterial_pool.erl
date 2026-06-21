@@ -2,7 +2,8 @@
 
 -moduledoc """
 Per-pool supervisor: creates the pool's NIF resource and supervises one
-`arterial_connection` worker per connection slot plus an `arterial_sweeper`.
+`arterial_connection` worker per connection slot, an `arterial_sweeper`,
+and (only if `bounce_interval_ms` is configured) an `arterial_bouncer`.
 
 Typically started as a child of the `arterial_app` top-level supervisor
 (via `arterial_app:start/0` + a `simple_one_for_one` child spec), but can

@@ -25,6 +25,7 @@ together.
 setup() -> setup(2).
 
 setup(Size) ->
+  ok = test_helper:set_log_level(),
   {ok, Srv} = test_tcp_server:start(0),
   Port = test_tcp_server:port(Srv),
   {ok, SupPid} = arterial_pool:start_link(tcp_echo_pool, #{

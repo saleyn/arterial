@@ -24,6 +24,7 @@ socket instead of the atom `dummy_socket`.
 %% udp_echo_pool's C++ pool resource, buffer ETS table, and server/socket
 %% past this test.
 setup() ->
+  ok = test_helper:set_log_level(),
   {ok, Srv} = test_udp_server:start(0),
   Port = test_udp_server:port(Srv),
   {ok, Sock} = socket:open(inet, dgram, udp),

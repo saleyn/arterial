@@ -58,55 +58,101 @@ get a reply.
   -- one message per request -- before the backlog slot is released, so it
   can resubmit or persist that request outside `arterial` instead of
   silently losing it. See `arterial_nif:connection_down/2`.
+* An optional, per-pool `arterial_bouncer` that recycles connections one
+  at a time on a fixed rotation (`bounce_interval_ms`) -- e.g. to pick up
+  DNS/load-balancer changes for long-lived connections -- waiting for
+  each connection's backlog to drain (up to `bounce_drain_timeout_ms`)
+  before disconnecting and reconnecting it. Disabled by default.
+* Six supported request/reply matching modes covering native or
+  surrogate wire-level request IDs, FIFO-ordered backlogs (single- or
+  multi-request-in-flight), send-and-forget, and per-message or
+  bulk/cumulative acknowledgement-based protocols -- see
+  [Protocol](#protocol).
+* Pluggable observability: `call`/`cast`/`checkout`/`connect` spans plus
+  `disconnect`/`sweep` events through a generic facade
+  (`arterial_observe`), with built-in `telemetry` and `prometheus`
+  backends (both strictly optional dependencies) or a custom backend
+  module -- see [Observability](#observability).
 
 ## Installation
 
-Arterial is not yet published to Hex. Add it as a `rebar3` dependency directly
-from its Git repository:
+Add `arterial` as a [hex.pm](https://hex.pm/packages/arterial) package dependency:
 
+**Erlang:** in your project's `rebar.config`
 ```erlang
 {deps, [
-  {arterial, {git, "https://github.com/saleyn/arterial.git", {branch, "main"}}}
+  {:arterial, "~> 0.1"}
 ]}.
+```
+
+**Elixir:** in your project's `mix.exs`
+```elixir
+def deps do
+  [
+    {:arterial, "~> 0.1"}
+  ]
+end
 ```
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    subgraph arterial [Arterial]
-    A[fa:fa-person-military-pointing Arterial Sup] --->|supervises| P(fa:fa-layer-group Pool)
-    A[fa:fa-person-military-pointing Arterial Sup] --->|supervises| CS[fa:fa-person-military-pointing Connection Mgr Sup]
-    B>fa:fa-arrow-down-9-1 Backlog] -.-> P
-    style B stroke-width:1px,color:#666,stroke-dasharray: 5 5
-    CS -->|supervises| C1(fa:fa-link Connection1)
-    CS -->|supervises| C2(fa:fa-link Connection2)
-    CS -->|supervises| CN(fa:fa-link ConnectionN)
-    P -.-|monitors| C1
-    P -.-|monitors| C2
-    P -.-|monitors| CN
+    AS[fa:fa-person-military-pointing arterial_sup] -->|one_for_one| NIF(fa:fa-table arterial_nif)
+    AS -->|one_for_one| OBS(fa:fa-chart-line arterial_observe)
+    AS -->|one_for_one| PS[fa:fa-person-military-pointing arterial_pool_sup]
+
+    PS -->|simple_one_for_one| P1[fa:fa-layer-group arterial_pool pool1]
+    PS -.->|simple_one_for_one| PN[fa:fa-layer-group arterial_pool poolN]
+
+    subgraph pool [one arterial_pool supervisor]
+    P1 -->|one_for_one| C1(fa:fa-link arterial_connection 0)
+    P1 -->|one_for_one| C2(fa:fa-link arterial_connection 1)
+    P1 -->|one_for_one| CN(fa:fa-link arterial_connection N)
+    P1 -->|one_for_one| SW(fa:fa-broom arterial_sweeper)
+    P1 -.->|optional| BN(fa:fa-repeat arterial_bouncer)
     end
+
+    B>fa:fa-arrow-down-9-1 ConnectionPool NIF resource] -.-> P1
+    style B stroke-width:1px,color:#666,stroke-dasharray: 5 5
+
     C1 o-.-o S([Server])
     C2 o-.-o S
     CN o-.-o S
 ```
 
-`arterial_app` is a top-level `simple_one_for_one` supervisor that spawns one
-`arterial_pool` supervisor per named pool. Each `arterial_pool` creates the
-pool's C++-backed `ConnectionPool` NIF resource (which tracks which
-connections are checked out/available, their per-connection request
-backlog, throttles, and in-flight async request registry), then starts one
-`arterial_connection` worker per connection slot plus one `arterial_sweeper`
-that periodically evicts timed-out in-flight requests.
+`arterial_sup` is the application's static `one_for_one` top supervisor,
+with three permanent children: `arterial_nif` (the singleton owner of
+every pool's per-connection buffer ETS table), `arterial_observe` (owns
+the configured observability backend's lifecycle — see
+[Observability](#observability) — a no-op if none is configured), and
+`arterial_pool_sup`, a `simple_one_for_one` supervisor that spawns one
+`arterial_pool` supervisor per named pool started via
+`arterial_pool:start_link/2`.
+
+Each `arterial_pool` supervisor creates the pool's C++-backed
+`ConnectionPool` NIF resource (which tracks which connections are
+checked out/available, their per-connection request backlog, throttles,
+and in-flight async request registry — drawn as the dashed box above,
+since it's NIF-resident state the supervisor owns a reference to, not a
+supervised child), then starts one `arterial_connection` worker per
+connection slot, one `arterial_sweeper` that periodically evicts
+timed-out in-flight requests, and — only if the pool's
+`bounce_interval_ms` option is set — one `arterial_bouncer` that
+recycles connections on a rotation (see `arterial_bouncer`'s moduledoc
+for why and how).
 
 ### Erlang layer
 
 | Module | Responsibility |
 |---|---|
-| `arterial_app` | Application + top supervisor (`simple_one_for_one` of pools). |
-| `arterial_pool` | Per-pool `supervisor`; creates the NIF pool resource, then starts one `arterial_connection` worker per connection slot and one `arterial_sweeper`. |
+| `arterial_app` | The `arterial` OTP application; defines `arterial_sup`, the top-level `one_for_one` supervisor (`arterial_nif` + `arterial_observe` + `arterial_pool_sup`). |
+| `arterial_pool` | Per-pool `supervisor`; creates the NIF pool resource, then starts one `arterial_connection` worker per connection slot, one `arterial_sweeper`, and (if configured) one `arterial_bouncer`. |
 | `arterial_connection` | One `gen_server` per pooled connection. Owns the socket, runs the connect/reconnect state machine with exponential backoff, and drives the user-supplied client callback module (`arterial_client`). |
 | `arterial_sweeper` | Per-pool timer process; calls `arterial_nif:sweep_timeouts/1` on an interval to evict expired in-flight async requests. |
+| `arterial_bouncer` | Optional per-pool timer process; recycles connections one at a time on a rotation via `arterial_connection:bounce/2`, only started when `bounce_interval_ms` is configured. |
+| `arterial_observe` | Generic, pluggable observability facade (`span/3`/`event/2,3`); dispatches to a configurable backend module — see [Observability](#observability). |
+| `arterial_observe_telemetry` / `arterial_observe_prometheus` | Built-in `arterial_observe` backends, forwarding to `telemetry` or recording directly into Prometheus metrics, respectively. |
 | `arterial_socket` | Thin wrapper over Erlang's `socket` module for `tcp`/`udp` connect, plus `ssl` (requires OTP 28+ — see [SSL/TLS guide](docs/ssl-guide.md)). |
 | `arterial_client` | Behaviour for the connection lifecycle/codec (`init/1`, `setup/2`, `handle_request/2`, `handle_data/2`, `handle_timeout/2`, `terminate/2`); also implements `call/3` (synchronous request API) and `cast/2` (send-and-forget API). |
 | `arterial_protocol` | Behaviour for the wire transport and per-request codec (`connect/3`, `send/2`, `recv/2`, `encode_request/3`, `decode_reply/2`). |
@@ -119,15 +165,18 @@ that periodically evicts timed-out in-flight requests.
 
 | File | Responsibility |
 |---|---|
-| `arterial.hpp` / `arterial.cpp` | `ConnectionPool`: wraps the lock-free FIFO pool of connections, the in-flight async request registry, and the optional queue-when-busy wait-list; NIF entry points (`create_nif`, `checkout_nif`, `checkin_nif`, `checkin_up_to_nif`, `checkout_async_nif`, `make_available_nif`/`make_unavailable_nif`, `connection_drained_nif`, `connection_down_nif`, `track_inflight_nif`, `sweep_timeouts_nif`). |
+| `arterial.hpp` / `arterial.cpp` | `ConnectionPool`: wraps the lock-free FIFO pool of connections, the in-flight async request registry, the owner table, and the optional queue-when-busy wait-list; NIF entry points (`create_nif`, `checkout_nif`, `checkin_nif`, `checkin_up_to_nif`, `checkout_async_nif`, `make_available_nif`/`make_unavailable_nif`, `connection_drained_nif`, `connection_down_nif`, `track_inflight_nif`, `sweep_timeouts_nif`). |
 | `connection.hpp` | `Connection`: one pooled connection's id, socket term, request backlog, and vector of throttles. |
 | `backlog.hpp` | Per-connection in-flight request tracking — see [Backlog modes](#backlog-modes). |
-| `pool_fifo.hpp` / `pool_lifo.hpp` | Lock-free, atomic CAS–based object pools (FIFO built on top of a LIFO base) used to hand out `Connection*` objects with `CheckOut`/`CheckIn`/`MakeAvailable`/`MakeUnavailable` semantics and ABA-safe versioned node indices. |
+| `pool_fifo.hpp` | `BaseObjectPoolFIFO`/`ObjectPoolFIFO<T>`: a lock-free, atomic CAS–based Vyukov-style ring-buffer object pool used to hand out `Connection*` objects with `CheckOut`/`CheckIn`/`MakeAvailable`/`MakeUnavailable` semantics and ABA-safe versioned node indices. |
 | `wait_list.hpp` | `WaitList`: a bounded, lock-free MPMC ring buffer (Vyukov-style) of queued `checkout_async` callers, used by the optional queue-when-busy feature — see [Queue-when-busy checkouts](#queue-when-busy-checkouts). |
+| `owner_table.hpp` | `OwnerTable`: a fixed-capacity, lock-free, open-addressing table mapping a checked-out connection's owning `ErlNifPid` to its held backlog reservations, used to auto-release a connection if its owning process dies. |
 | `throttle.hpp` | `basic_time_spacing_throttle<T>` — a token-bucket-style rate limiter (ported from [utxx's `rate_throttler`](https://github.com/saleyn/utxx/blob/master/include/utxx/rate_throttler.hpp)) that checks elapsed time on each call instead of running a timer thread. |
-| `unordered_ttl_map.hpp` | Hash map + sorted LRU eviction list, used to track in-flight asynchronous requests and their deadlines (either one fixed TTL per pool, or a per-request deadline kept sorted on insert); also used to track deadlines for queued waiters. |
-| `enif.hpp` | Generic C++/Erlang NIF interop helpers (term conversion, resource wrapping). |
-| `test_pool.cpp` | Standalone tests for the FIFO/LIFO object pools. |
+| `hashmap_with_ttl.hpp` | `UnorderedTTLMap`: hash map + sorted LRU eviction list, used to track in-flight asynchronous requests and their deadlines (either one fixed TTL per pool, or a per-request deadline kept sorted on insert); also used to track deadlines for queued waiters. |
+| `sharded_ttl_map.hpp` | `ShardedTTLMap`: a concurrency-safe wrapper partitioning an `UnorderedTTLMap` across N independently-locked shards, so callers touching different keys never contend with each other. |
+| `arterial_util.hpp` | Small bit-twiddling helpers (e.g. `RoundUpPow2`) shared across the lock-free/sharded data structures above. |
+| `enif.hpp` | Generic C++/Erlang NIF interop helpers (term conversion, resource wrapping) — a fork of the third-party `nifpp` library. |
+| `test_pool.cpp` | Standalone tests for the FIFO object pool. |
 
 ### Connection checkout
 
@@ -238,7 +287,7 @@ It is the responsibility of the user to provide a module for encoding and decodi
 
 1. **Native request ID.** Each wire-level message contains a 32-bit (or 64-bit) request ID, and replies are not required to arrive in FIFO order. Use `RandomAccessBackLog` (`fifo => false`), any `backlog` value below 65,536 (the 16-bit internal index cap — see [Backlog modes](#backlog-modes)). Requests can be sent asynchronously, with up to 64k in-flight per connection.
 
-2. **Surrogate request ID.** Same as above, but for protocols that don't define a "request ID" concept of their own and instead expose *some* extensible/free-form field your `encode_request/3` can repurpose as one (a correlation tag, an unused header word, an opaque client cookie the server is required to echo back unmodified). `arterial` doesn't care whether the ID is one the protocol natively defines or one you synthesize and inject yourself — `RandomAccessBackLog` matches replies purely by the bits in `ext_req_id`, with no notion of which side "owns" the ID's meaning. Same `fifo => false` configuration as mode 1; see [client-guide.md's "Surrogate request IDs"](docs/client-guide.md#surrogate-request-ids) for a worked example.
+2. **Surrogate request ID.** Same as above, but for protocols that don't define a "request ID" concept of their own and instead expose *some* extensible/free-form field your `encode_request/3` can repurpose as one (a correlation tag, an unused header word, an opaque client cookie the server is required to echo back unmodified). `arterial` doesn't care whether the ID is one the protocol natively defines or one you synthesize and inject yourself — `RandomAccessBackLog` matches replies purely by the bits in `ext_req_id`, with no notion of which side "owns" the ID's meaning. Same `fifo => false` configuration as mode 1; see [Client Implementation Guide's "Surrogate request IDs"](docs/client-guide.md#surrogate-request-ids) for a worked example.
 
 3. **FIFO, backlog = 1 (synchronous reservation).** Wire-level messages don't encode a request ID (and no field can be repurposed as one), so replies are matched purely by FIFO send order. A client reserves the connection for the lifetime of one request and awaits the response synchronously — no concurrent in-flight requests, so no backlog capacity is needed beyond the default of 1.
 
@@ -250,8 +299,8 @@ It is the responsibility of the user to provide a module for encoding and decodi
 
 6. **Acknowledgement-based protocols**, two variants:
 
-   * **Per-message ack**: the server's "reply" to a request is just an ack (carrying the id back, or not even that, as long as your framing can tell which message it closes out) rather than a real response payload. This needs nothing extra — it's the *same* matching as mode 1 or 2 (`fifo => false`); `decode_reply/2` simply returns whatever small ack term applies (even just the atom `ack`) once it recognizes the match. See [client-guide.md's "Per-message acks"](docs/client-guide.md#per-message-acks) for a worked example.
-   * **Bulk/cumulative ack**: a single ack confirms several previous requests at once (e.g. a heartbeat carrying "processed through sequence N"). This is a genuinely different mechanism, using `arterial_nif:checkin_up_to/3`: it releases every outstanding FIFO slot up to and including a given `req_id` in one call, even across requests originally reserved by different callers. Only meaningful with `fifo => true` (mode 3 or 4); a no-op against a random-access backlog (mode 1/2). See [client-guide.md's "Bulk/cumulative acks"](docs/client-guide.md#bulkcumulative-acks) for the full contract and `test/arterial_nif_tests.erl`'s `checkin_up_to_releases_fifo_span_test/0` for a worked example.
+   * **Per-message ack**: the server's "reply" to a request is just an ack (carrying the id back, or not even that, as long as your framing can tell which message it closes out) rather than a real response payload. This needs nothing extra — it's the *same* matching as mode 1 or 2 (`fifo => false`); `decode_reply/2` simply returns whatever small ack term applies (even just the atom `ack`) once it recognizes the match. See [Client Implementation Guide's "Per-message acks"](docs/client-guide.md#per-message-acks) for a worked example.
+   * **Bulk/cumulative ack**: a single ack confirms several previous requests at once (e.g. a heartbeat carrying "processed through sequence N"). This is a genuinely different mechanism, using `arterial_nif:checkin_up_to/3`: it releases every outstanding FIFO slot up to and including a given `req_id` in one call, even across requests originally reserved by different callers. Only meaningful with `fifo => true` (mode 3 or 4); a no-op against a random-access backlog (mode 1/2). See [Client Implementation Guide's "Bulk/cumulative acks"](docs/client-guide.md#bulkcumulative-acks) for the full contract and `test/arterial_nif_tests.erl`'s `checkin_up_to_releases_fifo_span_test/0` for a worked example.
 
 **Disconnect notification** applies across modes 1–4 and 6 (anywhere a request can be genuinely in-flight): if a connection's socket dies while it still has unconfirmed asynchronous (`track_inflight/5`-registered) requests, each owning process receives `{arterial_disconnected, Pool, ReqID}` so it can resubmit or persist that request outside `arterial`. See `arterial_nif:connection_down/2`, called automatically from `arterial_connection`'s disconnect path. Not applicable to mode 5 (nothing is ever in-flight to lose).
 
@@ -264,7 +313,7 @@ Two behaviours decouple the wire transport from request/response encoding:
 
 Pool/connection options (`t:arterial_client:options/0`) include `address`/`ip`
 (or `addresses`, for failover across several), `port`, `protocol` (`tcp` |
-`udp` | `ssl` — see [docs/ssl-guide.md](docs/ssl-guide.md) for `ssl`, which
+`udp` | `ssl` — see [SSL/TLS guide](docs/ssl-guide.md) for `ssl`, which
 needs OTP 28+), `reconnect`, `reconnect_time`, `bounce_interval_ms`,
 `socket_options`, and `tls_options` (only used when `protocol => ssl`).
 `t:arterial_pool:options/0` (passed to `arterial_pool:start_link/2`)
@@ -276,34 +325,70 @@ per-connection options map above).
 For a full step-by-step walkthrough of implementing both behaviours,
 wiring them into a pool, and testing against a real server, see
 [Arterial Client Implementation Guide](docs/clent-guide.md). For the `ssl` transport
-specifically (OTP 28+ required), see [SSL Guide](docs/ssl-guide.md).
+specifically (OTP 28+ required), see [SSL/TLS guide](docs/ssl-guide.md).
 
 ## Observability
 
 Arterial emits events for `call`/`cast`/`checkout`/`connect` (each as a
 `start`/`stop`/`exception` span), plus one-shot `disconnect` and `sweep`
 events, through a pluggable facade,
-[src/arterial_observability.erl](src/arterial_observability.erl) — see
+[src/arterial_observe.erl](src/arterial_observe.erl) — see
 its moduledoc for the full event/measurement/metadata catalog.
 
 The backend that actually receives these events is chosen via the
-`arterial` application's `observability` env var:
+`arterial` application's `observability` env var, read once by
+`arterial_app`'s top-level supervisor at boot:
 
 ```erlang
-{arterial, [{observability, telemetry}]}    % default; forwards to telemetry:execute/3
-{arterial, [{observability, prometheus}]}   % records straight into Prometheus metrics
-{arterial, [{observability, my_module}]}    % your own arterial_observability callback module
+{arterial, [{observability, undefined}]}              % default: no backend, span/3 just runs Fun/0
+{arterial, [{observability, telemetry}]}               % forwards to telemetry:execute/3
+{arterial, [{observability, prometheus}]}              % records straight into Prometheus metrics
+{arterial, [{observability, {telemetry, Opts}}]}       % built-in backend + Opts passed to its start/1
+{arterial, [{observability, {prometheus, Opts}}]}
+{arterial, [{observability, my_module}]}               % your own arterial_observe callback module
+{arterial, [{observability, {my_module, Opts}}]}
 ```
 
-Both `telemetry` and `prometheus` are strictly optional dependencies
-(declared in `rebar.config` but absent from `arterial.app.src`'s
-`applications`) — only the configured backend's dependency is ever
-started, the same lazy pattern `arterial_socket` uses for `ssl`. With the
-`prometheus` backend, call `arterial_observability_prometheus:start/0,1`
-once at boot to declare its metrics, then wire up your own exporter
-(`prometheus_httpd`, `prometheus_cowboy2`, etc.) separately. Writing your
-own backend means implementing a single `arterial_observability`
-callback, `event/3`.
+Both `telemetry` and `prometheus` are strictly optional dependencies:
+neither is in arterial's own default `deps` (rebar3 has no native
+"optional dependency" mechanism), nor in `arterial.app.src`'s
+`applications` — only the configured backend's dependency is ever
+started, the same lazy pattern `arterial_socket` uses for `ssl`. A plain
+`rebar3 compile` of arterial itself never fetches either library.
+
+Since rebar3 profiles aren't transitive across dependencies, an
+application embedding `arterial` and wanting one of the built-in backends
+must add that backend's dependency directly to its own `rebar.config`
+(version-pinned to match arterial's own `rebar.config`):
+
+```erlang
+{deps, [
+  {arterial,   {git, "https://github.com/saleyn/arterial.git", {branch, "main"}}},
+  {prometheus, "6.1.2"}  %% or {telemetry, "1.3.0"}, depending on backend
+]}.
+```
+
+Arterial's own `rebar.config` additionally defines `telemetry` and
+`prometheus` profiles (each pulling in just that one dependency) plus a
+`test` profile (pulling in both) — these exist for arterial's own
+development/test suite (`rebar3 as test eunit`, etc.), not for embedding
+applications to depend on.
+
+`arterial_app`'s supervisor starts a permanent `arterial_observe`
+child that calls the configured backend's `start/1` once at boot (e.g.
+`arterial_observe_prometheus:start/1` declares its metrics —
+do this before traffic starts flowing, or the first few observations may
+race metric registration) and `stop/0` on shutdown (each backend only
+stops the underlying application — `telemetry`/`prometheus` — if it was
+the one that started it, so a host application already running either
+for its own purposes is left alone). With the `prometheus` backend, wire
+up your own exporter (`prometheus_httpd`, `prometheus_cowboy2`, etc.)
+separately — `arterial_observe_prometheus` only owns the metric
+definitions and the events that feed them.
+
+Writing your own backend means implementing the `arterial_observe`
+behaviour: `start/1`, `stop/0`, and `event/3` — see that module's
+moduledoc's "Writing your own backend" section for the exact contract.
 
 ## Documentation
 

@@ -1,10 +1,10 @@
--module(arterial_observability_telemetry_tests).
+-module(arterial_observe_telemetry_tests).
 -include_lib("eunit/include/eunit.hrl").
 
 -moduledoc """
 Verifies the `[arterial, ...]` events documented in
-`arterial_observability`'s moduledoc actually reach `telemetry` (the
-default `arterial_observability` backend) with the right
+`arterial_observe`'s moduledoc actually reach `telemetry` (one of
+the two built-in `arterial_observe` backends) with the right
 measurements/metadata, against a real `arterial_pool` stack (mirrors
 `test_tcp_server_tests`'s harness).
 """.
@@ -12,7 +12,15 @@ measurements/metadata, against a real `arterial_pool` stack (mirrors
 -define(POOL, telemetry_echo_pool).
 
 setup() ->
+  ok = test_helper:set_log_level(),
+  %% arterial_observe:backend/0 resolves and caches its backend
+  %% module via persistent_term on first call -- erase any caching from a
+  %% previous test (module) run so this test's application:set_env/3
+  %% actually takes effect (mirrors the "restart the observability child"
+  %% requirement documented in arterial_observe's moduledoc).
+  persistent_term:erase(arterial_observe),
   ok = application:set_env(arterial, observability, telemetry),
+  ok = arterial_observe_telemetry:start([]),
   {ok, Srv} = test_tcp_server:start(0),
   Port = test_tcp_server:port(Srv),
   {ok, SupPid} = arterial_pool:start_link(?POOL, #{
@@ -163,7 +171,7 @@ sweep_emits_expired_count_test() ->
     %% Drive the sweep directly (the same call arterial_sweeper makes on
     %% its timer) rather than waiting out a real interval.
     {ok, 1} = arterial_nif:sweep_timeouts(?POOL),
-    arterial_observability:event([sweep, stop], #{expired_count => 1}, #{pool => ?POOL}),
+    arterial_observe:event([sweep, stop], #{expired_count => 1}, #{pool => ?POOL}),
 
     [{telemetry_event, [arterial, sweep, stop], Measurements, Meta}] = flush_events(),
     ?assertEqual(1, maps:get(expired_count, Measurements)),

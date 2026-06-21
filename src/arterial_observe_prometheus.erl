@@ -1,18 +1,25 @@
--module(arterial_observability_prometheus).
+-module(arterial_observe_prometheus).
 
 -moduledoc """
-`arterial_observability` backend that records straight into Prometheus
+`arterial_observe` backend that records straight into Prometheus
 metrics -- no dependency on the `telemetry` library at all, only on
 `prometheus` itself.
 
-Selected via `{arterial, [{observability, prometheus}]}`. Call
-`start/0,1` once at application boot (after configuring whatever exporter
-you use, e.g. `prometheus_httpd`/`prometheus_cowboy2`) to declare this
-module's metrics; `event/3` (and so every `arterial_observability:span/3`/
-`event/2,3` call) lazily starts the `prometheus` application itself the
-same way `arterial_socket` lazily starts `ssl`, but metric *declaration*
-only happens in `start/0,1` -- call it before traffic starts flowing or
-the first few observations may race metric registration.
+Selected via `{arterial, [{observability, prometheus}]}` (or
+`{prometheus, Opts}`, where `Opts` is the map `start/1` takes -- see
+below). `arterial_app`'s top-level supervisor calls `start/1` once at
+boot (after configuring whatever exporter you use, e.g.
+`prometheus_httpd`/`prometheus_cowboy2`) and `stop/0` on shutdown (see
+`m:arterial_observe`'s moduledoc for the full lifecycle contract).
+`start/1` both starts the `prometheus` application (if it isn't running
+already, the same lazy pattern `arterial_socket` uses for `ssl`) and
+declares this module's metrics -- do this before traffic starts flowing,
+or the first few observations may race metric registration. `stop/0`
+only stops the `prometheus` application again if this module is the one
+that started it (tracked via `ensure_started/0`'s `internal`/`external`
+bookkeeping, so a host application that already runs `prometheus` for
+its own purposes never has it pulled out from under it when `arterial`
+stops).
 
 ## Metrics
 
@@ -36,7 +43,7 @@ don't fit your latency profile.
 ```
 1> application:set_env(arterial, observability, prometheus).
 ok
-2> arterial_observability_prometheus:start().
+2> arterial_observe_prometheus:start().
 ok
 3> arterial_client:call(my_pool, my_request, 5000).
 {ok, my_response}
@@ -46,17 +53,23 @@ ok
 ```
 """.
 
--behaviour(arterial_observability).
+-behaviour(arterial_observe).
 
--export([start/0, start/1, event/3]).
+-export([start/0, start/1, stop/0, event/3]).
 
--doc "Equivalent to `start/1` with default histogram buckets.".
+-doc """
+Equivalent to `start/1` with default histogram buckets. Mainly useful for
+calling this module manually (a shell session, a test) outside the
+`arterial_observe` supervised lifecycle, which always calls `start/1`.
+""".
 -spec start() -> ok.
 start() -> start(#{}).
 
 -doc """
-Declare this module's Prometheus metrics. Idempotent -- calling it again
-just re-declares the same metrics (a no-op per `prometheus_metric`'s own
+The `arterial_observe` behaviour's `start/1` callback: starts the
+`prometheus` application (see `ensure_started/0`) and declares this
+module's Prometheus metrics. Idempotent -- calling it again just
+re-declares the same metrics (a no-op per `prometheus_metric`'s own
 `declare/1` semantics).
 
 `Opts`:
@@ -66,7 +79,7 @@ just re-declares the same metrics (a no-op per `prometheus_metric`'s own
 """.
 -spec start(#{buckets => [number(), ...]}) -> ok.
 start(Opts) when is_map(Opts) ->
-  ok = ensure_started(),
+  ensure_started(),
 
   Buckets = maps:get(buckets, Opts, default),
   HistogramOpts = case Buckets of
@@ -98,10 +111,24 @@ start(Opts) when is_map(Opts) ->
     [pool, span]),
   ok.
 
--doc false.
+-doc """
+Stops the `prometheus` application, but only if `start/1` was the one
+that started it (a host application that already had `prometheus`
+running for its own purposes keeps it running). Does not un-declare the
+metrics `start/1` registered -- Prometheus has no API for that; they
+simply stop receiving observations.
+""".
+-spec stop() -> ok.
+stop() ->
+  case ensure_started() of
+    internal -> application:stop(prometheus);
+    _        -> ok
+  end,
+  persistent_term:erase(?MODULE).
+
+-doc "Records the event into this module's Prometheus metrics; see the moduledoc's Metrics section for the event-to-metric mapping.".
 -spec event([atom()], map(), map()) -> ok.
 event(EventName, Measurements, Metadata) ->
-  ok = ensure_started(),
   handle_event(EventName, Measurements, Metadata).
 
 %%%-----------------------------------------------------------------------------
@@ -109,12 +136,17 @@ event(EventName, Measurements, Metadata) ->
 %%%-----------------------------------------------------------------------------
 
 ensure_started() ->
-  case persistent_term:get(?MODULE, false) of
-    true  -> ok;
-    false ->
-      {ok, _} = application:ensure_all_started(prometheus),
-      persistent_term:put(?MODULE, true),
-      ok
+  case persistent_term:get(?MODULE, nil) of
+    nil ->
+      {ok, Apps} = application:ensure_all_started(prometheus),
+      Status = case lists:member(prometheus, Apps) of
+        true  -> internal;
+        false -> external
+      end,
+      persistent_term:put(?MODULE, Status),
+      Status;
+    Cached ->
+      Cached
   end.
 
 declare_histogram(Name, Help, Labels, ExtraOpts) ->
@@ -127,7 +159,7 @@ declare_counter(Name, Help, Labels) ->
 
 %% Prometheus convention: durations are seconds (floats), not native time
 %% units -- convert once here so every histogram is in the same unit
-%% regardless of what arterial_observability:span/3 measured internally.
+%% regardless of what arterial_observe:span/3 measured internally.
 seconds(DurationNative) ->
   erlang:convert_time_unit(DurationNative, native, microsecond) / 1_000_000.
 

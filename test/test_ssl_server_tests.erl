@@ -19,6 +19,7 @@ doesn't fail CI on OTP 27.
 setup() -> setup(2).
 
 setup(Size) ->
+  ok = test_helper:set_log_level(),
   {ok, Srv} = test_ssl_server:start(0),
   Port = test_ssl_server:port(Srv),
   {ok, SupPid} = arterial_pool:start_link(ssl_echo_pool, #{

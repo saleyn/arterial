@@ -162,7 +162,7 @@ monitoring between calls.
 -spec call(arterial_pool:name(), term(), non_neg_integer()) ->
   {ok, arterial:response()} | {error, term()}.
 call(Pool, Request, Timeout) ->
-  arterial_observability:span([call], #{pool => Pool}, fun() ->
+  arterial_observe:span([call], #{pool => Pool}, fun() ->
     Result = do_call(Pool, Request, Timeout),
     Outcome = case Result of {ok, _} -> ok; _ -> error end,
     {Result, #{pool => Pool, result => Outcome}}
@@ -202,7 +202,7 @@ do_call(Pool, Request, Timeout) ->
 %% Wraps arterial_nif:checkout_connection/2 with a [arterial, checkout, ...]
 %% span -- shared by call/3 (Mode = sync) and cast/2 (Mode = async).
 checkout(Pool, Mode) ->
-  arterial_observability:span([checkout], #{pool => Pool, mode => Mode}, fun() ->
+  arterial_observe:span([checkout], #{pool => Pool, mode => Mode}, fun() ->
     Result = arterial_nif:checkout_connection(Pool, Mode),
     Outcome = case Result of {ok, _} -> ok; {error, Reason} -> Reason end,
     {Result, #{pool => Pool, mode => Mode, outcome => Outcome}}
@@ -239,7 +239,7 @@ ok
 """.
 -spec cast(arterial_pool:name(), term()) -> ok | {error, term()}.
 cast(Pool, Request) ->
-  arterial_observability:span([cast], #{pool => Pool}, fun() ->
+  arterial_observe:span([cast], #{pool => Pool}, fun() ->
     Result = do_cast(Pool, Request),
     Outcome = case Result of ok -> ok; _ -> error end,
     {Result, #{pool => Pool, result => Outcome}}
