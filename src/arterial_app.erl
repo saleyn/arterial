@@ -69,12 +69,32 @@ stop(_State) ->
 -spec init([] | pool_sup) ->
   {ok, {{one_for_one | simple_one_for_one, non_neg_integer(), non_neg_integer()}, [map()]}}.
 init([]) ->
+  %% Start observability module if configured
+  {ObsImplMod, ObsOpts} =
+    case application:get_env(arterial, observability) of
+      prometheus            -> {arterial_observe_prometheus,  #{}};
+      telemetry             -> {arterial_observe_telemetry,   #{}};
+      {prometheus, Opts}    -> {arterial_observe_prometheus, Opts};
+      {telemetry,  Opts}    -> {arterial_observe_telemetry,  Opts};
+      undefined             -> {nil, []};
+      Mod when is_atom(Mod) -> {Mod, []};
+      {Mod, Opts} when is_atom(Mod) -> {Mod, Opts}
+    end,
+
   %% Top-level: the singleton arterial_nif table owner plus the
   %% simple_one_for_one sub-supervisor for pools below. A
   %% simple_one_for_one supervisor can only ever hold one (homogeneous)
   %% child spec, so arterial_nif can't be a sibling inside it directly --
   %% it needs this static one_for_one wrapper instead.
   {ok, {{one_for_one, 5, 10}, [
+    #{
+      id       => arterial_observe,
+      start    => {arterial_observe, start_link, [ObsImplMod, ObsOpts]},
+      restart  => permanent,
+      shutdown => 1000,
+      type     => worker,
+      modules  => [arterial_nif]
+    },
     #{
       id       => arterial_nif,
       start    => {arterial_nif, start_link, []},

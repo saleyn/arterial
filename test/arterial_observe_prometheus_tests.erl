@@ -1,19 +1,26 @@
--module(arterial_observability_prometheus_tests).
+-module(arterial_observe_prometheus_tests).
 -include_lib("eunit/include/eunit.hrl").
 
 -moduledoc """
-Verifies `arterial_observability_prometheus:start/0` declares its metrics
+Verifies `arterial_observe_prometheus:start/0` declares its metrics
 and that they get updated when the corresponding `[arterial, ...]` events
 fire (with `{observability, prometheus}` configured), against a real
-`arterial_pool` stack (mirrors `arterial_observability_telemetry_tests`'s
+`arterial_pool` stack (mirrors `arterial_observe_telemetry_tests`'s
 harness).
 """.
 
 -define(POOL, prometheus_echo_pool).
 
 setup() ->
+  ok = test_helper:set_log_level(),
+  %% arterial_observe:backend/0 resolves and caches its backend
+  %% module via persistent_term on first call -- erase any caching from a
+  %% previous test (module) run so this test's application:set_env/3
+  %% actually takes effect (mirrors the "restart the observability child"
+  %% requirement documented in arterial_observe's moduledoc).
+  persistent_term:erase(arterial_observe),
   ok = application:set_env(arterial, observability, prometheus),
-  ok = arterial_observability_prometheus:start(),
+  ok = arterial_observe_prometheus:start(),
   {ok, Srv} = test_tcp_server:start(0),
   Port = test_tcp_server:port(Srv),
   {ok, SupPid} = arterial_pool:start_link(?POOL, #{
@@ -50,13 +57,15 @@ wait_until_available(Pool, N, Retries) ->
       error(pool_not_ready)
   end.
 
-%% prometheus_histogram:value/2's Buckets element is a list of per-bucket
-%% counts in bucket order -- the last entry (the +infinity bucket) is the
-%% cumulative total observation count.
+%% prometheus_histogram:value/2's Buckets element is a list of raw
+%% (non-cumulative) per-bucket counts -- one observation lands in exactly
+%% one bucket slot, so the total observation count is the sum across all
+%% of them (NOT the last slot -- that's only the count of observations
+%% falling in the highest/`+infinity` bucket specifically).
 total_observations(Name, LabelValues) ->
   case prometheus_histogram:value(Name, LabelValues) of
-    undefined       -> 0;
-    {Buckets, _Sum} -> lists:last(Buckets)
+    undefined      -> 0;
+    {Buckets, _Sum} -> lists:sum(Buckets)
   end.
 
 call_observes_histogram_test() ->
@@ -127,7 +136,7 @@ sweep_increments_counter_test() ->
     timer:sleep(1),
 
     {ok, 1} = arterial_nif:sweep_timeouts(?POOL),
-    arterial_observability:event([sweep, stop], #{expired_count => 1}, #{pool => ?POOL}),
+    arterial_observe:event([sweep, stop], #{expired_count => 1}, #{pool => ?POOL}),
 
     After = counter_value(arterial_sweep_expired_total, [?POOL]),
     ?assertEqual(Before + 1, After),

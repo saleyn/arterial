@@ -2,7 +2,7 @@
 /// \file   sharded_ttl_map.hpp
 /// \author Serge Aleynikov
 //-----------------------------------------------------------------------------
-/// \brief A concurrency-safe wrapper around unordered_ttl_map.hpp,
+/// \brief A concurrency-safe wrapper around hashmap_with_ttl.hpp,
 /// partitioning keys across N independently-locked shards so that callers
 /// touching different keys never contend with each other.
 ///
