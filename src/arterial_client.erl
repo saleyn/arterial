@@ -70,25 +70,53 @@ let the callback module release any resources held in `State`.
 Pool/connection options accepted under the `client_opts` key of
 `t:arterial_pool:options/0`.
 
+`addresses` (a non-empty list, tried in order on every reconnect until
+one connects) takes priority over the single-address `address`/`ip` if
+both are given; useful for failing over across a fixed set of
+known-good backup addresses. Each entry is either a plain address
+(sharing this `port`/`socket_options`) or a map overriding either (or
+both) for that entry alone -- see `t:arterial_connection:address_entry/0`,
+e.g. to reach several independent server instances on localhost, each
+on its own port. Once the whole list has been tried and failed, the
+connection backs off (`reconnect_time`) before restarting from the first
+address again.
+
+`reconnect_time` controls that backoff: a fixed interval (plain
+integer), or `{backoff, Min, Max}` for exponential backoff -- see
+`t:arterial_connection:reconnect_time/0`. The legacy `reconnect_time_min`/
+`reconnect_time_max` pair still works (folded into the equivalent
+`{backoff, Min, Max}`) if `reconnect_time` isn't given.
+
 ## Examples
 
 ```
 1> Opts = #{address => "db.internal", port => 5432, protocol => tcp,
-2>          reconnect => true, reconnect_time_min => 500,
-3>          reconnect_time_max => 30000}.
+2>          reconnect => true, reconnect_time => {backoff, 500, 30000}}.
 #{address => "db.internal",port => 5432,protocol => tcp,
-  reconnect => true,reconnect_time_min => 500,reconnect_time_max => 30000}
+  reconnect => true,reconnect_time => {backoff,500,30000}}
+3> Opts2 = #{addresses => ["db1.internal", "db2.internal", "db3.internal"],
+4>           port => 5432, protocol => tcp}.
+#{addresses => ["db1.internal","db2.internal","db3.internal"],
+  port => 5432,protocol => tcp}
+5> Opts3 = #{addresses => [#{address => "127.0.0.1", port => 9001},
+6>                          #{address => "127.0.0.1", port => 9002}],
+7>           protocol => tcp}.
+#{addresses => [#{address => "127.0.0.1",port => 9001},
+                 #{address => "127.0.0.1",port => 9002}],
+  protocol => tcp}
 ```
 """.
 -type options() :: #{
   init_options       => arterial_connection:init_options(),
   address            => arterial:inet_address(),
+  addresses          => [arterial_connection:address_entry(), ...],
   ip                 => arterial:inet_address(),
   port               => arterial:inet_port(),
   protocol           => arterial:protocol(),
   reconnect          => boolean(),
-  reconnect_time_max => arterial:time()   | infinity,
-  reconnect_time_min => arterial:time(),
+  reconnect_time     => arterial_connection:reconnect_time(),
+  reconnect_time_max => arterial:time()   | infinity, % deprecated, use reconnect_time
+  reconnect_time_min => arterial:time(),              % deprecated, use reconnect_time
   bounce_interval_ms => non_neg_integer() | infinity,
   socket_options     => arterial:socket_options()
 }.

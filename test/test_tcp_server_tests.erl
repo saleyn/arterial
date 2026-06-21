@@ -209,3 +209,73 @@ conn_pid(Pool, ConnID) ->
     {_, Pid, _, _} when is_pid(Pid) -> {ok, Pid};
     _                               -> error
   end.
+
+%% With `addresses => [Dead, Live]` (sharing one port), every reconnect
+%% must skip the first (unreachable) address and fall through to the
+%% second without waiting out a backoff interval in between -- proving
+%% failover tries the whole list in order on a single reconnect attempt,
+%% not just eventually after several backed-off retries.
+tcp_multi_address_failover_test() ->
+  {ok, Srv} = test_tcp_server:start(0),
+  Port = test_tcp_server:port(Srv),
+  %% "Dead" address: a real listening socket on the *same* port, bound to
+  %% a different loopback address, stopped immediately so it's a
+  %% deterministic connection-refused target (vs. a firewall/timeout-
+  %% dependent unroutable address).
+  {ok, DeadSrv} = test_tcp_server:start(Port, {127, 0, 0, 2}),
+  ok = test_tcp_server:stop(DeadSrv),
+
+  {ok, SupPid} = arterial_pool:start_link(tcp_echo_pool, #{
+    size        => 1,
+    protocol    => test_echo_protocol,
+    client      => test_echo_client,
+    client_opts => #{
+      addresses => ["127.0.0.2", "127.0.0.1"],
+      port      => Port,
+      protocol  => tcp
+    }
+  }),
+  try
+    wait_until_available(tcp_echo_pool, 1, 100),
+    {ok, hello} = arterial_client:call(tcp_echo_pool, {echo, hello}, 1000)
+  after
+    supervisor:stop(SupPid),
+    arterial_nif:destroy(tcp_echo_pool),
+    test_tcp_server:stop(Srv)
+  end.
+
+%% Map-entry addresses (`#{address => IP, port => Port}`) let each entry
+%% carry its own port, independent of the connection's shared `port` --
+%% needed to test against multiple independent server instances on
+%% localhost rather than just multiple addresses sharing one port.
+tcp_multi_address_per_entry_port_test() ->
+  %% A dead entry, deliberately on its own port (no top-level `port`
+  %% option set at all -- proves the map entries are fully self-contained
+  %% and don't need a fallback).
+  {ok, DeadSrv} = test_tcp_server:start(0),
+  DeadPort = test_tcp_server:port(DeadSrv),
+  ok = test_tcp_server:stop(DeadSrv),
+
+  {ok, Srv} = test_tcp_server:start(0),
+  Port = test_tcp_server:port(Srv),
+
+  {ok, SupPid} = arterial_pool:start_link(tcp_echo_pool, #{
+    size        => 1,
+    protocol    => test_echo_protocol,
+    client      => test_echo_client,
+    client_opts => #{
+      addresses => [
+        #{address => "127.0.0.1", port => DeadPort},
+        #{address => "127.0.0.1", port => Port}
+      ],
+      protocol => tcp
+    }
+  }),
+  try
+    wait_until_available(tcp_echo_pool, 1, 100),
+    {ok, hello} = arterial_client:call(tcp_echo_pool, {echo, hello}, 1000)
+  after
+    supervisor:stop(SupPid),
+    arterial_nif:destroy(tcp_echo_pool),
+    test_tcp_server:stop(Srv)
+  end.

@@ -27,13 +27,20 @@ ok
 ```
 """.
 
--export([start/1, port/1, stop/1]).
+-export([start/1, start/2, port/1, stop/1]).
 
--doc "Start listening on `Port` (`0` picks a free ephemeral port).".
+-doc "Equivalent to `start/2` bound to `127.0.0.1`.".
 -spec start(arterial:inet_port()) -> {ok, pid()}.
-start(Port) ->
+start(Port) -> start(Port, {127, 0, 0, 1}).
+
+-doc """
+Start listening on `Port` (`0` picks a free ephemeral port), bound to
+`Address`.
+""".
+-spec start(arterial:inet_port(), inet:ip_address()) -> {ok, pid()}.
+start(Port, Address) ->
   Parent = self(),
-  Pid = spawn_link(fun() -> init(Parent, Port) end),
+  Pid = spawn_link(fun() -> init(Parent, Port, Address) end),
   receive
     {Pid, ready, _ListenPort} -> {ok, Pid}
   after 5000 ->
@@ -52,10 +59,10 @@ stop(Srv) ->
   Srv ! {self(), stop},
   receive {Srv, stopped} -> ok end.
 
-init(Parent, Port) ->
+init(Parent, Port, Address) ->
   {ok, LSock} = socket:open(inet, stream, tcp),
   ok = socket:setopt(LSock, socket, reuseaddr, true),
-  ok = socket:bind(LSock, #{family => inet, addr => {127,0,0,1}, port => Port}),
+  ok = socket:bind(LSock, #{family => inet, addr => Address, port => Port}),
   %% Default backlog is small on some platforms; a pool with many
   %% connections all dialing in at once (e.g. arterial_bench) can exceed
   %% it, leaving extra SYNs queued at the kernel level until the single
