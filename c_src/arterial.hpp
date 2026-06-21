@@ -346,6 +346,18 @@ struct ConnectionPool {
   bool MakeAvailable   (uint32_t id) { return SetAvailable(id, true);  }
   bool MakeUnavailable (uint32_t id) { return SetAvailable(id, false); }
 
+  /// @brief Returns true if connection `id` currently has zero in-flight
+  /// requests checked out of its backlog (i.e. safe to disconnect without
+  /// abandoning any pending request). Used to implement a "bounce" cycle:
+  /// mark a connection unavailable (stops new checkouts from selecting it),
+  /// poll this until it drains, then disconnect/reconnect it.
+  /// @return false if `id` does not name a connection in this pool.
+  bool IsDrained(uint32_t id)
+  {
+    auto* conn = Get(id);
+    return conn && conn->Requests().Empty();
+  }
+
   /// @brief Look up a connection by id (its index in the pool).
   Connection* Get(uint32_t id)
   {

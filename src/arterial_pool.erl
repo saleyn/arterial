@@ -14,6 +14,7 @@ that manage their own supervision tree.
 
 -export([start_link/2]).
 -export([init/1]).
+-export([sup_name/1]).
 
 -doc "The atom identifying a pool; shared with `t:arterial_nif:pool/0`.".
 -type name() :: atom().
@@ -21,6 +22,41 @@ that manage their own supervision tree.
 -doc """
 Options accepted by `start_link/2`. All keys are optional and fall back to
 the defaults shown in the example below.
+
+* `size` - number of connections in the pool (default: `1`).
+* `backlog` - max in-flight requests per connection (default: `1`).
+* `fifo` - backlog/reply ordering per connection; `true` assumes replies
+  arrive in the same order requests were sent, `false` allows out-of-order
+  replies matched by request id (default: `true`).
+* `fixed_timeout_us` - shared TTL (microseconds) for every in-flight
+  request; `0` means each request uses its own TTL instead (default: `0`).
+* `sweep_interval_ms` - how often `arterial_sweeper` evicts expired
+  in-flight requests (default: `1000`).
+* `ttl_shards` - shard count for the in-flight/waiter registries; see
+  `arterial_nif:create/8` (default: `nproc`, value can be an integer,
+  a tuple `{nproc, Times::integer()}`, or `nproc`, where `nproc` is the
+  number of cores).
+* `bounce_interval_ms` - if set, starts an `arterial_bouncer` that
+  recycles one connection (disconnect + reconnect) every this many
+  milliseconds, round-robin across the pool; `undefined` disables
+  periodic bouncing entirely (default: `undefined`). Useful behind a
+  Kubernetes `Service`/load balancer that performs DNS- or
+  connection-level balancing across a `Deployment`'s pods: without
+  this, a long-lived pool's connections are resolved/balanced once at
+  connect time and then never re-balanced, so they go stale -- pods
+  added by autoscaling never receive traffic, and pods removed during
+  scale-down leave connections pinned to an endpoint that's gone.
+  Periodic bouncing forces each connection to re-resolve/re-balance on
+  its next reconnect, keeping load spread evenly across whatever set of
+  backend pods currently exists.
+* `bounce_drain_timeout_ms` - how long a single connection's bounce waits
+  for its backlog to drain of in-flight requests before forcing the
+  disconnect anyway; only meaningful if `bounce_interval_ms` is set
+  (default: `30000`).
+* `protocol` - the `c:arterial_protocol` callback module for this pool.
+* `client` - the `c:arterial_client` callback module for this pool.
+* `client_opts` - opaque options passed to `client`'s `setup/2` (default:
+  `#{}`).
 
 ## Examples
 
@@ -34,15 +70,17 @@ the defaults shown in the example below.
 ```
 """.
 -type options() :: #{
-  size              => pos_integer(),
-  backlog           => pos_integer(),
-  fifo              => boolean(),
-  fixed_timeout_us  => non_neg_integer(),
-  sweep_interval_ms => pos_integer(),
-  ttl_shards        => non_neg_integer() | nproc | {nproc, pos_integer()},
-  protocol          => arterial:protocol(),
-  client            => arterial:client(),
-  client_opts       => arterial_client:options()
+  size                   => pos_integer(),
+  backlog                => pos_integer(),
+  fifo                   => boolean(),
+  fixed_timeout_us       => non_neg_integer(),
+  sweep_interval_ms      => pos_integer(),
+  ttl_shards             => non_neg_integer() | nproc | {nproc, pos_integer()},
+  bounce_interval_ms     => undefined | pos_integer(),
+  bounce_drain_timeout_ms => pos_integer(),
+  protocol               => arterial:protocol(),
+  client                 => arterial:client(),
+  client_opts            => arterial_client:options()
 }.
 
 -export_type([name/0, options/0]).
@@ -55,7 +93,9 @@ the defaults shown in the example below.
 Start the supervisor for pool `Name`: creates the pool's NIF resource,
 then starts one `arterial_connection` worker per connection slot plus an
 `arterial_sweeper` that periodically evicts timed-out in-flight async
-requests (see `arterial_nif:track_inflight/5`).
+requests (see `arterial_nif:track_inflight/5`), and, if
+`bounce_interval_ms` is set, an `arterial_bouncer` that periodically
+recycles connections one at a time (see `arterial_bouncer`).
 
 ## Examples
 
@@ -77,23 +117,27 @@ start_link(Name, Opts) when is_atom(Name), is_map(Opts) ->
 -doc false.
 init([Name, Opts]) ->
   #{
-    size              := Size,
-    backlog           := Backlog,
-    fifo              := Fifo,
-    fixed_timeout_us  := FixedTimeoutUs,
-    sweep_interval_ms := SweepIntervalMs,
-    ttl_shards        := TtlShards,
-    protocol          := Protocol,
-    client            := Client,
-    client_opts       := ClientOpts
+    size                    := Size,
+    backlog                 := Backlog,
+    fifo                    := Fifo,
+    fixed_timeout_us        := FixedTimeoutUs,
+    sweep_interval_ms       := SweepIntervalMs,
+    ttl_shards              := TtlShards,
+    bounce_interval_ms      := BounceIntervalMs,
+    bounce_drain_timeout_ms := BounceDrainTimeoutMs,
+    protocol                := Protocol,
+    client                  := Client,
+    client_opts             := ClientOpts
   } = maps:merge(#{
-    size              => 1,
-    backlog           => 1,
-    fifo              => true,
-    fixed_timeout_us  => 0,
-    sweep_interval_ms => 1000,
-    ttl_shards        => nproc,
-    client_opts       => #{}
+    size                    => 1,
+    backlog                 => 1,
+    fifo                    => true,
+    fixed_timeout_us        => 0,
+    sweep_interval_ms       => 1000,
+    ttl_shards              => nproc,
+    bounce_interval_ms      => undefined,
+    bounce_drain_timeout_ms => 30000,
+    client_opts             => #{}
   }, Opts),
 
   ok = arterial_nif:create(Name, Size, Backlog, Fifo, Protocol, FixedTimeoutUs, 0, TtlShards),
@@ -119,10 +163,26 @@ init([Name, Opts]) ->
     modules  => [arterial_sweeper]
   },
 
-  {ok, {{one_for_one, 5, 10}, ConnChildren ++ [SweeperChild]}}.
+  BouncerChildren = case BounceIntervalMs of
+    undefined ->
+      [];
+    _ ->
+      [#{
+        id       => arterial_bouncer,
+        start    => {arterial_bouncer, start_link, [Name, Size, BounceIntervalMs, BounceDrainTimeoutMs]},
+        restart  => permanent,
+        shutdown => 1000,
+        type     => worker,
+        modules  => [arterial_bouncer]
+      }]
+  end,
 
-%%%-----------------------------------------------------------------------------
-%%% Internal functions
-%%%-----------------------------------------------------------------------------
+  {ok, {{one_for_one, 5, 10}, ConnChildren ++ [SweeperChild] ++ BouncerChildren}}.
 
+-doc """
+The registered name of `Name`'s supervisor, as started by `start_link/2`.
+Used by `arterial_bouncer` to look up a pool's `arterial_connection`
+worker pids via `supervisor:which_children/1`.
+""".
+-spec sup_name(name()) -> atom().
 sup_name(Name) -> list_to_atom("arterial_pool_" ++ atom_to_list(Name)).
