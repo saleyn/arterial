@@ -402,13 +402,15 @@ drives the same workload against `arterial` itself).
 ```
 make bench           BENCH_OPTS='pool_size=8, duration_s=5'   # arterial
 make bench-shackle   BENCH_OPTS='pool_size=8, duration_s=5'   # shackle
+make bench-poolboy   BENCH_OPTS='pool_size=8, duration_s=5'   # poolboy
 ```
 
-Both accept a comma-separated `key=value` list (or a literal `#{...}` map
-for non-trivial values like binaries) via `BENCH_OPTS`; run
-`make bench-help` / `make bench-shackle-help` to print each module's full
-option/example documentation (`arterial_bench:help/0` /
-`shackle_bench:help/0`). An unrecognized option key raises
+All three accept a comma-separated `key=value` list (or a literal `#{...}`
+map for non-trivial values like binaries) via `BENCH_OPTS`; run
+`make bench-help` / `make bench-shackle-help` / `make bench-poolboy-help`
+to print each module's full option/example documentation
+(`arterial_bench:help/0` / `shackle_bench:help/0` /
+`poolboy_bench:help/0`). An unrecognized option key raises
 `{unrecognized_bench_opts, Keys}` rather than being silently ignored.
 
 For a fair head-to-head, both benchmarks default to architecturally
@@ -449,6 +451,24 @@ shackle is a mature, heavily-optimized production library, while
 `arterial_async_driver`/`arterial_bench` are minimal test-only drivers
 built directly on arterial's public NIF API, not part of arterial's
 shipped functionality.
+
+`test/poolboy_bench.erl` compares against
+[poolboy](https://github.com/devinus/poolboy) instead, a generic worker
+pool with no protocol/wire awareness of its own (unlike shackle) and no
+NIF-backed connection management (unlike arterial) — `poolboy:checkout/3`
+just hands back a `pid()`, and `test/poolboy_echo_worker.erl` (a plain
+`gen_server` wrapping one persistent `gen_tcp` socket, reusing
+`test_echo_protocol`'s framing) is the only thing that knows how to talk
+to `test_tcp_server`. That structural shape — the caller's own process
+blocks on a `gen_server:call/3` into the worker, which itself blocks on
+`gen_tcp:send/2` + `gen_tcp:recv/2` — is the architecture comparable to
+`arterial_bench`'s `mode => sync` (no async dispatcher process in the
+loop on either side), not its default `mode => async`; pass
+`BENCH_OPTS='mode=sync'` to `make bench` for the matching arterial run.
+`poolboy_bench` defaults `max_overflow => 0` and `pool_strategy => fifo`
+(closest match to arterial's default fifo pool order) and `workers` to
+`pool_size` so every connection stays saturated, same default rationale
+as the other two benchmarks.
 
 ## Documentation
 

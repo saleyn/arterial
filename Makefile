@@ -52,7 +52,7 @@ test:
 # loopback TCP -- not part of `test`/eunit (no _test exports), so it
 # needs its own target. Pass options either as a plain comma-separated
 # `key=value` list:
-#   make bench BENCH_OPTS='pool_size=16, duration_s=10'
+#   make bench BENCH_OPTS='pool_size=16 duration_s=10'
 #   make bench BENCH_OPTS='mode=sync'
 # or, if you need a non-trivial value (e.g. a binary), as a full Erlang
 # map literal -- detected by a leading '#{' and passed through as-is:
@@ -65,11 +65,16 @@ BENCH_OPTS_MAP := $(HASH){}
 else ifneq ($(findstring $(HASH){,$(BENCH_OPTS)),)
 BENCH_OPTS_MAP := $(BENCH_OPTS)
 else
-BENCH_OPTS_MAP := $(HASH){$(shell echo '$(BENCH_OPTS)' | sed -E 's/([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*=[[:space:]]*([^,]+)/\1 => \2/g')}
+BENCH_OPTS_MAP := $(HASH){$(shell echo '$(BENCH_OPTS)' | \
+  sed -E 's/([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*=[[:space:]]*([0-9]+)/\1 => \2/g')}
 endif
-bench bench-help:
+
+bench: bench-arterial
+bench-help: bench-arterial-help
+
+bench-arterial bench-arterial-help:
 	@$(REBAR) as test compile
-	@erl -noshell -noinput -pa _build/test/lib/arterial/ebin \
+	erl -noshell -noinput -pa _build/test/lib/arterial/ebin \
 	  -pa _build/test/lib/arterial/test \
 	  -eval "arterial_bench:$(subst -,_,$@)($(BENCH_OPTS_MAP)), halt()."
 
@@ -84,6 +89,18 @@ bench-shackle bench-shackle-help:
 	@erl -noshell -noinput -pa _build/test/lib/*/ebin \
 	  -pa _build/test/lib/arterial/test \
 	  -eval "shackle_bench:$(subst -,_,$(subst bench-shackle,bench,$@))($(BENCH_OPTS_MAP)), halt()."
+
+# Runs test/poolboy_bench.erl -- the same workload shape/wire framing as
+# `bench` above, but driven through https://github.com/devinus/poolboy
+# instead of arterial, for a direct throughput/latency comparison. The
+# `poolboy` dependency is only pulled in under the `test` profile (see
+# rebar.config), so this needs every dep app's ebin on the code path,
+# not just arterial's.
+bench-poolboy bench-poolboy-help:
+	@$(REBAR) as test compile
+	@erl -noshell -noinput -pa _build/test/lib/*/ebin \
+	  -pa _build/test/lib/arterial/test \
+	  -eval "poolboy_bench:$(subst -,_,$(subst bench-poolboy,bench,$@))($(BENCH_OPTS_MAP)), halt()."
 
 clean:
 	$(MAKE) -C c_src $@
