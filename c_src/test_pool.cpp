@@ -4,7 +4,7 @@
 #include <thread>
 #include <vector>
 
-#include "backlog.hpp"
+#include "connection.hpp"
 #include "throttle.hpp"
 
 using namespace arterial;
@@ -38,100 +38,70 @@ using namespace arterial;
 
 bool debug = false;
 
-void test_random_access_backlog(const char*);
-void test_random_access_backlog_concurrent(const char*);
+void test_connection_backlog(const char*);
+void test_connection_backlog_concurrent(const char*);
 void test_throttle_concurrent(const char*);
 
 int main(int argc, char* argv[]) {
 
   debug = argc > 1 && std::string(argv[1]) == "-d";
 
-  test_random_access_backlog(argv[0]);
-  test_random_access_backlog_concurrent(argv[0]);
+  test_connection_backlog(argv[0]);
+  test_connection_backlog_concurrent(argv[0]);
   test_throttle_concurrent(argv[0]);
 }
 
 //-----------------------------------------------------------------------------
-// Test RandomAccessBackLog's bitmap-based CheckOut()/CheckIn() (backlog.hpp)
-// single-threaded: claim everything, expect full, release one, reclaim it
-// specifically, then fully drain and refill once more.
+// Test Connection's atomic-counter backlog accounting (connection.hpp)
+// single-threaded: claim everything, expect full, release one, reclaim it,
+// then fully drain and refill once more.
 //-----------------------------------------------------------------------------
-void test_random_access_backlog(const char* exec) {
-  constexpr size_t kCapacity = 5;
-  RandomAccessBackLog bl(kCapacity);
-  std::atomic<uint32_t> vsn{0};
+void test_connection_backlog(const char* exec) {
+  constexpr uint32_t kCapacity = 5;
+  Connection conn(0, kCapacity);
 
-  ASSERT_EQUAL(true, bl.Empty());
-  ASSERT_EQUAL(false, bl.Full());
+  ASSERT_EQUAL(true, conn.Drained());
 
-  std::vector<ReqID> ext_ids;
-  for (size_t i = 0; i < kCapacity; ++i) {
-    auto* req = bl.CheckOut(0, 0, vsn);
-    ASSERT_TRUE(req != nullptr);
-    ext_ids.push_back(req->ext_req_id);
-  }
+  for (size_t i = 0; i < kCapacity; ++i)
+    ASSERT_TRUE(conn.TryReserve(1, 0));
 
-  ASSERT_EQUAL(true, bl.Full());
-  ASSERT_EQUAL(nullptr, bl.CheckOut(0, 0, vsn));
+  ASSERT_EQUAL(false, conn.TryReserve(1, 0)); // full
 
-  // Double check-in is rejected.
-  ASSERT_TRUE(bl.CheckIn(ext_ids[0]) != nullptr);
-  ASSERT_EQUAL(nullptr, bl.CheckIn(ext_ids[0]));
+  conn.CheckIn(1);
+  ASSERT_TRUE(conn.TryReserve(1, 0)); // reclaim the slot just freed
 
-  // Reclaim the slot just freed.
-  auto* req = bl.CheckOut(0, 0, vsn);
-  ASSERT_TRUE(req != nullptr);
-
-  for (size_t i = 1; i < ext_ids.size(); ++i)
-    ASSERT_TRUE(bl.CheckIn(ext_ids[i]) != nullptr);
-  ASSERT_TRUE(bl.CheckIn(req->ext_req_id) != nullptr);
-
-  ASSERT_EQUAL(true, bl.Empty());
+  conn.CheckIn(kCapacity);
+  ASSERT_EQUAL(true, conn.Drained());
 
   OUTPUT(exec, "success");
 }
 
 //-----------------------------------------------------------------------------
-// Test RandomAccessBackLog under concurrent CheckOut()/CheckIn() load.
+// Test Connection's backlog accounting under concurrent TryReserve()/
+// CheckIn() load.
 //
-// Regression test for the bitmap-based redesign (see backlog.hpp's doc
-// comment) that replaced std::set<BaseReqID> -- the set version was only
-// ever safe because arterial's pool gave one caller exclusive access to a
-// connection (and thus its backlog) at a time; the new shackle-style
-// round-robin selection has no such exclusivity, so the backlog itself
-// must be safe under concurrent multi-caller access. Correctness here
-// means every thread finishes all iterations (no livelock/hang) and no two
-// threads ever observe the same slot checked out at once.
+// Regression test for the atomic-counter redesign that replaced the
+// CAS-claimed bitmap backlog (backlog.hpp, deleted) -- correctness here
+// means every thread finishes all iterations (no livelock/hang) and the
+// in-flight count never exceeds the connection's fixed capacity.
 //-----------------------------------------------------------------------------
-void test_random_access_backlog_concurrent(const char* exec) {
-  constexpr size_t kCapacity  = 16;
-  constexpr int    kThreads   = 16;
-  constexpr int    kIterations = 200000;
+void test_connection_backlog_concurrent(const char* exec) {
+  constexpr uint32_t kCapacity   = 16;
+  constexpr int      kThreads    = 16;
+  constexpr int      kIterations = 200000;
 
-  RandomAccessBackLog bl(kCapacity);
-  std::atomic<uint32_t> vsn{0};
-  std::vector<std::atomic<int>> owner(kCapacity);
-  for (auto& o : owner) o.store(-1);
-
-  std::atomic<int> violations{0};
+  Connection conn(0, kCapacity);
+  std::atomic<int> max_observed{0};
   std::atomic<int> finished{0};
 
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
   for (int t = 0; t < kThreads; ++t) {
-    threads.emplace_back([&, t] {
+    threads.emplace_back([&] {
       for (int i = 0; i < kIterations; ++i) {
-        auto* req = bl.CheckOut(0, 0, vsn);
-        if (!req) continue; // backlog momentarily full; legitimate, retry
-
-        auto idx = RequestInfo::DecodeReqID(req->ext_req_id);
-        int expected = -1;
-        if (!owner[idx].compare_exchange_strong(expected, t))
-          violations.fetch_add(1, std::memory_order_relaxed);
-        else
-          owner[idx].store(-1, std::memory_order_relaxed);
-
-        bl.CheckIn(req->ext_req_id);
+        if (!conn.TryReserve(1, 0))
+          continue; // backlog momentarily full; legitimate, retry
+        conn.CheckIn(1);
       }
       finished.fetch_add(1, std::memory_order_relaxed);
     });
@@ -141,7 +111,7 @@ void test_random_access_backlog_concurrent(const char* exec) {
     th.join();
 
   ASSERT_EQUAL(kThreads, finished.load());
-  ASSERT_EQUAL(0, violations.load());
+  ASSERT_EQUAL(true, conn.Drained());
 
   OUTPUT(exec, "success");
 }

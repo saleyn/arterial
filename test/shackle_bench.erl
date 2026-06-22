@@ -9,25 +9,22 @@ and the same workload shape as `arterial_bench` -- so the two numbers
 are directly comparable head-to-head rather than measuring different
 fixtures.
 
-Two `mode`s, mirroring `arterial_bench:opts/0`'s `mode`, both defaulting
-to `backlog_size => 1` (see `t:opts/0`'s doc -- a real, settable option
-here, not forced) so neither side multiplexes multiple in-flight
-requests onto one connection by default -- shackle's wire protocol and
-`shackle_server` *can* do that safely (each request tagged with its own
-`external_request_id`, demuxed off one persistent socket), but arterial's
-can't (see `arterial_async_driver`'s moduledoc), so it's kept at 1 by
-default for a fair head-to-head; raise `backlog_size` explicitly to
-measure shackle's multiplexing on its own terms instead:
+Two `mode`s, both defaulting to `backlog_size => 1` (see `t:opts/0`'s doc
+-- a real, settable option here, not forced) so neither side multiplexes
+multiple in-flight requests onto one connection by default; raise
+`backlog_size` explicitly to measure shackle's multiplexing on its own
+terms (arterial's own `backlog` option, on the `arterial_bench` side, is
+directly comparable now too -- each connection's `arterial_conn_owner`
+process serializes/demuxes its own socket I/O, the same role
+`shackle_server` plays here, so both sides can now safely multiplex):
 
 - `sync` (default): each worker blocks directly on `shackle:call/3`
   (itself just `cast/3` + `receive_response/1`) -- shackle always hands
-  the request to a `shackle_server` process internally, even here, so
-  this is the mode comparable to `arterial_bench`'s `async` mode (its
-  own default), **not** `arterial_bench`'s `sync` mode: arterial's
-  `call/3` has no dispatcher process in the loop at all, so pairing it
-  against either of shackle's modes would compare two different
-  architectures, not just two pool implementations. See
-  `arterial_bench`'s moduledoc for the other side of this.
+  the request to a `shackle_server` process internally, even here. This
+  is the mode directly comparable to `arterial_client:call/3`: both
+  block the calling process on a message round-trip to a separate
+  per-connection process (`shackle_server` here, `arterial_conn_owner`
+  on arterial's side) that owns the actual socket I/O.
 - `async`: each worker calls `shackle:cast/4` then its own
   `receive_response/2` -- structurally the same dispatch shape as `sync`
   above (the request is hand-delivered to a `shackle_server` process
@@ -252,13 +249,13 @@ setup(PoolSize, PoolStrategy, MaxRetries, BacklogSize) ->
     {pool_strategy, PoolStrategy},
     {max_retries, MaxRetries},
     %% Defaults to exactly one in-flight request per connection, same as
-    %% arterial_bench's own backlog default -- shackle's wire protocol
-    %% and shackle_server can safely multiplex many in-flight requests
-    %% per connection (each tagged with its own external_request_id),
-    %% but arterial's can't (see arterial_async_driver's moduledoc), so
-    %% this stays at 1 for a fair head-to-head comparison by default;
-    %% raise it explicitly via the backlog_size opt to measure shackle's
-    %% pipelining advantage on its own terms instead.
+    %% arterial_bench's own backlog default -- both sides can now safely
+    %% multiplex many in-flight requests per connection (shackle via its
+    %% own wire-level external_request_id tagging; arterial via its
+    %% per-connection arterial_conn_owner process), so this stays at 1
+    %% purely for a fair head-to-head comparison by default; raise it
+    %% explicitly via the backlog_size opt to measure shackle's
+    %% pipelining on its own terms instead.
     {backlog_size, BacklogSize}
   ]),
   wait_until_available(PoolSize, 200),

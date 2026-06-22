@@ -71,12 +71,12 @@ stop(_State) ->
 init([]) ->
   %% Start observability module if configured
   {ObsImplMod, ObsOpts} =
-    case application:get_env(arterial, observability) of
+    case application:get_env(arterial, observability, nil) of
       prometheus            -> {arterial_observe_prometheus,  #{}};
       telemetry             -> {arterial_observe_telemetry,   #{}};
       {prometheus, Opts}    -> {arterial_observe_prometheus, Opts};
       {telemetry,  Opts}    -> {arterial_observe_telemetry,  Opts};
-      undefined             -> {nil, []};
+      nil                   -> {nil, []};
       Mod when is_atom(Mod) -> {Mod, []};
       {Mod, Opts} when is_atom(Mod) -> {Mod, Opts}
     end,

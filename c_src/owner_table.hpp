@@ -24,7 +24,6 @@
 //-----------------------------------------------------------------------------
 #pragma once
 
-#include "backlog.hpp"
 #include "arterial_util.hpp"
 #include <erl_nif.h>
 #include <atomic>
@@ -38,15 +37,18 @@
 namespace arterial {
 
 //-----------------------------------------------------------------------------
-/// @brief Everything a single owning process currently holds: reserved
-/// backlog slots, grouped by the connection they were reserved on, plus the
+/// @brief Everything a single owning process currently holds: a count of
+/// reserved backlog slots per connection (individual request identity is
+/// tracked entirely on the Erlang side, by the connection's
+/// `arterial_conn_owner` process -- this table only needs "how many slots
+/// does this pid hold on this connection" for crash cleanup), plus the
 /// monitor watching that process (so it can be demonitored once its last
 /// reservation is released).
 //-----------------------------------------------------------------------------
 struct OwnerEntry {
-  ErlNifMonitor                          mon{};
-  bool                                    monitored = false; // mon is armed
-  std::map<uint32_t, std::vector<ReqID>> by_conn; // conn_id -> req_ids
+  ErlNifMonitor             mon{};
+  bool                      monitored = false; // mon is armed
+  std::map<uint32_t, uint32_t> by_conn; // conn_id -> reserved slot count
 };
 
 //-----------------------------------------------------------------------------

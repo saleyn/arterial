@@ -1,9 +1,13 @@
 -module(arterial_pool).
 
 -moduledoc """
-Per-pool supervisor: creates the pool's NIF resource and supervises one
-`arterial_connection` worker per connection slot, an `arterial_sweeper`,
-and (only if `bounce_interval_ms` is configured) an `arterial_bouncer`.
+Per-pool supervisor: creates the pool's NIF resource and supervises an
+`arterial_pool_guard` (reacts to a connection worker crashing by forcing
+it unavailable in the NIF immediately, see that module's moduledoc),
+then, per connection slot, an `arterial_conn_owner` (the only process
+that ever touches that connection's raw socket) followed by its matching
+`arterial_connection` worker (connect/reconnect/backoff lifecycle), plus
+(only if `bounce_interval_ms` is configured) an `arterial_bouncer`.
 
 Typically started as a child of the `arterial_app` top-level supervisor
 (via `arterial_app:start/0` + a `simple_one_for_one` child spec), but can
@@ -26,15 +30,12 @@ the defaults shown in the example below.
 
 * `size` - number of connections in the pool (default: `1`).
 * `backlog` - max in-flight requests per connection (default: `1`).
-* `fifo` - backlog/reply ordering per connection; `true` assumes replies
-  arrive in the same order requests were sent, `false` allows out-of-order
-  replies matched by request id (default: `true`).
-* `fixed_timeout_us` - shared TTL (microseconds) for every in-flight
-  request; `0` means each request uses its own TTL instead (default: `0`).
-* `sweep_interval_ms` - how often `arterial_sweeper` evicts expired
-  in-flight requests (default: `1000`).
-* `ttl_shards` - shard count for the in-flight/waiter registries; see
-  `arterial_nif:create/8` (default: `nproc`, value can be an integer,
+* `fifo` - reply demux mode used by each connection's `arterial_conn_owner`;
+  `true` assumes replies arrive in the same order requests were sent (no
+  wire-level request id needed), `false` matches replies to requests by
+  id instead (default: `true`).
+* `ttl_shards` - shard count for the queue-when-busy waiter registry; see
+  `arterial_nif:create/5` (default: `nproc`, value can be an integer,
   a tuple `{nproc, Times::integer()}`, or `nproc`, where `nproc` is the
   number of cores).
 * `bounce_interval_ms` - if set, starts an `arterial_bouncer` that
@@ -62,11 +63,11 @@ the defaults shown in the example below.
 ## Examples
 
 ```
-1> Opts = #{size => 4, backlog => 16, fifo => true, fixed_timeout_us => 0,
-2>          sweep_interval_ms => 1000, protocol => my_protocol,
+1> Opts = #{size => 4, backlog => 16, fifo => true,
+2>          protocol => my_protocol,
 3>          client => my_client, client_opts => #{address => "localhost", port => 9000}}.
-#{size => 4,backlog => 16,fifo => true,fixed_timeout_us => 0,
-  sweep_interval_ms => 1000,protocol => my_protocol,client => my_client,
+#{size => 4,backlog => 16,fifo => true,
+  protocol => my_protocol,client => my_client,
   client_opts => #{address => "localhost",port => 9000}}
 ```
 """.
@@ -74,8 +75,6 @@ the defaults shown in the example below.
   size                   => pos_integer(),
   backlog                => pos_integer(),
   fifo                   => boolean(),
-  fixed_timeout_us       => non_neg_integer(),
-  sweep_interval_ms      => pos_integer(),
   ttl_shards             => non_neg_integer() | nproc | {nproc, pos_integer()},
   bounce_interval_ms     => undefined | pos_integer(),
   bounce_drain_timeout_ms => pos_integer(),
@@ -92,11 +91,12 @@ the defaults shown in the example below.
 
 -doc """
 Start the supervisor for pool `Name`: creates the pool's NIF resource,
-then starts one `arterial_connection` worker per connection slot plus an
-`arterial_sweeper` that periodically evicts timed-out in-flight async
-requests (see `arterial_nif:track_inflight/5`), and, if
-`bounce_interval_ms` is set, an `arterial_bouncer` that periodically
-recycles connections one at a time (see `arterial_bouncer`).
+then starts, per connection slot, an `arterial_conn_owner` (the only
+process that ever touches that connection's raw socket -- see its
+moduledoc) followed by its matching `arterial_connection` worker
+(connect/reconnect/backoff lifecycle), and, if `bounce_interval_ms` is
+set, an `arterial_bouncer` that periodically recycles connections one at
+a time (see `arterial_bouncer`).
 
 ## Examples
 
@@ -121,8 +121,6 @@ init([Name, Opts]) ->
     size                    := Size,
     backlog                 := Backlog,
     fifo                    := Fifo,
-    fixed_timeout_us        := FixedTimeoutUs,
-    sweep_interval_ms       := SweepIntervalMs,
     ttl_shards              := TtlShards,
     bounce_interval_ms      := BounceIntervalMs,
     bounce_drain_timeout_ms := BounceDrainTimeoutMs,
@@ -133,36 +131,54 @@ init([Name, Opts]) ->
     size                    => 1,
     backlog                 => 1,
     fifo                    => true,
-    fixed_timeout_us        => 0,
-    sweep_interval_ms       => 1000,
     ttl_shards              => nproc,
     bounce_interval_ms      => undefined,
     bounce_drain_timeout_ms => 30000,
     client_opts             => #{}
   }, Opts),
 
-  ok = arterial_nif:create(Name, Size, Backlog, Fifo, Protocol, FixedTimeoutUs, 0, TtlShards),
+  ok = arterial_nif:create(Name, Size, Backlog, 0, TtlShards),
 
-  ConnChildren = [
-    #{
-      id       => {arterial_connection, ConnID},
-      start    => {arterial_connection, start_link, [Name, ConnID, Client, ClientOpts]},
-      restart  => permanent,
-      shutdown => 5000,
-      type     => worker,
-      modules  => [arterial_connection]
-    }
-    || ConnID <- lists:seq(0, Size - 1)
-  ],
-
-  SweeperChild = #{
-    id       => arterial_sweeper,
-    start    => {arterial_sweeper, start_link, [Name, SweepIntervalMs]},
+  %% Started before every connection slot's children, so it's already
+  %% monitoring (or, for the very first batch, about to start polling
+  %% for) each one before any of them can possibly crash -- see
+  %% arterial_pool_guard's moduledoc for why this needs to exist at all.
+  GuardChild = #{
+    id       => arterial_pool_guard,
+    start    => {arterial_pool_guard, start_link, [Name, Size]},
     restart  => permanent,
     shutdown => 1000,
     type     => worker,
-    modules  => [arterial_sweeper]
+    modules  => [arterial_pool_guard]
   },
+
+  %% Each connection slot's owner must already be registered before its
+  %% arterial_connection worker starts (the worker publishes its socket
+  %% to the owner as soon as it connects, see arterial_connection:
+  %% client_init/1) -- interleave owner/connection pairs rather than
+  %% starting every owner first, so a supervisor restart of one
+  %% connection's pair never depends on every other slot's owner already
+  %% being up.
+  ConnChildren = lists:flatmap(fun(ConnID) ->
+    [
+      #{
+        id       => {arterial_conn_owner, ConnID},
+        start    => {arterial_conn_owner, start_link, [Name, ConnID, Protocol, Fifo]},
+        restart  => permanent,
+        shutdown => 1000,
+        type     => worker,
+        modules  => [arterial_conn_owner]
+      },
+      #{
+        id       => {arterial_connection, ConnID},
+        start    => {arterial_connection, start_link, [Name, ConnID, Client, ClientOpts]},
+        restart  => permanent,
+        shutdown => 5000,
+        type     => worker,
+        modules  => [arterial_connection]
+      }
+    ]
+  end, lists:seq(0, Size - 1)),
 
   BouncerChildren = case BounceIntervalMs of
     undefined ->
@@ -178,7 +194,7 @@ init([Name, Opts]) ->
       }]
   end,
 
-  {ok, {{one_for_one, 5, 10}, ConnChildren ++ [SweeperChild] ++ BouncerChildren}}.
+  {ok, {{one_for_one, 5, 10}, [GuardChild] ++ ConnChildren ++ BouncerChildren}}.
 
 -doc """
 The registered name of `Name`'s supervisor, as started by `start_link/2`.

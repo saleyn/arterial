@@ -54,7 +54,7 @@ state.
 -doc """
 Optional: produce a synthetic response for a request that timed out
 (asynchronous path) instead of letting the caller only see
-`{arterial_timeout, Pool, RequestID}` (see `arterial_nif:track_inflight/5`).
+`{error, timeout}` from the connection's `arterial_conn_owner`.
 """.
 -callback handle_timeout(RequestID::arterial:request_id(), State::any()) ->
   {ok, arterial:response(), State::any()} | {error,  Reason::term(), State::term()}.
@@ -142,12 +142,13 @@ See `m:arterial_socket`'s moduledoc for why `ssl` needs OTP 28+.
 Send `Request` on a connection checked out from `Pool` and block for its
 reply (or `Timeout` milliseconds, whichever comes first).
 
-The calling process owns the socket directly for the duration of the call:
-it checks out a connection, encodes/sends/receives on the raw socket via
-the pool's `arterial_protocol` module, then checks the connection back in.
-`arterial_connection` (the pool's `gen_server` worker for this connection)
-is not involved in the call itself -- it only owns reconnect/health
-monitoring between calls.
+The connection's `arterial_conn_owner` process -- not the calling process
+-- owns the socket and does the actual `encode_request`/`send`/`recv`/
+`decode_reply` round trip; this call just checks out reservation capacity,
+hands the request to the owner via `arterial_conn_owner:send_recv/4`, and
+checks the capacity back in once the owner replies. This is what makes
+`backlog > 1` (multiple concurrent callers multiplexed onto one
+connection) safe: only the owner ever touches the raw socket.
 
 ## Examples
 
@@ -170,34 +171,26 @@ call(Pool, Request, Timeout) ->
 
 do_call(Pool, Request, Timeout) ->
   case checkout(Pool, sync) of
-    {ok, #{
-      conn_id  := ConnID,
-      protocol := Proto,
-      socket   := Socket,
-      buffer   := Buffer,
-      req_ids  := [ReqID | _] = ReqIDs
-    }} ->
+    {ok, ConnID} ->
       try
-        TS = os:system_time(microsecond),
-        maybe
-          {ok, Data}         ?= Proto:encode_request(ReqID, Request, Timeout),
-          ok                 ?= Proto:send(Socket, Data),
-          Expire              = arterial_util:calc_expiration(TS, Timeout),
-          {ok, Result, Rest} ?= receive_response(Socket, Proto, ReqID, Buffer, Expire),
-          ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, Rest),
-          {ok, Result}
-        else
-          {error, _} = Error ->
-            ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, <<>>),
-            Error
-        end
-      catch E:R:ST ->
-        arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, <<>>),
-        erlang:raise(E, R, ST)
+        arterial_conn_owner:send_recv(Pool, ConnID, Request, Timeout)
+      catch
+        exit:Reason -> owner_call_exit_error(Reason)
+      after
+        ok = arterial_nif:checkin_connection(Pool, ConnID)
       end;
     {error, _} = Error ->
       Error
   end.
+
+%% The owner died mid-call (gen_server:call/3 raises rather than
+%% returning when its target is gone) -- surface this exactly like any
+%% other disconnect, instead of crashing this caller along with it.
+%% arterial_pool's supervisor restarts the owner; the checkin in
+%% do_call/3's/do_cast/2's `after` still runs regardless, so the dead
+%% reservation is never stranded.
+owner_call_exit_error({Reason, {gen_server, call, _}}) -> {error, Reason};
+owner_call_exit_error(Reason)                          -> {error, Reason}.
 
 %% Wraps arterial_nif:checkout_connection/2 with a [arterial, checkout, ...]
 %% span -- shared by call/3 (Mode = sync) and cast/2 (Mode = async).
@@ -212,12 +205,9 @@ checkout(Pool, Mode) ->
 Send `Request` on a connection checked out from `Pool` without waiting
 for (or expecting) any reply -- mode (e) of the backlog/protocol design:
 send-and-forget protocols (e.g. fire-and-forget logging/metrics) where
-every message is inherently one-way. The backlog slot is reserved and
+every message is inherently one-way. The reservation is claimed and
 released back-to-back within this one call, never actually left
-in-flight: there's nothing to check in later, so unlike `call/3` there's
-no `req_ids` for a caller to hold onto, and `checkout_connection/2,3`'s
-`backlog`/multiplexing settings don't matter here -- `cast/2` never holds
-a slot long enough to contend with itself.
+in-flight.
 
 Returns as soon as the bytes are handed to the transport's `send/2`
 (e.g. accepted into the OS socket buffer), not when (or whether) the
@@ -247,57 +237,13 @@ cast(Pool, Request) ->
 
 do_cast(Pool, Request) ->
   case checkout(Pool, async) of
-    {ok, #{
-      conn_id  := ConnID,
-      protocol := Proto,
-      socket   := Socket,
-      buffer   := Buffer,
-      req_ids  := [ReqID | _] = ReqIDs
-    }} ->
+    {ok, ConnID} ->
       try
-        case Proto:encode_request(ReqID, Request, infinity) of
-          {ok, Data} ->
-            Result = Proto:send(Socket, Data),
-            %% Preserve Buffer as-is on checkin: cast/2 never reads from
-            %% the socket, so any bytes already buffered from a prior
-            %% call/3 on this connection (e.g. a reply's trailing bytes
-            %% belonging to the next response) must not be discarded here.
-            ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, Buffer),
-            case Result of
-              ok -> ok;
-              {error, _} = Error -> Error
-            end;
-          {error, _} = Error ->
-            ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, Buffer),
-            Error
-        end
-      catch E:R:ST ->
-        arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, Buffer),
-        erlang:raise(E, R, ST)
-      end;
-    {error, _} = Error ->
-      Error
-  end.
-
-%%%-----------------------------------------------------------------------------
-%%% Internal functions
-%%%-----------------------------------------------------------------------------
-
--spec receive_response(arterial:socket(), arterial:protocol(),
-                        arterial:request_id(), binary(),
-                        non_neg_integer() | infinity) ->
-  {ok, arterial:response(), binary()} | {error, term()}.
-receive_response(Socket, Proto, ReqID, Buffer, Expire) ->
-  case Proto:decode_reply(ReqID, Buffer) of
-    {ok, Result, Rest} ->
-      {ok, Result, Rest};
-    {more, Buffer1} ->
-      Timeout = arterial_util:calc_timeout(Expire),
-      case Proto:recv(Socket, Timeout) of
-        {ok, Chunk} ->
-          receive_response(Socket, Proto, ReqID, <<Buffer1/binary, Chunk/binary>>, Expire);
-        {error, _} = Error ->
-          Error
+        arterial_conn_owner:send(Pool, ConnID, Request)
+      catch
+        exit:Reason -> owner_call_exit_error(Reason)
+      after
+        ok = arterial_nif:checkin_connection(Pool, ConnID)
       end;
     {error, _} = Error ->
       Error

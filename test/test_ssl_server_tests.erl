@@ -52,10 +52,8 @@ teardown({Srv, SupPid}) ->
 %% retry budget callers below pass in.
 wait_until_available(Pool, N, Retries) ->
   case checkout_n(Pool, N, []) of
-    {ok, Reservations} ->
-      lists:foreach(
-        fun({ConnID, ReqIDs}) -> ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, <<>>) end,
-        Reservations);
+    {ok, ConnIDs} ->
+      lists:foreach(fun(ConnID) -> ok = arterial_nif:checkin_connection(Pool, ConnID) end, ConnIDs);
     {error, no_connection} when Retries > 0 ->
       timer:sleep(20),
       wait_until_available(Pool, N, Retries - 1);
@@ -67,12 +65,10 @@ checkout_n(_Pool, 0, Acc) ->
   {ok, Acc};
 checkout_n(Pool, N, Acc) ->
   case arterial_nif:checkout_connection(Pool, sync) of
-    {ok, #{conn_id := ConnID, req_ids := ReqIDs}} ->
-      checkout_n(Pool, N - 1, [{ConnID, ReqIDs} | Acc]);
+    {ok, ConnID} ->
+      checkout_n(Pool, N - 1, [ConnID | Acc]);
     {error, no_connection} = Error ->
-      lists:foreach(
-        fun({ConnID, ReqIDs}) -> ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, <<>>) end,
-        Acc),
+      lists:foreach(fun(ConnID) -> ok = arterial_nif:checkin_connection(Pool, ConnID) end, Acc),
       Error
   end.
 

@@ -47,8 +47,8 @@ wait_until_available(_Pool, 0, _Retries) ->
   ok;
 wait_until_available(Pool, N, Retries) ->
   case arterial_nif:checkout_connection(Pool, sync) of
-    {ok, #{conn_id := ConnID, req_ids := ReqIDs}} ->
-      ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, <<>>),
+    {ok, ConnID} ->
+      ok = arterial_nif:checkin_connection(Pool, ConnID),
       wait_until_available(Pool, N - 1, Retries);
     {error, no_connection} when Retries > 0 ->
       timer:sleep(20),
@@ -159,29 +159,21 @@ checkout_emits_nested_inside_call_test() ->
     teardown(Ctx)
   end.
 
-sweep_emits_expired_count_test() ->
+%% A per-request timeout, armed and fired by the connection's
+%% arterial_conn_owner (no more NIF-side sweep/track_inflight -- that
+%% responsibility moved there entirely), emits [arterial, timeout].
+timeout_emits_event_test() ->
   Ctx = setup(),
-  HandlerId = attach([[arterial, sweep, stop]]),
+  HandlerId = attach([[arterial, timeout]]),
   try
-    {ok, #{conn_id := ConnID, req_ids := [ReqID]}} =
-      arterial_nif:checkout_connection(?POOL, async),
-    ok = arterial_nif:track_inflight(?POOL, ConnID, ReqID, self(), 0),
-    timer:sleep(1),
+    {error, timeout} = arterial_client:call(?POOL, {delay, 300, late}, 50),
 
-    %% Drive the sweep directly (the same call arterial_sweeper makes on
-    %% its timer) rather than waiting out a real interval.
-    {ok, 1} = arterial_nif:sweep_timeouts(?POOL),
-    arterial_observe:event([sweep, stop], #{expired_count => 1}, #{pool => ?POOL}),
-
-    [{telemetry_event, [arterial, sweep, stop], Measurements, Meta}] = flush_events(),
-    ?assertEqual(1, maps:get(expired_count, Measurements)),
+    [{telemetry_event, [arterial, timeout], _Measurements, Meta}] = flush_events(),
     ?assertEqual(?POOL, maps:get(pool, Meta)),
-
-    %% Drain the {arterial_timeout,...} this sweep generated so it
-    %% doesn't leak into teardown/the next test.
-    receive {arterial_timeout, ?POOL, ReqID} -> ok after 0 -> ok end
+    ?assertEqual(0, maps:get(conn_id, Meta))
   after
     detach(HandlerId),
+    timer:sleep(350), % let the slow reply land before teardown closes the socket
     teardown(Ctx)
   end.
 

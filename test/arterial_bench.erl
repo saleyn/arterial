@@ -5,26 +5,24 @@ Throughput/latency micro-benchmark for `arterial`, driven against a real
 `test_tcp_server` over loopback TCP using the same
 `test_echo_protocol`/`test_echo_client` pair as `test_tcp_server_tests`.
 
-Two `mode`s, both with zero request multiplexing (at most one in-flight
-request per connection at a time -- see `t:opts/0`'s `mode` doc):
+Every worker calls `arterial_client:call/3` directly -- there is no
+separate "async dispatcher" mode anymore (an earlier version of this
+benchmark routed an `async` mode through `arterial_async_driver`, a
+small fixed pool of dispatcher processes, to avoid blocking N worker
+processes directly on socket I/O; `call/3` itself now has that same
+shape unconditionally, since the connection's `arterial_conn_owner`
+process -- not the caller -- owns the socket and does the actual I/O;
+see that module's moduledoc).
 
-- `async` (default): each worker process casts through a small, fixed
-  pool of `arterial_async_driver` dispatcher processes (one per
-  connection) instead of blocking on the socket itself -- see that
-  module's doc for why this is "non-blocking dispatch", not wire-level
-  pipelining (arterial's public API has no way to hold a connection
-  checked out across more than one in-flight request). This is the mode
-  comparable to `shackle_bench`: `shackle:call/3` always hands the
-  request off to a `shackle_server` process internally, even in
-  shackle's own default mode -- `arterial_client:call/3`'s `sync` mode
-  below has no such dispatcher in the loop, so benchmarking it against
-  shackle's *any* mode compares two different architectures, not just
-  two pool implementations.
-- `sync`: each worker process blocks directly on
-  `arterial_client:call/3`, owning a connection's socket for the whole
-  request/reply round trip -- no dispatcher process involved at all.
-  Useful to see the ceiling when the caller pays its own socket I/O
-  cost, but not the fair comparison point against `shackle_bench`.
+Because the owner serializes and demuxes replies itself, `backlog > 1`
+is now safe to multiplex: several concurrent callers can be checked out
+onto the same connection at once (each via its own `call/3`, each
+talking to the same owner), unlike before this redesign. Set `backlog`
+(default `1`, matching `arterial_pool`'s own default) to study
+multiplexing on its own terms -- pair it with `workers > pool_size` to
+actually exercise it (`workers =< pool_size * backlog` keeps every
+connection's backlog from ever rejecting a checkout purely from
+capacity).
 
 Not part of the regular `rebar3 eunit` run (no `_test`/`_test_` exported
 functions) -- run it via `make bench` (see the top-level Makefile's
@@ -34,7 +32,6 @@ functions) -- run it via `make bench` (see the top-level Makefile's
 $ rebar3 as test shell
 1> arterial_bench:bench().
 === arterial benchmark ===
-mode:         async
 pool size:    8
 backlog:      1
 order:        fifo
@@ -51,7 +48,7 @@ Tune the load shape via `bench/1`; see `help/0` for the full option list:
 
 ```
 1> arterial_bench:bench(#{pool_size => 16, duration_s => 10}).
-2> arterial_bench:bench(#{mode => sync}).
+2> arterial_bench:bench(#{backlog => 4, workers => 32}).
 ```
 
 From the shell, `BENCH_OPTS` takes a plain comma-separated `key=value`
@@ -68,7 +65,6 @@ $ make bench BENCH_OPTS='#{pool_size => 16, payload => <<"hi">>}'
 -export([bench/0, bench/1, help/0, bench_help/1]).
 
 -type opts() :: #{
-  mode       => sync | async,
   pool_size  => pos_integer(),
   backlog    => pos_integer(),
   workers    => pos_integer(),
@@ -98,38 +94,26 @@ help() ->
   io:format(
     "arterial_bench:bench(Opts) -- Opts is a map with any of:~n"
     "~n"
-    "  mode       => sync | async  (default: async)~n"
-    "                async: each worker casts through a small, fixed pool~n"
-    "                of arterial_async_driver dispatcher processes (one~n"
-    "                per connection) instead of blocking on the socket~n"
-    "                itself. This is the mode comparable to shackle_bench~n"
-    "                -- shackle:call/3 always dispatches to a~n"
-    "                shackle_server process internally, so arterial's~n"
-    "                sync mode (below) would compare a different~n"
-    "                architecture, not just a different pool.~n"
-    "                sync: each worker blocks directly on~n"
-    "                arterial_client:call/3, owning a connection's socket~n"
-    "                for the whole request/reply round trip -- no~n"
-    "                dispatcher process involved.~n"
-    "                Still at most one in-flight request per connection~n"
-    "                at a time either way -- arterial's public API has no~n"
-    "                way to hold a connection checked out across more~n"
-    "                than one in-flight request, so async here is~n"
-    "                non-blocking dispatch, not wire-level pipelining.~n"
     "  pool_size  => pos_integer()  (default: 8)~n"
     "                Number of pooled connections to test_tcp_server.~n"
+    "  backlog    => pos_integer()  (default: 1)~n"
+    "                Max in-flight requests per connection. Each~n"
+    "                connection's arterial_conn_owner process serializes~n"
+    "                and demuxes its own socket I/O, so backlog > 1 safely~n"
+    "                multiplexes several concurrent callers onto one~n"
+    "                connection -- raise this together with workers to~n"
+    "                study multiplexing.~n"
+    "  fifo       => boolean()  (default: true)~n"
+    "                Reply demux mode passed to arterial_pool -- true~n"
+    "                assumes replies arrive in send order (no wire-level~n"
+    "                id needed); test_echo_protocol supports both.~n"
     "  workers    => pos_integer()  (default: same as pool_size)~n"
-    "                Concurrent callers. Neither mode queues when every~n"
-    "                connection is busy, so workers > pool_size just~n"
+    "                Concurrent callers. workers > pool_size * backlog~n"
     "                oversubscribes (excess workers spin on~n"
     "                {error, no_connection} instead of measuring~n"
-    "                sustained throughput) -- only raise this above~n"
-    "                pool_size deliberately, to study that case.~n"
-    "  backlog    => pos_integer()  (default: 1, NOT independently~n"
-    "                configurable here -- both modes own a connection's~n"
-    "                socket exclusively for one request at a time, so~n"
-    "                backlog > 1 would let two concurrent callers race~n"
-    "                reading replies off the same socket).~n"
+    "                sustained throughput) -- raise this deliberately to~n"
+    "                study that case, or together with backlog to~n"
+    "                exercise multiplexing instead.~n"
     "  duration_s => pos_integer()  (default: 5)~n"
     "                How long to hammer the pool, in seconds.~n"
     "  payload    => binary()  (default: a short fixed binary)~n"
@@ -144,7 +128,7 @@ help() ->
     "Examples:~n"
     "  1> arterial_bench:bench().~n"
     "  2> arterial_bench:bench(#{pool_size => 16, duration_s => 10}).~n"
-    "  3> arterial_bench:bench(#{mode => sync}).~n"
+    "  3> arterial_bench:bench(#{backlog => 4, workers => 32}).~n"
     "  4> arterial_bench:bench(#{backoff => {backoff, 100, 5000}}).~n"
     "~n"
     "  $ make bench~n"
@@ -164,36 +148,21 @@ return `ok`. Starts and tears down its own `test_tcp_server` and
 bench(Opts) ->
   PoolSize0 = maps:get(pool_size, Opts, 8),
   Defaults = #{
-    %% async is the architecture comparable to shackle_bench -- see this
-    %% module's moduledoc/help() for why sync isn't a fair head-to-head.
-    mode       => async,
     pool_size  => PoolSize0,
-    fifo       => true,
-    %% backlog > 1 lets multiple in-flight requests pipeline on the same
-    %% connection, but neither mode here can safely share one socket
-    %% that way: sync's call/3 owns a connection's socket directly for
-    %% blocking send/recv, and async's arterial_async_driver serves one
-    %% request to completion before picking up the next (see that
-    %% module's doc -- arterial's public API has no way to hold a
-    %% connection checked out across more than one in-flight request).
-    %% Two concurrent callers checked out onto the *same* connection
-    %% (legal once backlog > 1 says it has room) would race reading
-    %% replies off that one socket. Keep backlog at 1 so each connection
-    %% serves at most one caller at a time, same as arterial_pool's own
-    %% default.
     backlog    => 1,
-    %% No queue-when-busy in either mode, so workers > pool_size just
-    %% oversubscribes -- excess workers busy-spin on {error, no_connection}
-    %% instead of measuring real throughput. Default to one worker per
-    %% connection (every connection kept saturated, none idle) unless the
-    %% caller deliberately wants to study oversubscription by passing
-    %% `workers` explicitly.
+    fifo       => true,
+    %% No queue-when-busy by default, so workers > pool_size * backlog
+    %% just oversubscribes -- excess workers busy-spin on
+    %% {error, no_connection} instead of measuring real throughput.
+    %% Default to one worker per connection (every connection kept
+    %% saturated, none idle) unless the caller deliberately wants to
+    %% study oversubscription/multiplexing by passing `workers` or
+    %% `backlog` explicitly.
     workers    => PoolSize0,
     duration_s => 5,
     payload    => <<"the quick brown fox jumps over the lazy dog">>
   },
   #{
-    mode       := Mode,
     pool_size  := PoolSize,
     backlog    := Backlog,
     workers    := Workers,
@@ -202,7 +171,7 @@ bench(Opts) ->
     fifo       := Fifo
   } = maps:merge(Defaults, Opts),
 
-  {Srv, SupPid} = setup(PoolSize, Backlog, Fifo, Mode, maps:get(backoff, Opts, undefined)),
+  {Srv, SupPid} = setup(PoolSize, Backlog, Fifo, maps:get(backoff, Opts, undefined)),
   try
     DurationMs = DurationS * 1000,
     Parent = self(),
@@ -210,23 +179,23 @@ bench(Opts) ->
     Deadline = StartAt + DurationMs,
 
     WorkerPids = [
-      spawn_link(fun() -> worker_loop(Mode, Parent, Deadline, Payload, []) end)
+      spawn_link(fun() -> worker_loop(Parent, Deadline, Payload, []) end)
       || _ <- lists:seq(1, Workers)
     ],
 
     {AllLatenciesUs, Rejected} = collect(WorkerPids, [], 0),
     ElapsedMs = erlang:monotonic_time(millisecond) - StartAt,
 
-    report(Mode, PoolSize, Backlog, Workers, DurationMs, ElapsedMs, AllLatenciesUs, Rejected, Fifo)
+    report(PoolSize, Backlog, Workers, DurationMs, ElapsedMs, AllLatenciesUs, Rejected, Fifo)
   after
-    teardown({Srv, SupPid}, Mode)
+    teardown({Srv, SupPid})
   end.
 
 %%%-----------------------------------------------------------------------------
 %%% Internal functions
 %%%-----------------------------------------------------------------------------
 
-setup(PoolSize, Backlog, Fifo, Mode, Backoff) ->
+setup(PoolSize, Backlog, Fifo, Backoff) ->
   {ok, Srv} = test_tcp_server:start(0),
   Port = test_tcp_server:port(Srv),
   ClientOpts0 = #{address => "127.0.0.1", port => Port, protocol => tcp},
@@ -244,30 +213,25 @@ setup(PoolSize, Backlog, Fifo, Mode, Backoff) ->
   }),
   try
     wait_until_available(PoolSize, 200),
-    Mode =:= async andalso arterial_async_driver:start_link(?POOL, PoolSize, test_echo_client),
     {Srv, SupPid}
   catch
     Class:Reason:Stack ->
-      teardown({Srv, SupPid}, Mode),
+      teardown({Srv, SupPid}),
       erlang:raise(Class, Reason, Stack)
   end.
 
-teardown({Srv, SupPid}, Mode) ->
-  Mode =:= async andalso arterial_async_driver:stop(?POOL),
+teardown({Srv, SupPid}) ->
   ok = supervisor:stop(SupPid),
   try arterial_nif:destroy(?POOL) catch _:_ -> ok end,
   test_tcp_server:stop(Srv).
 
-%% Block until all `N` connections have (re)connected, the same way
-%% test_tcp_server_tests:wait_until_available/3 does: check them all out
-%% at once, then immediately check them back in (with their real ReqIDs,
-%% per checkin_connection/4's contract) so no backlog slot is stranded.
+%% Block until all `N` connections have (re)connected: check them all out
+%% at once, then immediately check them back in, so no reservation is
+%% stranded.
 wait_until_available(N, Retries) ->
   case checkout_n(N, []) of
-    {ok, Reservations} ->
-      lists:foreach(
-        fun({ConnID, ReqIDs}) -> ok = arterial_nif:checkin_connection(?POOL, ConnID, ReqIDs, <<>>) end,
-        Reservations);
+    {ok, ConnIDs} ->
+      lists:foreach(fun(ConnID) -> ok = arterial_nif:checkin_connection(?POOL, ConnID) end, ConnIDs);
     {error, no_connection} when Retries > 0 ->
       timer:sleep(20),
       wait_until_available(N, Retries - 1);
@@ -279,38 +243,33 @@ checkout_n(0, Acc) ->
   {ok, Acc};
 checkout_n(N, Acc) ->
   case arterial_nif:checkout_connection(?POOL, sync) of
-    {ok, #{conn_id := ConnID, req_ids := ReqIDs}} ->
-      checkout_n(N - 1, [{ConnID, ReqIDs} | Acc]);
+    {ok, ConnID} ->
+      checkout_n(N - 1, [ConnID | Acc]);
     {error, no_connection} = Error ->
-      lists:foreach(
-        fun({ConnID, ReqIDs}) -> ok = arterial_nif:checkin_connection(?POOL, ConnID, ReqIDs, <<>>) end,
-        Acc),
+      lists:foreach(fun(ConnID) -> ok = arterial_nif:checkin_connection(?POOL, ConnID) end, Acc),
       Error
   end.
 
 %% Each worker hammers requests back-to-back until Deadline, recording
 %% the wall-clock latency (microseconds) of every successful request.
-%% sync calls arterial_client:call/3 directly; async casts through
-%% arterial_async_driver:request/3 instead -- same workload, same
-%% {ok, Payload} | {error, no_connection} contract either way.
 %% {error, no_connection} is a transient, load-dependent outcome (every
-%% connection momentarily busy/throttled under enough concurrent
+%% connection momentarily at backlog capacity under enough concurrent
 %% workers) rather than a bug -- it's counted separately and retried
 %% immediately instead of aborting the worker. Any other error is
 %% unexpected and aborts the loop, surfaced via the worker's exit reason.
-worker_loop(Mode, Parent, Deadline, Payload, Acc) ->
-  worker_loop(Mode, Parent, Deadline, Payload, Acc, 0).
+worker_loop(Parent, Deadline, Payload, Acc) ->
+  worker_loop(Parent, Deadline, Payload, Acc, 0).
 
-worker_loop(Mode, Parent, Deadline, Payload, Acc, Rejected) ->
+worker_loop(Parent, Deadline, Payload, Acc, Rejected) ->
   case erlang:monotonic_time(millisecond) >= Deadline of
     true ->
       Parent ! {self(), done, Acc, Rejected};
     false ->
       T0 = erlang:monotonic_time(microsecond),
-      case do_request(Mode, Payload) of
+      case arterial_client:call(?POOL, {echo, Payload}, 5000) of
         {ok, Payload} ->
           T1 = erlang:monotonic_time(microsecond),
-          worker_loop(Mode, Parent, Deadline, Payload, [T1 - T0 | Acc], Rejected);
+          worker_loop(Parent, Deadline, Payload, [T1 - T0 | Acc], Rejected);
         {error, no_connection} ->
           %% Yield instead of busy-spinning: with enough concurrent
           %% workers, retrying instantly on every rejection starves the
@@ -318,17 +277,12 @@ worker_loop(Mode, Parent, Deadline, Payload, Acc, Rejected) ->
           %% complete, which paradoxically makes rejections *more*
           %% likely rather than just wasting CPU.
           erlang:yield(),
-          worker_loop(Mode, Parent, Deadline, Payload, Acc, Rejected + 1);
+          worker_loop(Parent, Deadline, Payload, Acc, Rejected + 1);
         Other ->
           Parent ! {self(), done, Acc, Rejected},
           error({unexpected_reply, Other})
       end
   end.
-
-do_request(sync, Payload) ->
-  arterial_client:call(?POOL, {echo, Payload}, 5000);
-do_request(async, Payload) ->
-  arterial_async_driver:request(?POOL, {echo, Payload}, 5000).
 
 collect([], Acc, RejectedAcc) ->
   {lists:append(Acc), RejectedAcc};
@@ -339,13 +293,12 @@ collect([Pid | Rest], Acc, RejectedAcc) ->
     error({worker_timeout, Pid})
   end.
 
-report(Mode, PoolSize, Backlog, Workers, DurationMs, ElapsedMs, LatenciesUs, Rejected, Fifo) ->
+report(PoolSize, Backlog, Workers, DurationMs, ElapsedMs, LatenciesUs, Rejected, Fifo) ->
   N = length(LatenciesUs),
   Sorted = lists:sort(LatenciesUs),
   ThroughputPerSec = N * 1000 / ElapsedMs,
 
   io:format("=== arterial benchmark ===~n"),
-  io:format("mode:         ~p~n", [Mode]),
   io:format("pool size:    ~p~n", [PoolSize]),
   io:format("backlog:      ~p~n", [Backlog]),
   io:format("order:        ~s~n", [case Fifo of true -> "fifo"; false -> "lifo" end]),

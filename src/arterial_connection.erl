@@ -6,12 +6,19 @@ socket lifecycle (connect, reconnect-with-backoff, disconnect) and drives
 the paired `arterial_client` callback module's `init/1`/`setup/2`/
 `terminate/2` callbacks around it.
 
-Started once per connection slot by `arterial_pool`'s supervisor. Once
-connected, the worker publishes the socket into the pool's NIF resource
-via `arterial_nif:set_socket/3` + `arterial_nif:make_available/2` so that
-`arterial_client:call/3` and the asynchronous checkout path
-(`arterial_nif:checkout_async/3`) can use it; it is not itself involved
-in individual requests.
+Started once per connection slot by `arterial_pool`'s supervisor,
+immediately after the matching `arterial_conn_owner` (see
+`arterial_pool:init/1`). Once connected, this worker hands the live
+socket to that owner via `arterial_conn_owner:set_socket/4`, then marks
+the connection available for checkout via `arterial_nif:make_available/2`
+-- it is not itself involved in individual requests, only connection
+lifecycle (connect/reconnect/backoff/disconnect).
+
+This process monitors its owner sibling (see `init/1`): `arterial_pool`'s
+supervisor is `one_for_one`, so an owner crash/restart doesn't restart
+this process too -- on the resulting `'DOWN'`, if a live socket is still
+held, it's republished directly to the freshly restarted (socket-less)
+owner, without going through a full reconnect.
 """.
 
 -behaviour(gen_server).
@@ -34,6 +41,9 @@ in individual requests.
 -endif.
 
 -define(BOUNCE_DRAIN_POLL_INTERVAL_MS, 100).
+-define(DISCONNECT_DRAIN_MAX_WAIT_MS, 5000).
+-define(AWAIT_OWNER_RETRIES, 20).
+-define(AWAIT_OWNER_POLL_INTERVAL_MS, 10).
 
 -record(recon_state, {
   cur    :: undefined | arterial:time(),
@@ -68,7 +78,8 @@ in individual requests.
   is                    :: impl_state(),
   sock                  :: undefined | arterial:socket(),
   timer_ref             :: undefined | reference(),
-  bounce                :: undefined | #bounce_state{}
+  bounce                :: undefined | #bounce_state{},
+  owner_mon             :: undefined | reference()
 }).
 
 -type state()           :: #state{}.
@@ -249,7 +260,29 @@ init([Pool, ConnID, Client, CliOpts]) ->
   Port == undefined andalso lists:any(fun needs_default_port/1, Addresses)
     andalso error({missing_port_option, Client}),
 
+  %% Belt-and-suspenders: arterial_pool_guard is the real fix for a
+  %% crashed (not gracefully disconnected) previous instance of this
+  %% connection slot leaving the NIF believing it's still available with
+  %% a dead socket -- it reacts to that death directly, closing the
+  %% window before this replacement process even starts. This call is
+  %% just a cheap, idempotent backstop in case the guard hasn't caught up
+  %% yet for some reason; a no-op on a normal first start.
+  true = arterial_nif:make_unavailable(Pool, ConnID),
+
+  %% arterial_pool's supervisor starts each slot's arterial_conn_owner
+  %% before its matching arterial_connection (see arterial_pool:init/1),
+  %% so the owner is always already registered by the time this runs.
+  %% Monitored (rather than linked) so a supervisor-driven owner restart
+  %% (one_for_one -- this process is NOT restarted alongside it) is
+  %% observed here as a plain message, not a crash: see
+  %% handle_info({'DOWN', OwnerMon, ...}, State) and publish_to_owner/2,
+  %% which re-publish the socket this process already holds (if any) to
+  %% the freshly restarted (socket-less) owner without going through a
+  %% full reconnect.
+  OwnerMon = erlang:monitor(process, arterial_conn_owner:reg_name(Pool, ConnID)),
+
   {ok, #state{
+    owner_mon = OwnerMon,
     ss = #srv_state{
       pfx          = Pfx,
       client       = Client,
@@ -298,6 +331,24 @@ handle_info(reconnect, State) ->
 
 handle_info(bounce_check, #state{bounce = #bounce_state{}} = State) ->
   bounce_check(State);
+
+%% This connection's owner sibling restarted (arterial_pool's supervisor
+%% is one_for_one, so this process survives untouched) -- the freshly
+%% started owner has no socket. arterial_pool's supervisor restarts it on
+%% its own as soon as this 'DOWN' fires, but that restart isn't
+%% synchronous with this message, so the registered name can briefly
+%% resolve to nothing yet -- publish_to_owner/1 (a self-message retry
+%% loop, never a blocking sleep inside this callback) bounds how long
+%% this process waits for that restart to land before giving up on
+%% republishing this cycle. Whatever State#state.sock currently holds
+%% (undefined if not connected yet, the live socket otherwise) is exactly
+%% what should be (re)published once the owner reappears -- no separate
+%% "what were we trying to do" bookkeeping needed.
+handle_info({'DOWN', OwnerMon, process, _Pid, _Reason}, #state{owner_mon = OwnerMon} = State) ->
+  publish_to_owner(?AWAIT_OWNER_RETRIES, State#state{owner_mon = undefined});
+
+handle_info({publish_to_owner, Retries}, State) ->
+  publish_to_owner(Retries, State);
 
 handle_info(Msg, #state{ss = #srv_state{pfx = Pfx}} = State) ->
   ?LOG_WARNING("~s got unexpected msg: ~p", [Pfx, Msg]),
@@ -364,15 +415,21 @@ needs_default_port(_)            -> true.
 
 client_init(#state{
   sock = Sock,
-  ss   = #srv_state{pfx=Pfx, pool=Pool, conn_id=ConnID, client=Cli, init_opts=InitOpts}
+  ss   = #srv_state{pfx=Pfx, client=Cli, init_opts=InitOpts}
 } = State) ->
   try Cli:init(InitOpts) of
     {ok, CState0} ->
       case Cli:setup(Sock, CState0) of
         {ok, CState} ->
-          true = arterial_nif:set_socket(Pool, ConnID, Sock),
-          true = arterial_nif:make_available(Pool, ConnID),
-          {noreply, State#state{is = CState, ss = reset_backoff(State#state.ss)}};
+          %% Owner registration is guaranteed once arterial_pool's
+          %% supervisor finishes its initial startup (it starts each
+          %% slot's owner before its connection, see arterial_pool:init/1)
+          %% -- publish_to_owner/2's retry loop only matters for the rare
+          %% case where the owner independently crashed and is mid-restart
+          %% at the exact moment this reconnect lands. Not awaited
+          %% synchronously here: see publish_to_owner/2 for why.
+          publish_to_owner(?AWAIT_OWNER_RETRIES,
+            State#state{is = CState, ss = reset_backoff(State#state.ss)});
         {error, Reason, CState} ->
           ?LOG_WARNING("~s ~w:setup/2 error: ~p", [Pfx, Cli, Reason]),
           disconnect(Reason, State#state{is = CState})
@@ -403,8 +460,12 @@ bounce_check(#state{
     true ->
       (TimedOut andalso not Drained) andalso
         ?LOG_NOTICE("~s bounce: backlog did not drain before deadline, forcing it anyway", [Pfx]),
-      {noreply, State1} = disconnect(bounce, State#state{bounce = undefined}),
-      % disconnect/2 always schedules a backoff-delayed reconnect via
+      %% MaxDrainWaitMs = 0: this loop already waited up to the caller's
+      %% own DrainTimeoutMs above and deliberately decided to proceed
+      %% regardless -- disconnect/3 must not silently re-impose its own,
+      %% longer ?DISCONNECT_DRAIN_MAX_WAIT_MS wait on top of that.
+      {noreply, State1} = disconnect(bounce, 0, State#state{bounce = undefined}),
+      % disconnect/3 always schedules a backoff-delayed reconnect via
       % recon_timer/1 -- cancel it before making our own immediate
       % attempt below, otherwise a second, redundant reconnect would fire
       % later (harmless if it finds itself already connected, but wasteful,
@@ -422,16 +483,39 @@ bounce_check(#state{
       {noreply, State}
   end.
 
-disconnect(Reason, #state{ss = #srv_state{pfx=Pfx, pool=Pool, conn_id=ConnID,
+%% Equivalent to disconnect/3 with MaxDrainWaitMs = ?DISCONNECT_DRAIN_MAX_WAIT_MS --
+%% the right default for every caller except bounce_check/1 (see disconnect/3).
+disconnect(Reason, State) ->
+  disconnect(Reason, ?DISCONNECT_DRAIN_MAX_WAIT_MS, State).
+
+%% `MaxDrainWaitMs` is a parameter (not always ?DISCONNECT_DRAIN_MAX_WAIT_MS)
+%% specifically for bounce_check/1: it already ran its own, caller-supplied-
+%% duration drain-poll loop (DrainTimeoutMs) before ever calling disconnect/2,
+%% and deliberately proceeds anyway once that deadline passes without having
+%% drained -- passing 0 here means this disconnect doesn't silently re-impose
+%% a second, longer wait (?DISCONNECT_DRAIN_MAX_WAIT_MS) on top of a decision
+%% the caller already made. Every other caller (a real connection error) has
+%% done no such wait yet, so it gets the full default budget.
+disconnect(Reason, MaxDrainWaitMs, #state{ss = #srv_state{pfx=Pfx, pool=Pool, conn_id=ConnID,
                                            client=Cli, proto=Proto}, is=ImplState, sock=Sock} = State) ->
   case Sock of
     undefined -> ok;
     _         ->
       arterial_nif:make_unavailable(Pool, ConnID),
-      %% Notify owners of any in-flight, unconfirmed requests on this
-      %% connection (see arterial_nif:connection_down/2's doc) before the
+      %% Wait for the connection to actually drain before telling the
+      %% owner to clear its socket -- make_unavailable/2 above only stops
+      %% NEW checkouts from selecting this connection; without waiting
+      %% for in-flight reservations to release, the owner could reset its
+      %% counter to 0 while a checkout still in flight from just before
+      %% make_unavailable/2 took effect later tries to use it. Reuses the
+      %% same drain-poll bounce_check/1 already does, not a new mechanism.
+      drain(Pool, ConnID, MaxDrainWaitMs),
+      %% Fails every still-pending caller on this connection with
+      %% {error, disconnected} (covering sync and async callers alike,
+      %% unlike the old NIF-side connection_down/2 which only covered
+      %% requests explicitly registered via track_inflight/5) before the
       %% socket closes and ConnID becomes eligible for reconnect/reuse.
-      ok = arterial_nif:connection_down(Pool, ConnID),
+      ok = arterial_conn_owner:clear_socket(Pool, ConnID),
       arterial_observe:event([disconnect], #{pool => Pool, conn_id => ConnID, reason => Reason}),
       arterial_socket:close(Proto, Sock)
   end,
@@ -447,6 +531,81 @@ disconnect(Reason, #state{ss = #srv_state{pfx=Pfx, pool=Pool, conn_id=ConnID,
 
 cancel_timer(undefined) -> ok;
 cancel_timer(TimerRef)  -> erlang:cancel_timer(TimerRef), ok.
+
+%% Block (this gen_server has nothing else to do mid-disconnect/terminate
+%% anyway) until ConnID has zero in-flight requests, polling the same way
+%% bounce_check/1 does asynchronously -- this caller can't defer the way
+%% bounce_check/1 does (disconnect/3 must finish synchronously, including
+%% when called from terminate/2), so it's a plain bounded sleep loop
+%% instead. `RemainingMs` is the caller's own drain budget (see
+%% disconnect/3 -- 0 for bounce_check/1, which already ran its own,
+%% longer drain-poll loop and is calling this only to (not) wait any
+%% further; ?DISCONNECT_DRAIN_MAX_WAIT_MS for every other caller). A
+%% single in-flight request that never completes (e.g. a peer that
+%% stopped responding entirely) must not hang a disconnect/shutdown
+%% forever -- once this budget runs out, the owner's clear_socket/2
+%% forces every still-pending caller to fail with {error, disconnected}
+%% regardless.
+drain(_Pool, _ConnID, RemainingMs) when RemainingMs =< 0 ->
+  ok;
+drain(Pool, ConnID, RemainingMs) ->
+  case arterial_nif:connection_drained(Pool, ConnID) of
+    true  -> ok;
+    false ->
+      timer:sleep(?BOUNCE_DRAIN_POLL_INTERVAL_MS),
+      drain(Pool, ConnID, RemainingMs - ?BOUNCE_DRAIN_POLL_INTERVAL_MS)
+  end.
+
+%% Publish State#state.sock (or do nothing if undefined -- nothing to
+%% publish yet) to Pool's connection ConnID's owner, then (re-)monitor
+%% it. Used both right after a fresh connect (client_init/1) and after a
+%% 'DOWN' for the previous owner instance (handle_info/2 above) -- in
+%% both cases arterial_pool's supervisor either already has, or is about
+%% to, start the owner this process needs to talk to, but that isn't
+%% synchronous with the message that got us here. Rather than block this
+%% gen_server in a sleep loop waiting for it, retry via a self-message
+%% (handle_info({publish_to_owner, Retries}, State) above) so the mailbox
+%% stays responsive (bounce requests, other monitors, ...) while waiting.
+%% Gives up silently after ?AWAIT_OWNER_RETRIES polls (owner_mon stays
+%% undefined, so this process simply isn't watching anyone -- the next
+%% successful reconnect, or a future owner crash this process happens to
+%% still be monitoring some other way, isn't possible once owner_mon is
+%% undefined, so in practice this only matters if the owner is stuck down
+%% far longer than ?AWAIT_OWNER_RETRIES * ?AWAIT_OWNER_POLL_INTERVAL_MS,
+%% at which point arterial_pool's own restart-intensity limit is the
+%% bigger problem).
+publish_to_owner(0, State) ->
+  {noreply, State};
+publish_to_owner(Retries, #state{
+  sock = Sock,
+  ss = #srv_state{pool = Pool, conn_id = ConnID, proto = Proto}
+} = State) ->
+  case whereis(arterial_conn_owner:reg_name(Pool, ConnID)) of
+    undefined ->
+      erlang:send_after(?AWAIT_OWNER_POLL_INTERVAL_MS, self(), {publish_to_owner, Retries - 1}),
+      {noreply, State};
+    _Pid ->
+      %% Only arm a fresh monitor if this process isn't already watching
+      %% a (still valid) owner -- init/1's own monitor, or one armed by
+      %% an earlier publish_to_owner/2 call this connection's lifetime,
+      %% covers the common case where the owner never actually died;
+      %% re-monitoring it here on every reconnect cycle would otherwise
+      %% leak one extra monitor per cycle.
+      State1 = case State#state.owner_mon of
+        undefined ->
+          State#state{owner_mon = erlang:monitor(process, arterial_conn_owner:reg_name(Pool, ConnID))};
+        _ ->
+          State
+      end,
+      case Sock of
+        undefined ->
+          ok;
+        _ ->
+          ok = arterial_conn_owner:set_socket(Pool, ConnID, Sock, Proto),
+          true = arterial_nif:make_available(Pool, ConnID)
+      end,
+      {noreply, State1}
+  end.
 
 %% `addresses` (a list, tried in order on every reconnect) takes priority
 %% if given; otherwise fall back to the single-address `address`/`ip`

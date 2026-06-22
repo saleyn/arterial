@@ -10,9 +10,11 @@ has no connection handshake), so it doesn't associate a default peer for
 plain `send/2`/`recv/2` -- and `arterial_connection`'s `client_opts` has
 no option to request that. This test therefore connects the UDP socket
 itself (`socket:connect/3`, which *does* support associating a default
-peer for a `dgram` socket) and registers it directly with the pool via
-`arterial_nif:set_socket/3` + `make_available/2`, bypassing
-`arterial_connection`/`arterial_pool` -- the same pattern
+peer for a `dgram` socket) and publishes it directly to a manually
+started `arterial_conn_owner` (the only thing that ever does socket I/O
+now, see that module's moduledoc) via `set_socket/4` +
+`arterial_nif:make_available/2`, bypassing only `arterial_connection`'s
+connect/reconnect lifecycle -- the same kind of direct-publish pattern
 `arterial_nif_tests` uses for its NIF-level tests, just with a real
 socket instead of the atom `dummy_socket`.
 """.
@@ -21,29 +23,34 @@ socket instead of the atom `dummy_socket`.
 %% which silently overwrites rather than failing on a name collision --
 %% so if anything after create/5 fails here (before any test body's own
 %% try/after runs), clean up what was already started instead of leaking
-%% udp_echo_pool's C++ pool resource, buffer ETS table, and server/socket
-%% past this test.
+%% udp_echo_pool's C++ pool resource and server/socket past this test.
 setup() ->
   ok = test_helper:set_log_level(),
   {ok, Srv} = test_udp_server:start(0),
   Port = test_udp_server:port(Srv),
   {ok, Sock} = socket:open(inet, dgram, udp),
   ok = socket:connect(Sock, #{family => inet, addr => {127,0,0,1}, port => Port}),
-  ok = arterial_nif:create(udp_echo_pool, 1, 1, true, test_echo_protocol),
+  ok = arterial_nif:create(udp_echo_pool, 1, 1, 0, nproc),
   try
-    true = arterial_nif:set_socket(udp_echo_pool, 0, Sock),
+    {ok, OwnerPid} = arterial_conn_owner:start_link(udp_echo_pool, 0, test_echo_protocol, true),
+    ok = arterial_conn_owner:set_socket(udp_echo_pool, 0, Sock, udp),
     true = arterial_nif:make_available(udp_echo_pool, 0),
-    {Srv, Sock}
+    {Srv, Sock, OwnerPid}
   catch
     Class:Reason:Stack ->
-      teardown({Srv, Sock}),
+      teardown({Srv, Sock, undefined}),
       erlang:raise(Class, Reason, Stack)
   end.
 
-teardown({Srv, Sock}) ->
+teardown({Srv, Sock, OwnerPid}) ->
   ok = arterial_nif:destroy(udp_echo_pool),
+  is_pid(OwnerPid) andalso unlink_and_stop(OwnerPid),
   socket:close(Sock),
   test_udp_server:stop(Srv).
+
+unlink_and_stop(Pid) ->
+  unlink(Pid),
+  exit(Pid, shutdown).
 
 udp_echo_test() ->
   Ctx = setup(),

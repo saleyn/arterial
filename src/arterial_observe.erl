@@ -4,7 +4,7 @@
 Generic, pluggable instrumentation facade. Every instrumentation point in
 `arterial` calls `span/3`/`event/2,3` here instead of talking to any
 specific metrics library directly, so swapping backends never touches
-`arterial_client`/`arterial_connection`/`arterial_sweeper`.
+`arterial_client`/`arterial_connection`/`arterial_conn_owner`.
 
 ## Configuring a backend
 
@@ -81,24 +81,22 @@ pool name, `t:arterial_pool:name/0`) is always present in metadata.
 * `[arterial, disconnect]` -- emitted whenever
   `arterial_connection:disconnect/2` runs (planned bounce or
   unplanned/error-triggered). Metadata: `pool`, `conn_id`, `reason`.
-* `[arterial, sweep, stop]` -- one event per `sweep_timeouts/1` call.
-  Measurements: `expired_count` (how many in-flight requests timed out
-  this sweep). Metadata: `pool`.
+* `[arterial, timeout]` -- emitted by a connection's `arterial_conn_owner`
+  whenever one of its own pending requests' `erlang:send_after`-armed
+  deadlines fires before a reply arrived. Metadata: `pool`, `conn_id`.
 
 Span `stop`/`exception` measurements always include `duration` (native
 time units, see `erlang:convert_time_unit/3`) and `monotonic_time`; `start`
-measurements include `monotonic_time`. Two events conspicuously absent
-from this catalog: a per-request timeout event and a "queued wait time"
-event for `arterial_nif:checkout_async/3,4`. Both `{arterial_timeout, Pool,
-ReqID}` and `{arterial_ready, Pool, ...}` are sent directly from the C++
-NIF layer (`enif_send`) straight to the original caller's mailbox -- there
-is no Erlang-side chokepoint in this library to intercept them, since
-`arterial` doesn't ship the asynchronous dispatch loop that would receive
-them (see `test/arterial_async_driver.erl` for the pattern such a loop
-follows). `[arterial, sweep, stop]`'s `expired_count` covers timeout
-*volume* in aggregate; a caller building their own dispatch loop on
-`checkout_async/3,4` should emit its own queued-wait/per-request-timeout
-telemetry around its own receive loop.
+measurements include `monotonic_time`. One event conspicuously absent
+from this catalog: a "queued wait time" event for
+`arterial_nif:checkout_async/2,3`. `{arterial_ready, Pool, ConnID}` is
+sent directly from the C++ NIF layer (`enif_send`) straight to the
+original caller's mailbox -- there is no Erlang-side chokepoint in this
+library to intercept it, since `arterial` doesn't ship a queue-when-busy
+dispatch loop of its own (`checkout_async/2,3` is a low-level primitive,
+meant to be driven directly by a caller-supplied process). A caller
+building their own dispatch loop on `checkout_async/2,3` should emit its
+own queued-wait telemetry around its own receive loop.
 """.
 -include_lib("kernel/include/logger.hrl").
 
@@ -169,8 +167,9 @@ server_loop(Module) ->
 
 -spec stop(atom()) -> ok.
 stop(Module) ->
-  Module:stop(),
-  persistent_term:erase(?MODULE).
+  ok = Module:stop(),
+  persistent_term:erase(?MODULE),
+  ok.
 
 -doc """
 Runs `Fun/0` (expected to return `{Result, StopMetadata}` or `{Result,
@@ -227,7 +226,7 @@ event(EventNameSuffix, Metadata) ->
 -doc """
 Emits `[arterial | EventNameSuffix]` with the given `Measurements`/
 `Metadata` through the configured backend. Use for one-shot events that
-aren't a start/stop pair (e.g. `[disconnect]`, `[sweep, stop]`). A no-op
+aren't a start/stop pair (e.g. `[disconnect]`, `[timeout]`). A no-op
 if no backend is configured.
 """.
 -spec event([atom()], map(), map()) -> ok.

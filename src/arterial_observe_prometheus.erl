@@ -28,7 +28,7 @@ stops).
 * `arterial_checkout_duration_seconds` (histogram; labels `pool`, `mode`, `outcome`)
 * `arterial_connect_duration_seconds` (histogram; labels `pool`, `result`)
 * `arterial_disconnects_total` (counter; labels `pool`, `reason`)
-* `arterial_sweep_expired_total` (counter; labels `pool`)
+* `arterial_timeouts_total` (counter; labels `pool`, `conn_id`)
 * `arterial_exceptions_total` (counter; labels `pool`, `span`) -- incremented
   on any `[arterial, Span, exception]` event (`call`/`cast`/`checkout`/`connect`),
   `span` identifies which one.
@@ -103,9 +103,9 @@ start(Opts) when is_map(Opts) ->
   declare_counter(arterial_disconnects_total,
     "Total number of arterial connection disconnects.",
     [pool, reason]),
-  declare_counter(arterial_sweep_expired_total,
-    "Total number of in-flight requests evicted by arterial_nif:sweep_timeouts/1.",
-    [pool]),
+  declare_counter(arterial_timeouts_total,
+    "Total number of in-flight requests timed out by a connection's arterial_conn_owner.",
+    [pool, conn_id]),
   declare_counter(arterial_exceptions_total,
     "Total number of arterial spans that raised an exception.",
     [pool, span]),
@@ -124,7 +124,8 @@ stop() ->
     internal -> application:stop(prometheus);
     _        -> ok
   end,
-  persistent_term:erase(?MODULE).
+  persistent_term:erase(?MODULE),
+  ok.
 
 -doc "Records the event into this module's Prometheus metrics; see the moduledoc's Metrics section for the event-to-metric mapping.".
 -spec event([atom()], map(), map()) -> ok.
@@ -187,8 +188,8 @@ handle_event([arterial, connect, exception], _Measurements, #{pool := Pool}) ->
 handle_event([arterial, disconnect], _Measurements, #{pool := Pool, reason := Reason}) ->
   prometheus_counter:inc(arterial_disconnects_total, [Pool, Reason]);
 
-handle_event([arterial, sweep, stop], #{expired_count := Count}, #{pool := Pool}) ->
-  prometheus_counter:inc(arterial_sweep_expired_total, [Pool], Count);
+handle_event([arterial, timeout], _Measurements, #{pool := Pool, conn_id := ConnID}) ->
+  prometheus_counter:inc(arterial_timeouts_total, [Pool, ConnID]);
 
 %% start/start events: this backend only records durations on stop/exception.
 handle_event([arterial, _, start], _Measurements, _Metadata) ->

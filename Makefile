@@ -23,8 +23,10 @@ cover:
 	$(REBAR) cover --verbose
 
 check:
-	$(REBAR) xref
-	$(REBAR) dialyzer
+	$(MAKE) xref dialyzer
+
+xref dialyzer:
+	$(REBAR) as test $@
 
 memcheck:
 	@echo "==> Building NIF with AddressSanitizer"
@@ -76,7 +78,7 @@ bench-arterial bench-arterial-help:
 	@$(REBAR) as test compile
 	erl -noshell -noinput -pa _build/test/lib/arterial/ebin \
 	  -pa _build/test/lib/arterial/test \
-	  -eval "arterial_bench:$(subst -,_,$@)($(BENCH_OPTS_MAP)), halt()."
+	  -eval "arterial_bench:$(subst -,_,$(subst -arterial,,$@))($(BENCH_OPTS_MAP)), halt()."
 
 # Runs test/shackle_bench.erl -- the same workload shape/wire framing as
 # `bench` above, but driven through https://github.com/lpgauth/shackle

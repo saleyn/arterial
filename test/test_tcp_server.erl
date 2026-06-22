@@ -13,6 +13,8 @@ back via `port/1`), accepts connections, and for each
 - `{echo, Term}`        -> replies with `Term`
 - `{upcase, Binary}`    -> replies with `string:uppercase(Binary)`
 - `{delay, Ms, Term}`   -> replies with `Term` after sleeping `Ms`
+- `{noreply, Term}`     -> processed, but never replies (the only shape
+  here safe to send via `arterial_client:cast/2`'s one-way contract)
 - anything else         -> replies with `{error, unknown_request}`
 
 ## Examples
@@ -136,6 +138,14 @@ respond(Sock, ReqID, {upcase, Bin}) when is_binary(Bin) ->
 respond(Sock, ReqID, {delay, Ms, Term}) ->
   timer:sleep(Ms),
   reply(Sock, ReqID, Term);
+respond(_Sock, _ReqID, {noreply, _Term}) ->
+  %% Genuinely one-way: processed, but no reply frame is ever written --
+  %% the only request shape this server supports that's actually safe to
+  %% send via arterial_client:cast/2 (mode (e)'s contract requires the
+  %% protocol to never reply; every other request shape here always
+  %% does, cast or not, since the server has no idea which API the client
+  %% used to send it).
+  ok;
 respond(Sock, ReqID, _Other) ->
   reply(Sock, ReqID, {error, unknown_request}).
 

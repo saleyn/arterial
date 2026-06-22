@@ -48,7 +48,8 @@ stop() ->
     internal -> application:stop(telemetry);
     _        -> ok
   end,
-  persistent_term:erase(?MODULE).
+  persistent_term:erase(?MODULE),
+  ok.
 
 -doc "Forwards the event to `telemetry:execute/3` unchanged.".
 -spec event([atom()], map(), map()) -> ok.

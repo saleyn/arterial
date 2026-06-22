@@ -47,8 +47,8 @@ wait_until_available(_Pool, 0, _Retries) ->
   ok;
 wait_until_available(Pool, N, Retries) ->
   case arterial_nif:checkout_connection(Pool, sync) of
-    {ok, #{conn_id := ConnID, req_ids := ReqIDs}} ->
-      ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, <<>>),
+    {ok, ConnID} ->
+      ok = arterial_nif:checkin_connection(Pool, ConnID),
       wait_until_available(Pool, N - 1, Retries);
     {error, no_connection} when Retries > 0 ->
       timer:sleep(20),
@@ -62,9 +62,19 @@ wait_until_available(Pool, N, Retries) ->
 %% one bucket slot, so the total observation count is the sum across all
 %% of them (NOT the last slot -- that's only the count of observations
 %% falling in the highest/`+infinity` bucket specifically).
+%%
+%% Called through erlang:apply/3 rather than directly: prometheus_histogram's
+%% own -spec for value/2 claims {number(), ...} (matching its sibling
+%% counter-style metrics), but its actual implementation
+%% (reduce_buckets_counters/1) returns {[number()], number()} -- a spec
+%% bug in the dependency itself, confirmed by reading its source, not a
+%% bug here. Dialyzer's success typing trusts that wrong spec over the
+%% real code, which would otherwise flag this clause (and propagate "no
+%% local return" into every caller) as unreachable; apply/3 is opaque to
+%% success typing, so it sees this call's result as term() instead.
 total_observations(Name, LabelValues) ->
-  case prometheus_histogram:value(Name, LabelValues) of
-    undefined      -> 0;
+  case erlang:apply(prometheus_histogram, value, [Name, LabelValues]) of
+    undefined       -> 0;
     {Buckets, _Sum} -> lists:sum(Buckets)
   end.
 
@@ -126,23 +136,18 @@ disconnect_increments_counter_test() ->
     teardown(Ctx)
   end.
 
-sweep_increments_counter_test() ->
+%% A per-request timeout, armed and fired by the connection's
+%% arterial_conn_owner (no more NIF-side sweep/track_inflight -- that
+%% responsibility moved there entirely), increments arterial_timeouts_total.
+timeout_increments_counter_test() ->
   Ctx = setup(),
   try
-    Before = counter_value(arterial_sweep_expired_total, [?POOL]),
-    {ok, #{conn_id := ConnID, req_ids := [ReqID]}} =
-      arterial_nif:checkout_connection(?POOL, async),
-    ok = arterial_nif:track_inflight(?POOL, ConnID, ReqID, self(), 0),
-    timer:sleep(1),
-
-    {ok, 1} = arterial_nif:sweep_timeouts(?POOL),
-    arterial_observe:event([sweep, stop], #{expired_count => 1}, #{pool => ?POOL}),
-
-    After = counter_value(arterial_sweep_expired_total, [?POOL]),
-    ?assertEqual(Before + 1, After),
-
-    receive {arterial_timeout, ?POOL, ReqID} -> ok after 0 -> ok end
+    Before = counter_value(arterial_timeouts_total, [?POOL, 0]),
+    {error, timeout} = arterial_client:call(?POOL, {delay, 300, late}, 50),
+    After = counter_value(arterial_timeouts_total, [?POOL, 0]),
+    ?assertEqual(Before + 1, After)
   after
+    timer:sleep(350), % let the slow reply land before teardown closes the socket
     teardown(Ctx)
   end.
 
