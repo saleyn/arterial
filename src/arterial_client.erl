@@ -174,23 +174,12 @@ do_call(Pool, Request, Timeout) ->
     {ok, ConnID} ->
       try
         arterial_conn_owner:send_recv(Pool, ConnID, Request, Timeout)
-      catch
-        exit:Reason -> owner_call_exit_error(Reason)
       after
         ok = arterial_nif:checkin_connection(Pool, ConnID)
       end;
     {error, _} = Error ->
       Error
   end.
-
-%% The owner died mid-call (gen_server:call/3 raises rather than
-%% returning when its target is gone) -- surface this exactly like any
-%% other disconnect, instead of crashing this caller along with it.
-%% arterial_pool's supervisor restarts the owner; the checkin in
-%% do_call/3's/do_cast/2's `after` still runs regardless, so the dead
-%% reservation is never stranded.
-owner_call_exit_error({Reason, {gen_server, call, _}}) -> {error, Reason};
-owner_call_exit_error(Reason)                          -> {error, Reason}.
 
 %% Wraps arterial_nif:checkout_connection/2 with a [arterial, checkout, ...]
 %% span -- shared by call/3 (Mode = sync) and cast/2 (Mode = async).
@@ -220,8 +209,9 @@ moduledoc).
 ## Examples
 
 ```
-1> arterial_pool:start_link(my_pool, #{protocol => my_log_proto, client => my_client,
-2>                                      client_opts => #{address => "localhost", port => 9000}}).
+1> arterial_pool:start_link(my_pool, #{protocol    => my_log_proto,
+2>                                     client      => my_client,
+2>                                     client_opts => #{address => "localhost", port => 9000}}).
 {ok,<0.123.0>}
 2> arterial_client:cast(my_pool, {log, info, <<"started">>}).
 ok
@@ -248,3 +238,13 @@ do_cast(Pool, Request) ->
     {error, _} = Error ->
       Error
   end.
+
+%% arterial_conn_owner:send/3 (unlike send_recv/4) is still a plain
+%% gen_server:call/2 -- it dies the same way (an `exit` instead of a
+%% normal return) if the owner crashes mid-call. Surface that exactly
+%% like any other disconnect instead of crashing this caller along with
+%% it; arterial_pool's supervisor restarts the owner, and the checkin in
+%% do_cast/2's `after` still runs regardless, so the dead reservation is
+%% never stranded.
+owner_call_exit_error({Reason, {gen_server, call, _}}) -> {error, Reason};
+owner_call_exit_error(Reason)                          -> {error, Reason}.

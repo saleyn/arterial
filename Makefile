@@ -75,8 +75,8 @@ bench: bench-arterial
 bench-help: bench-arterial-help
 
 bench-arterial bench-arterial-help:
-	@$(REBAR) as test compile
-	erl -noshell -noinput -pa _build/test/lib/arterial/ebin \
+	#@$(REBAR) as test compile
+	@erl -noshell -noinput -pa _build/test/lib/arterial/ebin \
 	  -pa _build/test/lib/arterial/test \
 	  -eval "arterial_bench:$(subst -,_,$(subst -arterial,,$@))($(BENCH_OPTS_MAP)), halt()."
 

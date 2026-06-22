@@ -89,7 +89,8 @@ the old NIF-side `connection_down/2`, which only ever covered requests
 explicitly registered via `track_inflight/5`).
 
 Each pending entry also carries an `erlang:monitor(process, CallerPid)`
-(`CallerPid` taken straight from `send_recv/4`'s own `From`) so a caller
+(`CallerPid` taken straight from the `{send_recv, Ref, CallerPid, ...}`
+message `send_recv/4` sends) so a caller
 that dies mid-flight -- before a reply or timeout reaches it -- gets its
 pending entry (and timer) dropped immediately rather than left to expire
 naturally. This is a tidiness improvement, not a correctness one: the
@@ -109,7 +110,8 @@ ever fires.
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(pending, {
-  from      :: gen_server:from(),
+  caller    :: pid(),
+  ref       :: reference(),
   timer_ref :: reference(),
   mon_ref   :: reference()
 }).
@@ -185,11 +187,52 @@ clear_socket(Pool, ConnID) ->
 -doc """
 Send `Request` on `Pool`'s connection `ConnID` and block for its decoded
 reply (or `Timeout` milliseconds, whichever comes first).
+
+Deliberately NOT a `gen_server:call/3`: this is the single hottest path
+in the whole library, called once per `arterial_client:call/3`, and
+`gen_server:call/3` pays for `$gen_call`/`gen_server:reply/2` message
+wrapping on every single request -- overhead that has nothing to do with
+this module's actual job (demuxing replies safely once `backlog > 1`).
+Instead, mirrors `shackle`'s own hot-path shape (see
+`shackle:call/3`/`shackle_server`): a bare `!` send carrying a fresh
+`Ref` and `self()`, and a bare `receive` keyed on that `Ref` -- the owner
+replies the same way (see `reply_one/3`), with no `gen_server`
+call/reply wrapping involved at all. `clear_socket/2`, `set_socket/4`,
+and `send/3` stay on `gen_server:call/2,3` since none of them are
+hot-path (each fires at most once per (re)connect, or once per
+fire-and-forget request, neither of which approaches `send_recv/4`'s
+volume).
+
+Unlike shackle, this still arms a `monitor(process, Owner)` for the
+duration of the call (one extra ETS-table entry, not a full
+`gen_server:call/3`): the owner crashing mid-flight must fail this
+caller promptly rather than have it sit out the full `Timeout` waiting
+for a reply that can now never arrive -- `arterial_conn_owner_tests`'s
+`owner_crash_resilience_test` pins this down. `shackle` itself doesn't
+bother (a dead `shackle_server` just times out its callers), but the
+monitor's one-time setup/teardown cost is negligible next to
+`gen_server:call/3`'s per-message wrapping, so there's no reason to give
+up this fail-fast property to get the bulk of the speedup.
 """.
 -spec send_recv(arterial_pool:name(), non_neg_integer(), term(), timeout()) ->
   {ok, term()} | {error, term()}.
 send_recv(Pool, ConnID, Request, Timeout) ->
-  gen_server:call(reg_name(Pool, ConnID), {send_recv, Request, Timeout}, Timeout + 5000).
+  case whereis(reg_name(Pool, ConnID)) of
+    undefined ->
+      {error, disconnected};
+    Owner ->
+      Ref = make_ref(),
+      MonRef = erlang:monitor(process, Owner),
+      Owner ! {send_recv, Ref, self(), Request, Timeout},
+      Reply = receive
+        {Ref, Result} -> Result;
+        {'DOWN', MonRef, process, Owner, Reason} -> {error, Reason}
+      after Timeout + 5000 ->
+        {error, timeout}
+      end,
+      erlang:demonitor(MonRef, [flush]),
+      Reply
+  end.
 
 -doc """
 Send `Request` on `Pool`'s connection `ConnID` without waiting for (or
@@ -230,29 +273,6 @@ handle_call(clear_socket, _From, State) ->
   State1 = fail_all_pending(disconnected, State),
   {reply, ok, State1#state{sock = undefined, transport = undefined, buf = <<>>, select_ref = undefined}};
 
-handle_call({send_recv, _Request, _Timeout}, _From, #state{sock = undefined} = State) ->
-  {reply, {error, disconnected}, State};
-
-handle_call({send_recv, Request, Timeout}, From, #state{
-  protocol = Proto, sock = Socket, next_id = ReqID
-} = State) ->
-  case Proto:encode_request(ReqID, Request, Timeout) of
-    {ok, Data} ->
-      case Proto:send(Socket, Data) of
-        ok ->
-          TimerRef = erlang:send_after(Timeout, self(), {timeout, ReqID}),
-          {CallerPid, _Tag} = From,
-          MonRef = erlang:monitor(process, CallerPid),
-          State1 = track_pending(ReqID, #pending{from = From, timer_ref = TimerRef, mon_ref = MonRef}, State),
-          State2 = pump_decode(State1#state{next_id = ReqID + 1}),
-          {noreply, State2};
-        {error, _} = Error ->
-          {reply, Error, State#state{next_id = ReqID + 1}}
-      end;
-    {error, _} = Error ->
-      {reply, Error, State}
-  end;
-
 handle_call({send, _Request}, _From, #state{sock = undefined} = State) ->
   {reply, {error, disconnected}, State};
 
@@ -268,6 +288,34 @@ handle_call({send, Request}, _From, #state{
 -doc false.
 handle_cast(_Msg, State) ->
   {noreply, State}.
+
+%% Hot path -- see send_recv/4's moduledoc for why this is a raw message
+%% instead of a handle_call/3 clause.
+handle_info({send_recv, Ref, CallerPid, _Request, _Timeout}, #state{sock = undefined} = State) ->
+  CallerPid ! {Ref, {error, disconnected}},
+  {noreply, State};
+
+handle_info({send_recv, Ref, CallerPid, Request, Timeout}, #state{
+  protocol = Proto, sock = Socket, next_id = ReqID
+} = State) ->
+  case Proto:encode_request(ReqID, Request, Timeout) of
+    {ok, Data} ->
+      case Proto:send(Socket, Data) of
+        ok ->
+          TimerRef = erlang:send_after(Timeout, self(), {timeout, ReqID}),
+          MonRef = erlang:monitor(process, CallerPid),
+          Pending = #pending{caller = CallerPid, ref = Ref, timer_ref = TimerRef, mon_ref = MonRef},
+          State1 = track_pending(ReqID, Pending, State),
+          State2 = pump_decode(State1#state{next_id = ReqID + 1}),
+          {noreply, State2};
+        {error, _} = Error ->
+          CallerPid ! {Ref, Error},
+          {noreply, State#state{next_id = ReqID + 1}}
+      end;
+    {error, _} = Error ->
+      CallerPid ! {Ref, Error},
+      {noreply, State}
+  end;
 
 %% tcp/udp ('socket' module): a previously armed socket:recv(...,nowait)
 %% fired. Re-read (won't block, the select already confirmed readability)
@@ -303,8 +351,8 @@ handle_info({timeout, ReqID}, #state{pool = Pool, conn_id = ConnID} = State) ->
   case take_pending(ReqID, State) of
     {undefined, State1} ->
       {noreply, State1};
-    {#pending{from = From}, State1} ->
-      gen_server:reply(From, {error, timeout}),
+    {#pending{caller = CallerPid, ref = Ref}, State1} ->
+      CallerPid ! {Ref, {error, timeout}},
       arterial_observe:event([timeout], #{pool => Pool, conn_id => ConnID}),
       {noreply, State1}
   end;
@@ -446,14 +494,14 @@ decode_one(Buf, #state{protocol = Proto, fifo = false, pending = Map}) ->
 reply_one(ReqID, Result, State) ->
   case take_pending(ReqID, State) of
     {undefined, State1} -> State1;
-    {#pending{from = From}, State1} ->
-      gen_server:reply(From, Result),
+    {#pending{caller = CallerPid, ref = Ref}, State1} ->
+      CallerPid ! {Ref, Result},
       State1
   end.
 
 fail_all_pending(Reason, #state{pending = Map} = State) ->
-  maps:foreach(fun(_ReqID, #pending{from = From, timer_ref = TimerRef}) ->
+  maps:foreach(fun(_ReqID, #pending{caller = CallerPid, ref = Ref, timer_ref = TimerRef}) ->
     cancel_timer(TimerRef),
-    gen_server:reply(From, {error, Reason})
+    CallerPid ! {Ref, {error, Reason}}
   end, Map),
   State#state{pending = #{}, fifo_q = queue:new()}.
