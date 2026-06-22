@@ -70,7 +70,7 @@ $(TEST_TARGET): $(TEST_OBJ) | $(TEST_DIR)
 $(OBJ): $(SRC) $(wildcard *.hpp) enif.hpp | $(OBJ_DIR)
 	$(CXX) -c $(CXXFLAGS) -o $@ $<
 
-$(TEST_OBJ) : test_pool.cpp pool_fifo.hpp enif.hpp | $(OBJ_DIR)
+$(TEST_OBJ) : test_pool.cpp backlog.hpp throttle.hpp enif.hpp | $(OBJ_DIR)
 	$(CXX) -c -g -O0 $(CXXFLAGS) -o $@ $<
 
 $(PRIV_DIR) $(OBJ_DIR) $(TEST_DIR):

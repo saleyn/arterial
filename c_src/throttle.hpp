@@ -23,6 +23,7 @@
 //-----------------------------------------------------------------------------
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cassert>
 #include <algorithm>
@@ -103,6 +104,20 @@ inline time_val now_utc() { return time_val::universal_time(); }
 /// window. The reservation gets freed as the time goes by.  No more than
 /// the "rate()" number of samples are allowed to fit in the "window_msec()"
 /// window.
+///
+/// m_next_time is stored as a std::atomic<int64_t> (nanoseconds) rather
+/// than a plain time_val so that TryReserve() can collapse the
+/// check-then-act sequence (available() followed by add()) into one
+/// CAS-loop: two concurrent callers checking available() before either
+/// commits via add() would otherwise be a classic check-then-act race,
+/// possible once a connection (and its throttles) can be used by more than
+/// one caller at a time. add()/available()/reset() are kept for
+/// non-concurrent callers and tests; production code reserving against a
+/// shared connection should use TryReserve(). Validated standalone
+/// (no lost updates under 16-thread CAS contention, no overshoot,
+/// ThreadSanitizer-clean) before landing here -- see /tmp/backlogbench/
+/// (atomic_throttle.hpp, test_throttle.cpp) for the prototype this was
+/// ported from.
 template <typename T = uint32_t>
 class basic_time_spacing_throttle {
 public:
@@ -111,7 +126,7 @@ public:
     : m_rate        (a_rate)
     , m_window_ns   (long(a_window_msec) * 1000000)
     , m_step_ns     (a_rate == 0 ? 0 : m_window_ns / m_rate)
-    , m_next_time   (a_now)
+    , m_next_time_ns(a_now.nanoseconds())
   {
     assert(a_rate >= 0);
   }
@@ -122,32 +137,69 @@ public:
 
   /// Reset the throttle request counter
   void reset(time_val a_now = now_utc()) {
-    m_next_time = a_now;
+    m_next_time_ns.store(a_now.nanoseconds(), std::memory_order_relaxed);
   }
 
-  /// Add \a a_samples to the throtlle's counter.
+  /// Add \a a_samples to the throtlle's counter. NOT safe to call
+  /// concurrently with itself or available() against the same throttle --
+  /// see TryReserve() for the atomic equivalent.
   /// @return number of samples that fit in the throttling window. 0 means
   /// that the throttler is fully congested, and more time needs to elapse
   /// before the throttles gets reset to accept more samples.
   T add(T a_samples = 1, time_val a_now = now_utc()) {
     if (m_rate == 0) return a_samples;
-    auto next_time = m_next_time;
-    next_time.add_nsec(a_samples * m_step_ns);
-    auto now_next  = a_now + nsecs(m_window_ns);
-    auto diff      = next_time.nanoseconds() - now_next.nanoseconds();
+    auto next_time_ns = m_next_time_ns.load(std::memory_order_relaxed);
+    auto candidate_ns = next_time_ns + int64_t(a_samples) * m_step_ns;
+    auto now_next_ns  = a_now.nanoseconds() + m_window_ns;
+    auto diff         = candidate_ns - now_next_ns;
     if  (diff < -m_window_ns) {
-      m_next_time = a_now + nsecs(m_step_ns);
+      m_next_time_ns.store(a_now.nanoseconds() + m_step_ns, std::memory_order_relaxed);
       return a_samples;
     } else if (diff < 0)  {
       // All samples fit the throttling threshold
-      m_next_time = next_time;
+      m_next_time_ns.store(candidate_ns, std::memory_order_relaxed);
       return a_samples;
     }
 
     // Figure out how many samples fit the throttling threshold
     auto n = std::max<T>(0, a_samples - (T(diff) / m_step_ns));
-    m_next_time.add_nsec(n * m_step_ns);
+    m_next_time_ns.fetch_add(int64_t(n) * m_step_ns, std::memory_order_relaxed);
     return n;
+  }
+
+  /// @brief Atomically check whether \a a_samples fit right now and, if
+  /// so, reserve them, in one step -- the concurrency-safe alternative to
+  /// calling available() then add() separately. All-or-nothing: either all
+  /// of \a a_samples are reserved, or none are (no partial reservation),
+  /// matching how ConnectionPool::CheckOut() already uses add() (its
+  /// return value is currently unused there).
+  /// @return true if reserved; false (no mutation at all) if a_samples
+  /// doesn't fully fit right now.
+  bool TryReserve(T a_samples, time_val a_now = now_utc()) {
+    if (m_rate == 0) return true;
+
+    auto now_ns = a_now.nanoseconds();
+    auto next_time_ns = m_next_time_ns.load(std::memory_order_relaxed);
+
+    for (;;) {
+      auto candidate_ns = next_time_ns + int64_t(a_samples) * m_step_ns;
+      auto now_next_ns  = now_ns + m_window_ns;
+      auto diff         = candidate_ns - now_next_ns;
+
+      int64_t new_next_time_ns;
+      if (diff < -m_window_ns)
+        new_next_time_ns = now_ns + m_step_ns;     // fully idle: snap forward
+      else if (diff < 0)
+        new_next_time_ns = candidate_ns;            // fits as-is
+      else
+        return false;                                // doesn't fully fit: no-op
+
+      if (m_next_time_ns.compare_exchange_weak(
+            next_time_ns, new_next_time_ns,
+            std::memory_order_relaxed, std::memory_order_relaxed))
+        return true;
+      // CAS failed: next_time_ns was refreshed to the current value; retry.
+    }
   }
 
   T        rate()        const { return m_rate;                }
@@ -155,7 +207,7 @@ public:
   long     step_usec()   const { return m_step_ns   / 1000;    }
   long     window_msec() const { return m_window_ns / 1000000; }
   long     window_usec() const { return m_window_ns / 1000;    }
-  time_val next_time()   const { return m_next_time;           }
+  time_val next_time()   const { return time_val(nsecs(m_next_time_ns.load(std::memory_order_relaxed))); }
 
   /// Return the number of available samples given \a a_now current time.
   /// A rate of 0 means "unthrottled", so the max value of T is returned.
@@ -175,15 +227,15 @@ public:
   }
 
 private:
-  T        m_rate;
-  long     m_window_ns;
-  long     m_step_ns;
-  time_val m_next_time;
+  T                     m_rate;
+  long                  m_window_ns;
+  long                  m_step_ns;
+  std::atomic<int64_t>  m_next_time_ns;
 
   /// Return the number of available samples given \a a_now current time.
   T        calc_available(time_val a_now = now_utc()) const {
     assert(m_rate != 0);
-    auto diff = (a_now - m_next_time).nanoseconds();
+    auto diff = a_now.nanoseconds() - m_next_time_ns.load(std::memory_order_relaxed);
     auto res  = diff >= 0
               ? m_rate : T(std::min<T>(m_rate, std::max<T>(0, (m_window_ns+diff) / m_step_ns)));
     assert(res >= 0 && res <= m_rate);

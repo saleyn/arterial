@@ -1,10 +1,11 @@
 #pragma once
 
 #include <vector>
-#include <set>
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <cassert>
 #include <erl_nif.h>
 #include "throttle.hpp"
@@ -141,6 +142,22 @@ protected:
 /// It should be used in cases when the wire-level protocol doesn't support
 /// passing a request ID in a request/reply, and the request/reply order is
 /// strictly FIFO.
+///
+/// Unlike RandomAccessBackLog, CheckInUpTo() is a variable-length bulk pop
+/// (scan from head until a match, or fail/no-op entirely) -- that doesn't
+/// decompose into independent per-slot CAS operations the way a fixed-size
+/// claim/release does, so this uses a small spinlock around the head/tail/
+/// size bookkeeping instead of a lock-free scheme. This is safe to do here
+/// because every critical section is either O(1) (CheckOut/CheckIn) or
+/// already O(size) with no I/O/syscalls/nested locking (CheckInUpTo/
+/// OutstandingReqIDs) -- the lock is held only across plain integer/memory
+/// ops. Needed because the round-robin pool design (see ConnectionPool::
+/// CheckOut() in arterial.hpp) removed the old exclusive-checkout-of-a-
+/// connection invariant that used to make a single caller's access to a
+/// connection's backlog implicitly serialized; now any number of Erlang
+/// processes can call checkout/checkin/checkin_up_to against the same
+/// connection concurrently (confirmed: no NIF-level or Connection-level
+/// lock exists above this).
 //-----------------------------------------------------------------------------
 struct FIFOBackLog : AbstractBackLog
 {
@@ -153,6 +170,7 @@ struct FIFOBackLog : AbstractBackLog
   /// @return nullptr if the backlog is full
   Req* CheckOut(uint64_t now_us, uint32_t ttl_us, std::atomic<uint32_t>& vsn) override
   {
+    SpinLockGuard guard(m_lock);
     if (Full()) return nullptr;
 
     auto& req = m_buffer[m_tail];
@@ -169,6 +187,7 @@ struct FIFOBackLog : AbstractBackLog
   /// @return nullptr if the queue is empty
   Req* CheckIn(ReqID) override
   {
+    SpinLockGuard guard(m_lock);
     if (Empty()) return nullptr;
 
     auto& req = m_buffer[m_head];
@@ -191,6 +210,7 @@ struct FIFOBackLog : AbstractBackLog
   /// never outstanding, gets no partial effect).
   std::vector<ReqID> CheckInUpTo(ReqID upto_ext_req_id) override
   {
+    SpinLockGuard guard(m_lock);
     std::vector<ReqID> popped;
 
     for (size_t i = 0, idx = m_head; i < m_size; ++i, idx = (idx + 1) % m_buffer.size()) {
@@ -210,6 +230,7 @@ struct FIFOBackLog : AbstractBackLog
 
   std::vector<ReqID> OutstandingReqIDs() const override
   {
+    SpinLockGuard guard(m_lock);
     std::vector<ReqID> ids;
     ids.reserve(m_size);
     for (size_t i = 0, idx = m_head; i < m_size; ++i, idx = (idx + 1) % m_buffer.size())
@@ -218,9 +239,24 @@ struct FIFOBackLog : AbstractBackLog
   }
 
 private:
-  size_t m_head = 0;
-  size_t m_tail = 0;
-  size_t m_size = 0;
+  // Minimal spinlock: critical sections here are always short (plain
+  // integer bookkeeping, no I/O, no nested locking), so a CAS spin beats
+  // a std::mutex's syscall-on-contention overhead for this access pattern.
+  struct SpinLock {
+    void lock()   { while (m_flag.exchange(true, std::memory_order_acquire)) ; }
+    void unlock() { m_flag.store(false, std::memory_order_release); }
+    mutable std::atomic<bool> m_flag{false};
+  };
+  struct SpinLockGuard {
+    explicit SpinLockGuard(SpinLock& l) : m_lock(l) { m_lock.lock(); }
+    ~SpinLockGuard() { m_lock.unlock(); }
+    SpinLock& m_lock;
+  };
+
+  mutable SpinLock m_lock;
+  size_t           m_head = 0;
+  size_t           m_tail = 0;
+  size_t           m_size = 0;
 };
 
 //-----------------------------------------------------------------------------
@@ -229,13 +265,32 @@ private:
 /// It should be used in cases when the wire-level protocol supports passing
 /// a request ID in a request/reply, so replies don't need to follow the
 /// FIFO order of requests.
+///
+/// Internally this is a CAS-claimed bitmap (1 = free, 0 = in-flight)
+/// instead of a std::set<BaseReqID> of free slots: each 64-bit word's
+/// fetch_and/fetch_or is ONE locked instruction covering up to 64 slots'
+/// worth of contention surface, not one CAS per slot. An atomic free_count
+/// gives O(1) full/empty checks without scanning, and a rotating starting
+/// word spreads concurrent claimers across different words instead of all
+/// hammering word 0 first. Validated standalone (correctness stress test +
+/// ThreadSanitizer, benchmarked against a mutex-wrapped std::set under
+/// contention) before landing here -- see /tmp/backlogbench/ for the
+/// prototype this was ported from (bitmap_backlog.hpp, test_bitmap.cpp).
 //-----------------------------------------------------------------------------
 struct RandomAccessBackLog : AbstractBackLog
 {
-  explicit RandomAccessBackLog(size_t capacity) : AbstractBackLog(capacity)
+  explicit RandomAccessBackLog(size_t capacity)
+  : AbstractBackLog(capacity)
+  , m_words((capacity + 63) / 64)
+  , m_bits(m_words)
+  , m_free_count(int64_t(capacity))
   {
-    for (size_t i = 0; i < capacity; ++i)
-      m_available.insert(BaseReqID(i));
+    for (size_t w = 0; w < m_words; ++w) {
+      uint64_t mask = (w + 1) * 64 <= capacity
+        ? ~uint64_t(0)
+        : (uint64_t(1) << (capacity - w * 64)) - 1; // partial last word
+      m_bits[w].store(mask, std::memory_order_relaxed);
+    }
   }
 
   /// @brief Checkout the next available request slot to be sent to a server
@@ -243,12 +298,10 @@ struct RandomAccessBackLog : AbstractBackLog
   /// @return nullptr if the backlog is full
   Req* CheckOut(uint64_t now_us, uint32_t ttl_us, std::atomic<uint32_t>& vsn) override
   {
-    if (Full()) return nullptr;
+    auto idx = TryClaim();
+    if (!idx) return nullptr;
 
-    auto idx = *m_available.begin();
-    m_available.erase(m_available.begin());
-
-    auto& req = m_buffer[idx];
+    auto& req = m_buffer[*idx];
     req.Update(now_us, ttl_us, vsn);
     return &req;
   }
@@ -262,28 +315,80 @@ struct RandomAccessBackLog : AbstractBackLog
     if (req_id >= Capacity()) [[unlikely]]
       return nullptr;
 
-    auto [_, inserted] = m_available.insert(req_id);
-    if (!inserted) [[unlikely]]
+    if (!Release(req_id)) [[unlikely]]
       return nullptr; // double check-in
 
     return &m_buffer[req_id];
   }
 
-  bool Full()  const override { return m_available.empty(); }
-  bool Empty() const override { return m_available.size() == Capacity(); }
+  bool Full()  const override { return m_free_count.load(std::memory_order_relaxed) <= 0; }
+  bool Empty() const override { return size_t(m_free_count.load(std::memory_order_relaxed)) == Capacity(); }
 
   std::vector<ReqID> OutstandingReqIDs() const override
   {
     std::vector<ReqID> ids;
-    ids.reserve(Capacity() - m_available.size());
+    ids.reserve(Capacity() - size_t(m_free_count.load(std::memory_order_relaxed)));
     for (BaseReqID i = 0; i < Capacity(); ++i)
-      if (m_available.find(i) == m_available.end())
+      if (IsClaimed(i))
         ids.push_back(m_buffer[i].ext_req_id);
     return ids;
   }
 
 private:
-  std::set<BaseReqID> m_available;
+  // @return claimed slot index, or nullopt if full.
+  std::optional<uint32_t> TryClaim()
+  {
+    if (m_free_count.load(std::memory_order_relaxed) <= 0)
+      return std::nullopt; // O(1) fast-fail
+
+    auto start_word = m_word_cursor.fetch_add(1, std::memory_order_relaxed) % m_words;
+
+    for (size_t w = 0; w < m_words; ++w) {
+      auto widx = (start_word + w) % m_words;
+      auto& word = m_bits[widx];
+      auto snapshot = word.load(std::memory_order_relaxed);
+
+      while (snapshot != 0) {
+        auto bit  = std::countr_zero(snapshot);
+        uint64_t mask = uint64_t(1) << bit;
+        auto prev = word.fetch_and(~mask, std::memory_order_acquire);
+
+        if (prev & mask) {
+          // We actually cleared a bit that was set -- ours.
+          m_free_count.fetch_sub(1, std::memory_order_relaxed);
+          return uint32_t(widx * 64 + bit);
+        }
+        // Someone else claimed it first; retry within the same word using
+        // the bits we know are still live, without re-loading.
+        snapshot = prev & ~mask;
+      }
+    }
+
+    return std::nullopt; // free_count was stale; caller treats as "full for now"
+  }
+
+  // @return false if the slot was already free (double check-in).
+  bool Release(uint32_t idx)
+  {
+    auto& word = m_bits[idx / 64];
+    uint64_t mask = uint64_t(1) << (idx % 64);
+    auto prev = word.fetch_or(mask, std::memory_order_release);
+    if (prev & mask) [[unlikely]]
+      return false; // already free: double check-in, no-op
+    m_free_count.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+
+  bool IsClaimed(uint32_t idx) const
+  {
+    auto word = m_bits[idx / 64].load(std::memory_order_acquire);
+    return !(word & (uint64_t(1) << (idx % 64)));
+  }
+
+  size_t                              m_words;
+  std::vector<std::atomic<uint64_t>>  m_bits;
+  std::atomic<int64_t>                m_free_count;
+  std::atomic<uint64_t>                m_word_cursor{0};
 };
 
 inline AbstractBackLog* AbstractBackLog::Create(size_t capacity, bool fifo)

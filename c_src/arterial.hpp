@@ -4,10 +4,28 @@
 //-----------------------------------------------------------------------------
 /// \brief Lock-free connection pool engine backing the `arterial_nif` NIF.
 ///
-/// `ConnectionPool` owns a fixed set of `Connection`s checked out/in via a
-/// lock-free FIFO (pool_fifo.hpp), each with its own per-connection request
-/// backlog (backlog.hpp) and rate throttles (throttle.hpp). On top of that
-/// it provides:
+/// `ConnectionPool` selects `Connection`s by plain round-robin index over a
+/// fixed array -- no exclusive claim/release at all, shackle-style: many
+/// callers can be inside a checkout attempt on the SAME connection at the
+/// same time. Each `Connection` is independently safe under that via three
+/// composed lock-free pieces: a CAS-claimed bitmap backlog (backlog.hpp), a
+/// CAS-loop rate throttle (throttle.hpp), and a generation fence
+/// (connection.hpp's BumpGeneration()/TryReserve()) that prevents a new
+/// checkout from landing on a connection in the exact window between
+/// OnConnectionDown()'s outstanding-request snapshot and the socket
+/// actually closing. All three were validated standalone (correctness
+/// stress tests + ThreadSanitizer, benchmarked under concurrent load) and
+/// together (round-robin selection + all three composed, 16-thread
+/// checkout/disconnect stress test) before landing here -- see
+/// /tmp/backlogbench/ (mock_pool.hpp, test_mock_pool.cpp,
+/// bench_mock_pool.cpp) for the prototype this was ported from. This
+/// replaced an earlier design (pool_fifo.hpp's Vyukov ring buffer, removed)
+/// that gave one caller EXCLUSIVE access to a connection between checkout
+/// and checkin -- correct, but serializes all per-connection work behind
+/// the ring's claim, measured ~9x slower than this design under 16-thread
+/// contention on a small (16-connection) pool.
+///
+/// On top of selection, the pool also provides:
 ///   - an in-flight request registry and a queue-when-busy waiter registry
 ///     (both ShardedTTLMap, sharded_ttl_map.hpp) that notify a request's or
 ///     waiter's owning process if no reply/service arrives before its TTL,
@@ -29,13 +47,11 @@
 
 #include "connection.hpp"
 #include "owner_table.hpp"
-#include "pool_fifo.hpp"
 #include "sharded_ttl_map.hpp"
 #include "wait_list.hpp"
 #include <erl_nif.h>
 #include <algorithm>
 #include <atomic>
-#include <set>
 #include <vector>
 #include <memory>
 
@@ -66,7 +82,6 @@ struct AsyncCheckoutResult {
 /// a connection frees up (see CheckOutAsync(), DrainWaitList()).
 //-----------------------------------------------------------------------------
 struct ConnectionPool {
-  using PooledConnection = PooledObject<Connection>;
   using InflightEntry    = std::pair<ErlNifPid, Connection*>;
   using InflightMap      = ShardedTTLMap<ReqID, InflightEntry>;
   using WaiterMap        = ShardedTTLMap<uint64_t, ErlNifPid>;
@@ -96,8 +111,7 @@ struct ConnectionPool {
   ConnectionPool(uint32_t a_size, BaseReqID a_backlog, bool a_fifo,
                  uint64_t a_fixed_ttl_us = 0, size_t a_max_waiters = 0,
                  size_t a_ttl_shards = 0)
-  : m_scratch(MakeConnections(a_size, a_backlog, a_fifo))
-  , m_pool(m_scratch)
+  : m_conns(MakeConnections(a_size, a_backlog, a_fifo))
   , m_inflight(a_fixed_ttl_us, a_ttl_shards)
   , m_waiting(0, a_ttl_shards)
   , m_fixed_ttl_us(a_fixed_ttl_us)
@@ -323,12 +337,12 @@ struct ConnectionPool {
   /// nullptr` to skip draining the wait-list (e.g. when called from a
   /// context with no live connection's worth of capacity to offer, or
   /// where waiter notification isn't wanted).
-  void CheckIn(uint32_t id, ErlNifEnv* env = nullptr, ERL_NIF_TERM pool_name = 0)
+  /// @param id is unused by the round-robin design itself (every
+  /// connection is always selectable; there's no pool-level "return it"
+  /// step anymore) -- kept as a parameter for call-site compatibility and
+  /// because every caller already has it at hand.
+  void CheckIn(uint32_t /*id*/, ErlNifEnv* env = nullptr, ERL_NIF_TERM pool_name = 0)
   {
-    auto* node = m_pool.Get(id);
-    if (node) [[likely]]
-      m_pool.CheckIn(*node);
-
     if (env)
       DrainWaitList(env, pool_name);
   }
@@ -343,8 +357,8 @@ struct ConnectionPool {
   }
 
   /// @brief Mark a connection (by id) as available/unavailable for checkout.
-  bool MakeAvailable   (uint32_t id) { return SetAvailable(id, true);  }
-  bool MakeUnavailable (uint32_t id) { return SetAvailable(id, false); }
+  bool MakeAvailable   (uint32_t id) { return SetEnabled(id, true);  }
+  bool MakeUnavailable (uint32_t id) { return SetEnabled(id, false); }
 
   /// @brief Returns true if connection `id` currently has zero in-flight
   /// requests checked out of its backlog (i.e. safe to disconnect without
@@ -361,13 +375,13 @@ struct ConnectionPool {
   /// @brief Look up a connection by id (its index in the pool).
   Connection* Get(uint32_t id)
   {
-    auto* node = m_pool.Get(id);
-    return node ? node->Value() : nullptr;
+    return id < m_conns.size() ? m_conns[id].get() : nullptr;
   }
 
-  /// @brief Remove the next available connection from the head of the FIFO
-  /// queue whose throttles and backlog can accommodate `a_samples` new
-  /// requests, reserving `a_samples` backlog slots on it.
+  /// @brief Try every connection at most once, starting from a shared
+  /// round-robin cursor, looking for one that's enabled and whose
+  /// throttles+backlog can accommodate `a_samples` new requests; reserves
+  /// `a_samples` backlog slots on the first one that qualifies.
   /// @return {connection, reserved request ids (wire-level ext_req_id)} or
   /// {nullptr, {}} if no connection currently qualifies.
   std::pair<Connection*, std::vector<ReqID>>
@@ -554,6 +568,16 @@ struct ConnectionPool {
     if (!conn) [[unlikely]]
       return;
 
+    // Bump the generation fence BEFORE snapshotting outstanding requests:
+    // any TryReserve() that hasn't yet re-validated its captured
+    // generation will see this and unwind, so nothing committed after
+    // this point can be missing from the snapshot below (see
+    // Connection::BumpGeneration()'s doc comment). This is the load-
+    // bearing ordering that replaces today's old "make_unavailable()
+    // pulls the connection out of the pool before the snapshot" guarantee
+    // -- there's no pool-level pull anymore, only this fence.
+    conn->BumpGeneration();
+
     auto ext_ids = conn->Requests().OutstandingReqIDs();
     if (ext_ids.empty())
       return;
@@ -580,8 +604,8 @@ struct ConnectionPool {
   }
 
 private:
-  std::vector<std::unique_ptr<Connection>> m_scratch;
-  ObjectPoolFIFO<Connection>               m_pool;
+  std::vector<std::unique_ptr<Connection>> m_conns;
+  std::atomic<uint64_t>                    m_cursor{0};
   InflightMap                              m_inflight;
   WaiterMap                                m_waiting;
   uint64_t                                 m_fixed_ttl_us;
@@ -589,11 +613,12 @@ private:
   std::atomic<uint64_t>                    m_next_waiter_id{0};
   OwnerTable                                m_owners;
 
-  bool SetAvailable(uint32_t id, bool available)
+  bool SetEnabled(uint32_t id, bool enabled)
   {
-    auto* node = m_pool.Get(id);
-    return node && (available ? m_pool.MakeAvailable(*node)
-                               : m_pool.MakeUnavailable(*node));
+    auto* conn = Get(id);
+    if (!conn) [[unlikely]] return false;
+    conn->SetEnabled(enabled);
+    return true;
   }
 
   static std::vector<std::unique_ptr<Connection>>
@@ -614,47 +639,21 @@ private:
 inline std::pair<Connection*, std::vector<ReqID>>
 ConnectionPool::CheckOut(size_t a_samples, time_val a_now)
 {
-  std::set<uint32_t> tried_connections;
+  if (m_conns.empty())
+    return std::make_pair(nullptr, std::vector<ReqID>());
 
-  while (true) {
-    auto* node = m_pool.CheckOut();
+  auto now_us = uint64_t(a_now.microseconds());
+  auto start  = m_cursor.fetch_add(1, std::memory_order_relaxed) % m_conns.size();
 
-    // No available connections
-    if (!node)
-      break;
+  for (size_t i = 0; i < m_conns.size(); ++i) {
+    auto* conn = m_conns[(start + i) % m_conns.size()].get();
 
-    auto* conn = node->Value();
+    if (!conn->Enabled())
+      continue;
 
-    // Check throttles: all must currently have room for a_samples
-    size_t pass_throttle = 0;
-    for (auto& t : conn->Throttles()) {
-      if (t.available(a_now) < a_samples) break;
-      ++pass_throttle;
-    }
-
-    // If all throttles pass, check if we have enough free requests left
-    // in the backlog of the selected connection. If so, we found the one
-    // that can be used
-    if (pass_throttle == conn->ThrottlesCount()) {
-      auto [success, ids] = conn->Requests().UnsafeReserve(a_samples, a_now.microseconds());
-
-      if (success) {
-        for (auto& t : conn->Throttles())
-          t.add(a_samples, a_now);
-        return std::make_pair(conn, std::move(ids));
-      }
-    }
-
-    // Did we make a full circle and unsuccessfully tried all connections?
-    if (tried_connections.find(conn->ID()) != tried_connections.end()) [[unlikely]] {
-      m_pool.CheckIn(*node);
-      break;
-    }
-
-    tried_connections.insert(conn->ID());
-
-    // Return the connection to the end of the pool and try the next one
-    m_pool.CheckIn(*node);
+    auto [success, ids] = conn->TryReserve(a_samples, now_us);
+    if (success)
+      return std::make_pair(conn, std::move(ids));
   }
 
   return std::make_pair(nullptr, std::vector<ReqID>());
