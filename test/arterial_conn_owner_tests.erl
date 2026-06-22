@@ -174,7 +174,9 @@ cast_mixed_with_concurrent_call_test() ->
 %% Killing the owner process mid-flight must fail the in-flight caller
 %% fast (not hang), and the connection must come back fully usable once
 %% the supervisor restarts the owner and arterial_connection republishes
-%% the live socket to it.
+%% the live socket to it. Relies on `monitor_owner_calls => true` (the
+%% default -- see `arterial_pool:options/0`), which `setup/2,3` doesn't
+%% override.
 owner_crash_resilience_test() ->
   {Srv, SupPid} = setup(1, 1),
   try

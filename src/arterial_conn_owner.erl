@@ -203,16 +203,27 @@ hot-path (each fires at most once per (re)connect, or once per
 fire-and-forget request, neither of which approaches `send_recv/4`'s
 volume).
 
-Unlike shackle, this still arms a `monitor(process, Owner)` for the
-duration of the call (one extra ETS-table entry, not a full
-`gen_server:call/3`): the owner crashing mid-flight must fail this
-caller promptly rather than have it sit out the full `Timeout` waiting
-for a reply that can now never arrive -- `arterial_conn_owner_tests`'s
-`owner_crash_resilience_test` pins this down. `shackle` itself doesn't
-bother (a dead `shackle_server` just times out its callers), but the
-monitor's one-time setup/teardown cost is negligible next to
-`gen_server:call/3`'s per-message wrapping, so there's no reason to give
-up this fail-fast property to get the bulk of the speedup.
+Also arms a `monitor(process, Owner)` for the duration of the call, so
+the owner crashing mid-flight fails this caller promptly (typically
+within however long the supervisor takes to restart it) instead of
+silently sitting out the full `Timeout`. This was made configurable
+(`monitor_owner_calls => false`) in an earlier version of this function,
+to shave the `erlang:monitor/2`/`erlang:demonitor/2` overhead `eprof`
+measured on a backlog=1 benchmark -- reverted: `false` made ANY
+retry-loop caller dangerous, not just slower. Once `whereis/1` above
+resolves to a (possibly about-to-crash) owner pid, an unmonitored
+`send_recv` has no way to distinguish "the owner is alive and working on
+it" from "the owner just died and nothing will ever reply" until
+`Timeout + 5000` elapses -- so a caller that retries on failure (a normal
+pattern, e.g. this module's own test suite's `wait_until_owner_usable/1`
+needed reworking around exactly this once `false` was in play) could
+turn a brief, expected owner-restart window into a multi-second stall
+per attempt instead of a fast, cheap failure. The monitor's setup/
+teardown cost is real but small next to that risk; keep it unconditional.
+`clear_socket/2`, `set_socket/4`, and `send/3` stay on `gen_server:call/2,3`
+since none of them are hot-path (each fires at most once per (re)connect,
+or once per fire-and-forget request, neither of which approaches
+`send_recv/4`'s volume).
 """.
 -spec send_recv(arterial_pool:name(), non_neg_integer(), term(), timeout()) ->
   {ok, term()} | {error, term()}.
