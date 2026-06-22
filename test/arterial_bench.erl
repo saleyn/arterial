@@ -60,7 +60,7 @@ real Erlang syntax (e.g. a binary), pass a map literal directly --
 detected by a leading `#{` and passed through as-is:
 
 ```
-$ make bench BENCH_OPTS='pool_size=16, duration_s=10'
+$ make bench BENCH_OPTS='pool_size=16 duration_s=10'
 $ make bench BENCH_OPTS='#{pool_size => 16, payload => <<"hi">>}'
 ```
 """.
@@ -148,8 +148,9 @@ help() ->
     "  4> arterial_bench:bench(#{backoff => {backoff, 100, 5000}}).~n"
     "~n"
     "  $ make bench~n"
-    "  $ make bench-shackle BENCH_OPTS='pool_size=16, duration_s=10'~n"
-    "  $ make bench BENCH_OPTS='pool_size=16, duration_s=10'~n"
+    "  $ make bench-shackle BENCH_OPTS='pool_size=16 duration_s=10'~n"
+    "  $ make bench-poolboy BENCH_OPTS='pool_size=16 duration_s=10'~n"
+    "  $ make bench BENCH_OPTS='pool_size=16 duration_s=10'~n"
     "  $ make bench BENCH_OPTS='#{pool_size => 16, duration_s => 10}'~n"
   ),
   ok.

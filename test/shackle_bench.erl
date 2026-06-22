@@ -65,8 +65,8 @@ Options mirror `arterial_bench:opts/0` wherever the same concept applies
 and `make bench-shackle` results line up directly:
 
 ```
-$ make bench          BENCH_OPTS='pool_size=16, duration_s=10'
-$ make bench-shackle  BENCH_OPTS='pool_size=16, duration_s=10'
+$ make bench          BENCH_OPTS='pool_size=16 duration_s=10'
+$ make bench-shackle  BENCH_OPTS='pool_size=16 duration_s=10'
 ```
 """.
 
@@ -149,7 +149,7 @@ help() ->
     "  4> shackle_bench:bench(#{mode => async}).~n"
     "~n"
     "  $ make bench-shackle~n"
-    "  $ make bench-shackle BENCH_OPTS='pool_size=16, duration_s=10'~n"
+    "  $ make bench-shackle BENCH_OPTS='pool_size=16 duration_s=10'~n"
   ),
   ok.
 
