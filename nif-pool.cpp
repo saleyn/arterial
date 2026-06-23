@@ -3,7 +3,7 @@
 #include <vector>
 #include <unistd.h>
 #include <sys/uio.h>
-#include <sys/ioctl.h> // Required for FIONREAD ioctl calls
+#include <sys/ioctl.h>
 #include <bit>
 #include <errno.h>
 #include <fcntl.h>
@@ -23,7 +23,8 @@ struct alignas(64) ConnSlot {
     unsigned int stripe_id{0};
     unsigned int slot_id{0};
     
-    ErlNifPid client_pid;
+    // Static owner process responsible for routing inbound packets
+    ErlNifPid owner_pid;
 
     std::vector<char> pending_buffer;
     size_t bytes_written{0};
@@ -83,7 +84,6 @@ void write_ready_callback(ErlNifEnv* env, void* obj, int fd, int is_ready) {
     }
 }
 
-// Optimization: Exact-Allocation Read Pipeline (No Reallocations)
 void read_ready_callback(ErlNifEnv* env, void* obj, int fd, int is_ready) {
     PoolContext* ctx = static_cast<PoolContext*>(obj);
     if (fd < 0 || static_cast<size_t>(fd) >= ctx->fd_map.size()) [[unlikely]] return;
@@ -91,18 +91,14 @@ void read_ready_callback(ErlNifEnv* env, void* obj, int fd, int is_ready) {
     ConnSlot* slot = ctx->fd_map[fd];
     if (!slot || slot->status.load(std::memory_order_relaxed) == SLOT_EMPTY) [[unlikely]] return;
 
-    // 1. Query the OS kernel to find the exact byte length pending in the ring buffer
     int bytes_available = 0;
     if (ioctl(fd, FIONREAD, &bytes_available) == -1 || bytes_available <= 0) {
-        // If ioctl fails or returns 0 bytes on a read-ready trigger, it means EOF/Disconnect
         goto handle_disconnect;
     }
 
-    // 2. Allocate an Erlang binary to match the exact size needed
     ErlNifBinary bin;
     if (!enif_alloc_binary(static_cast<size_t>(bytes_available), &bin)) [[unlikely]] return;
 
-    // 3. Read straight into the perfectly-sized binary space
     ssize_t n = read(fd, bin.data, bytes_available);
 
     if (n <= 0) {
@@ -111,7 +107,7 @@ void read_ready_callback(ErlNifEnv* env, void* obj, int fd, int is_ready) {
         goto handle_disconnect;
     }
 
-    // 4. Zero-Copy Broadcast Directly into the Client's Mailbox
+    // Always deliver straight to the static socket owner process
     ErlNifEnv* msg_env = enif_alloc_env();
     ERL_NIF_TERM bin_term = enif_make_binary(msg_env, &bin);
     ERL_NIF_TERM msg = enif_make_tuple3(msg_env, 
@@ -120,18 +116,17 @@ void read_ready_callback(ErlNifEnv* env, void* obj, int fd, int is_ready) {
         bin_term
     );
 
-    enif_send(nullptr, &(slot->client_pid), msg_env, msg);
+    enif_send(nullptr, &(slot->owner_pid), msg_env, msg);
     enif_free_env(msg_env);
     return;
 
 handle_disconnect:
-    // Handle remote host disconnect teardown cleanly
     ErlNifEnv* msg_env = enif_alloc_env();
     ERL_NIF_TERM closed_msg = enif_make_tuple2(msg_env, 
         enif_make_atom(msg_env, "tcp_closed"), 
         enif_make_uint(msg_env, slot->slot_id)
     );
-    enif_send(nullptr, &(slot->client_pid), msg_env, closed_msg);
+    enif_send(nullptr, &(slot->owner_pid), msg_env, closed_msg);
     enif_free_env(msg_env);
 
     {
@@ -194,12 +189,12 @@ static ERL_NIF_TERM register_socket_nif(ErlNifEnv* env, int argc, const ERL_NIF_
     PoolContext* ctx;
     unsigned int stripe_id;
     int raw_fd;
-    ErlNifPid client_pid;
+    ErlNifPid owner_pid;
 
     if (!enif_get_resource(env, argv[0], POOL_RES_TYPE, (void**)&ctx) ||
         !enif_get_uint(env, argv[1], &stripe_id) ||
         !enif_get_int(env, argv[2], &raw_fd) || raw_fd < 0 ||
-        !enif_get_local_pid(env, argv[3], &client_pid)) {
+        !enif_get_local_pid(env, argv[3], &owner_pid)) {
         return enif_make_badarg(env);
     }
 
@@ -221,7 +216,7 @@ static ERL_NIF_TERM register_socket_nif(ErlNifEnv* env, int argc, const ERL_NIF_
         auto& slot = stripe.slots[slot_id];
         if (slot.fd == -1) {
             slot.fd = raw_fd;
-            slot.client_pid = client_pid;
+            slot.owner_pid = owner_pid;
             slot.status.store(SLOT_AVAILABLE, std::memory_order_relaxed);
             
             {
@@ -360,7 +355,7 @@ static int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
 
 static ErlNifFunc nif_funcs[] = {
     {"init_pool", 2, init_pool_nif},
-    {"register_socket", 4, register_socket_nif}, 
+    {"register_socket", 4, register_socket_nif}, // Arity 4
     {"send_and_release", 3, send_and_release_nif}
 };
 
