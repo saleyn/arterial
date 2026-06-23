@@ -22,7 +22,7 @@ class RequestInfo {
 public:
 
   BaseReqID req_id;             // Internal request ID
-  ReqID     ext_req_id;         // External last assigned semi-unique request ID 
+  ReqID     ext_req_id;         // External last assigned semi-unique request ID
   uint64_t  ts_create;
   uint64_t  ts_expire;
   ErlNifPid pid;
@@ -35,7 +35,7 @@ public:
     ts_expire  = ts_create + ttl_us;
   }
 
-  static BaseReqID DecodeReqID(ReqID id) { return id & s_lo_mask; }
+  static BaseReqID DecodeReqID(ReqID ext_req_id) { return ext_req_id & s_lo_mask; }
 };
 
 //-----------------------------------------------------------------------------
@@ -53,7 +53,7 @@ struct RandomAccessBackLog;
 ///
 /// It should be used in cases when the wire-level protocol doesn't support
 /// passing a request ID in a request/reply, and the request/reply order is
-/// strictly FIFO. 
+/// strictly FIFO.
 //-----------------------------------------------------------------------------
 struct FIFOBackLog : protected AbstractBackLog
 {
@@ -76,13 +76,19 @@ struct FIFOBackLog : protected AbstractBackLog
   }
 
   /// @brief Pop the head item from the backlog.
-  /// NOTE: The FIFO backlog is used when the wire protocol doesn't support 
+  /// NOTE: The FIFO backlog is used when the wire protocol doesn't support
   /// passing request IDs to the server and back. It's expected that the replies
   /// to requests are in the FIFO order, so we don't need to check the ReqID,
   /// because the client doesn't know it, and it's inferred from the backlog's
-  /// queue.  
+  /// queue.
   /// @return nullptr if the queue is empty
   Req* CheckIn(ReqID) override { return this->Dequeue(); }
+
+  /// @brief Update the backlog by purging expired items
+  size_t Update(time_val now = time_val::universal_time()) override
+  {
+
+  }
 
   bool Full()  const override { return IsFull();  }
   bool Empty() const override { return BaseT::Empty(); }
@@ -100,6 +106,11 @@ private:
 //-----------------------------------------------------------------------------
 struct RandomAccessBackLog : protected AbstractBackLog
 {
+  struct TTLInfo {
+    ReqID    ext_req_id;
+    uint64_t expiration;  // Microseconds since epoch
+  };
+
   explicit RandomAccessBackLog(size_t capacity) : AbstractBackLog(capacity) {}
 
   /// @brief Checkout the next available request from the backlog's capacity
@@ -110,12 +121,17 @@ struct RandomAccessBackLog : protected AbstractBackLog
   Req* CheckOut(time_val now, uint32_t ttl_us, uint32_t& vsn) override
   {
     if (Empty()) return nullptr;
-    
+
     auto idx = *m_available.begin();
-    m_available.erase(m_available.begin());
+
+    m_available.erase(m_available.begin()); // Remove the next available request
+    m_used.emplace(idx);                    // Add it to the "used" set
 
     auto res = &this->m_buffer[idx];
     res->Update(now, ttl_us, vsn);
+
+    m_queue.push_back(TTLInfo{res->ext_req_id, res->ts_expire));
+
     return res;
   }
 
@@ -129,17 +145,39 @@ struct RandomAccessBackLog : protected AbstractBackLog
 
     m_available.insert(req_id);
 
-    return &this->m_buffer[req_id];
+    return m_used.erase(req_id) ? &this->m_buffer[req_id] : nullptr;
+  }
+
+  /// @brief Update the backlog by purging expired items
+  /// @return the number of purged items
+  size_t Update(time_val now = time_val::universal_time()) override
+  {
+    uint64_t expire = now.microseconds();
+    size_t   result = 0;
+
+    for (auto it = m_queue.begin(); it != m_queue.end(); it = m_queue.begin()) {
+      if ((*it).expiration > expire)
+        break;
+
+      if (CheckIn((*it).ext_req_id))
+        ++result;
+
+      m_queue.pop_front();
+    }
+
+    return result;
   }
 
   bool Full()  const override { return m_available.empty(); }
   bool Empty() const override { return m_available.size() == BaseT::Size(); }
 private:
-  std::set<BaseReqID> m_available;
+  std::set<BaseReqID>           m_available;
+  std::unordered_set<BaseReqID> m_used;
+  std::list<TTLInfo>            m_queue;
 };
 
 //-----------------------------------------------------------------------------
-/// @brief BackLog maintains a backlog of used requests in FIFO order 
+/// @brief BackLog maintains a backlog of used requests in FIFO order
 //-----------------------------------------------------------------------------
 struct AbstractBackLog : protected BaseCircularBuffer<RequestInfo, false>
 {
@@ -164,13 +202,16 @@ protected:
   /// @brief Checkout the next available request from the backlog to be sent
   /// to a server for processing.
   /// When reply is received, use CheckIn() function to added it back to the
-  /// backlog. 
+  /// backlog.
   /// @return nullptr if the backlog is empty
   virtual Req* CheckOut(time_val now, uint32_t ttl_us, uint32_t& vsn) = 0;
 
   /// @brief CheckIn a previously checked out request back to the pool.
   /// @return nullptr if unsuccessful
   virtual Req* CheckIn(ReqID ext_req_id) = 0;
+
+  /// @brief Update the backlog by purging expired items
+  virtual size_t Update(time_val now = time_val::universal_time()) = 0;
 
   Req&       operator[](size_t i)       { assert(i < m_buffer.size()); return m_requests[i]; }
   const Req& operator[](size_t i) const { assert(i < m_buffer.size()); return m_requests[i]; }
@@ -219,7 +260,7 @@ struct BaseCircularBuffer
 
   /// @brief Resize the buffer to the given capacity, and initialize items
   ///        using given `init` initialization lambda.
-  /// @param capacity  new buffer capacity 
+  /// @param capacity  new buffer capacity
   /// @param init      the lambda initializer `(size_t i, T& item) -> void`
   template <typename InitFun>
   void Resize(size_t capacity, InitFun init)
@@ -232,7 +273,7 @@ struct BaseCircularBuffer
     else if (Init)
       for (auto i = 0u; i < m_buffer.size(); ++i)
         m_buffer[i] = T();
-      
+
     m_head = m_tail = 0;
   }
 
@@ -241,8 +282,8 @@ protected:
   template <typename Fun>
   Req* Enqueue(Fun const& fun)
   {
-    if (Full()) [[unlikely]]
-      return false;
+    if (Full())
+      return nullptr;
 
     auto& req = m_buffer[m_tail];
     fun(req);  // insert item at back of buffer
@@ -265,12 +306,15 @@ protected:
     return p;
   }
 
+  Req const* Peek()  const { return Empty() ? nullptr : &m_buffer[m_head]; }
+  Req*       Peek()        { return Empty() ? nullptr : &m_buffer[m_head]; }
+
   /// @brief Return the front item (only valid if buffer is not empty)
-  const T& Front() const { return m_buffer[m_head]; }
-  T&       Front()       { return m_buffer[m_head]; }
+  const T&   Front() const { return m_buffer[m_head]; }
+  T&         Front()       { return m_buffer[m_head]; }
   /// @brief Return the back item (only valid if buffer is not empty)
-  const T& Back()  const { return m_buffer[(m_tail ? m_tail : m_buffer.size())-1]; }
-  T&       Back()        { return m_buffer[(m_tail ? m_tail : m_buffer.size())-1]; }
+  const T&   Back()  const { return m_buffer[(m_tail ? m_tail : m_buffer.size())-1]; }
+  T&         Back()        { return m_buffer[(m_tail ? m_tail : m_buffer.size())-1]; }
 
 protected:
   std::vector<T> m_buffer;

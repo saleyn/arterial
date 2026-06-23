@@ -72,6 +72,8 @@ struct time_val {
   time_val& add_nsec(long ns)         { m_tv += ns;        return *this; }
   time_val  add_nsec(long ns)   const { return time_val(m_tv + ns);      }
 
+  time_val& add_usec(long us)         { m_tv += us * 1000; return *this; }
+  time_val  add_usec(long us)   const { return time_val(m_tv + us*1000); }
 
   void now() { m_tv = universal_time().m_tv; }
 
