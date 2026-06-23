@@ -360,3 +360,131 @@ static ErlNifFunc nif_funcs[] = {
 };
 
 ERL_NIF_INIT(my_nif_pool, nif_funcs, load, nullptr, nullptr, nullptr)
+
+
+
+
+
+
+
+
+-module(my_nif_pool).
+
+%% API Exports
+-export([init/0, init_pool/2, register_socket/4, send_and_release/3]).
+-export([create_routing_table/0, call/5, start_owner/3]).
+
+%% Internal Thread Loops
+-export([owner_loop/1]).
+
+-on_load(init/0).
+
+-define(APPNAME, my_nif_pool).
+-define(LIBNAME, "nif_pool").
+-define(TABLE, multiplex_routing_table).
+
+%% ===================================================================
+%% Startup & Core Low-Level NIF Setup
+%% ===================================================================
+
+init() ->
+    SoName = case code:priv_dir(?APPNAME) of
+        {error, bad_name} ->
+            case code:which(?MODULE) of
+                Filename when is_list(Filename) ->
+                    filename:join([filename:dirname(Filename), "../priv", ?LIBNAME]);
+                _ ->
+                    filename:join(["../priv", ?LIBNAME])
+            end;
+        Dir ->
+            filename:join(Dir, ?LIBNAME)
+    end,
+    erlang:load_nif(SoName, 0).
+
+init_pool(_Stripes, _SlotsPerStripe) -> erlang:nif_error(nif_not_loaded).
+register_socket(_PoolRef, _StripeId, _RawFd, _OwnerPid) -> erlang:nif_error(nif_not_loaded).
+send_and_release(_PoolRef, _StripeId, _DataList) -> erlang:nif_error(nif_not_loaded).
+
+%% ===================================================================
+%% High-Level Orchestration Extensions
+%% ===================================================================
+
+%% @doc Pre-allocates the global, lock-free concurrency ETS routing graph.
+-spec create_routing_table() -> atom().
+create_routing_table() ->
+    ets:new(?TABLE, [
+        set, 
+        public, 
+        named_table,
+        {read_concurrency, true}, 
+        {write_concurrency, true}
+    ]),
+    ?TABLE.
+
+%% @doc Spawns a dedicated, isolated background process owner for a single pool socket.
+-spec start_owner(PoolRef :: reference(), StripeId :: integer(), RawFd :: integer()) -> {ok, pid()}.
+start_owner(PoolRef, StripeId, RawFd) ->
+    Pid = spawn_link(?MODULE, owner_loop, [undefined]),
+    {ok, SlotId} = register_socket(PoolRef, StripeId, RawFd, Pid),
+    Pid ! {assign_slot_id, SlotId},
+    {ok, Pid}.
+
+%% @doc Executes a highly multiplexed call bypassing the socket owner on write.
+%% Automatically logs correlation IDs in the public ETS mapping for O(1) response handling.
+-spec call(PoolRef :: reference(), StripeId :: integer(), CorrelationId :: integer(), Payload :: [binary()], Timeout :: integer()) ->
+    {ok, ReplyData :: binary()} | {error, any()}.
+call(PoolRef, StripeId, CorrelationId, Payload, Timeout) ->
+    %% 1. Lock down the transaction routing destination inside public ETS space
+    ets:insert(?TABLE, {CorrelationId, self()}),
+    
+    %% 2. Fast-path direct non-blocking write call
+    case send_and_release(PoolRef, StripeId, Payload) of
+        ok ->
+            %% 3. Wait for our specific correlated response block
+            receive
+                {multiplex_reply, CorrelationId, ReplyData} ->
+                    {ok, ReplyData};
+                {multiplex_error, CorrelationId, Reason} ->
+                    {error, Reason}
+            after Timeout ->
+                ets:delete(?TABLE, CorrelationId),
+                {error, timeout}
+            end;
+        Error ->
+            ets:delete(?TABLE, CorrelationId),
+            Error
+    end.
+
+%% ===================================================================
+%% Background Owner Loop Processes
+%% ===================================================================
+
+owner_loop(SlotId) ->
+    receive
+        {assign_slot_id, AssignedId} ->
+            owner_loop(AssignedId);
+
+        %% Fired directly from C++ read_ready_callback
+        {tcp_data, SlotId, RawBinary} ->
+            %% protocol parsing: Extract your Correlation ID out of the packet header.
+            %% Example: Assumes the first 4 bytes (Big-Endian integer) contains the ID.
+            <<CorrelationId:32, ActualPayload/binary>> = RawBinary,
+            
+            %% Look up the client PID that registered this correlation ID
+            case ets:lookup(?TABLE, CorrelationId) of
+                [{CorrelationId, ClientPid}] ->
+                    ets:delete(?TABLE, CorrelationId),
+                    ClientPid ! {multiplex_reply, CorrelationId, ActualPayload};
+                [] ->
+                    %% Timeout or late payload arrival
+                    ok
+            end,
+            owner_loop(SlotId);
+
+        %% Fired directly from C++ if the connection fails or drops
+        {tcp_closed, SlotId} ->
+            %% Connection died. Broadcast failure notifications to waiting processes if necessary.
+            ok
+    end.
+
+
