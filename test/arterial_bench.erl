@@ -269,7 +269,15 @@ setup(PoolSize, Backlog, Fifo, Mode, Backoff, ExternalServer) ->
 
 teardown({Srv, SupPid}, Mode) ->
   Mode =:= async andalso arterial_async_driver:stop(?POOL),
-  ok = supervisor:stop(SupPid),
+  case is_process_alive(SupPid) of
+    true ->
+      case supervisor:stop(SupPid) of
+        ok -> ok;
+        {error, not_found} -> ok;
+        Other -> error({supervisor_stop_failed, Other})
+      end;
+    false -> ok
+  end,
   try arterial_nif:destroy(?POOL) catch _:_ -> ok end,
   bench_external_server:stop(Srv).
 
