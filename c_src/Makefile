@@ -41,6 +41,10 @@ SRC         := arterial.cpp
 OBJ         := $(OBJ_DIR)/arterial.o
 TARGET      := $(PRIV_DIR)/arterial$(EXT)
 
+POOL_SRC    := arterial_nif_pool.cpp
+POOL_OBJ    := $(OBJ_DIR)/arterial_nif_pool.o
+POOL_TARGET := $(PRIV_DIR)/nif_pool$(EXT)
+
 TEST_OBJ    := $(OBJ_DIR)/test_pool.o
 TEST_TARGET  = $(TEST_DIR)/test_pool
 
@@ -59,15 +63,21 @@ else
   CXXFLAGS += -O3 -DNDEBUG -march=native -mtune=native
 endif
 
-all: $(TARGET) $(TEST_TARGET)
+all: $(TARGET) $(POOL_TARGET) $(TEST_TARGET)
 
 $(TARGET): $(OBJ) | $(PRIV_DIR)
+	$(CXX) $(LDFLAGS) $(SHARED_LDFLAGS) -I$(ERL_INC) -o $@ $<
+
+$(POOL_TARGET): $(POOL_OBJ) | $(PRIV_DIR)
 	$(CXX) $(LDFLAGS) $(SHARED_LDFLAGS) -I$(ERL_INC) -o $@ $<
 
 $(TEST_TARGET): $(TEST_OBJ) | $(TEST_DIR)
 	$(CXX) $(LDFLAGS) -I$(ERL_INC) -o $@ $<
 
 $(OBJ): $(SRC) $(wildcard *.hpp) enif.hpp | $(OBJ_DIR)
+	$(CXX) -c $(CXXFLAGS) -o $@ $<
+
+$(POOL_OBJ): $(POOL_SRC) enif.hpp | $(OBJ_DIR)
 	$(CXX) -c $(CXXFLAGS) -o $@ $<
 
 $(TEST_OBJ) : test_pool.cpp pool_fifo.hpp enif.hpp | $(OBJ_DIR)
@@ -87,4 +97,4 @@ enif.hpp:
 	curl -s -O https://raw.githubusercontent.com/saleyn/nifpp/main/enif.hpp
 
 clean:
-	rm -f *.o $(TEST_DIR)/test_pool $(PRIV_DIR)/arterial.so $(OBJ_DIR)/*.o
+	rm -f *.o $(TEST_DIR)/test_pool $(PRIV_DIR)/arterial.so $(PRIV_DIR)/nif_pool.so $(OBJ_DIR)/*.o

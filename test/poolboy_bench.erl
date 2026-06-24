@@ -71,7 +71,8 @@ $ make bench-poolboy   BENCH_OPTS='pool_size=16 duration_s=10'
   pool_strategy => fifo | lifo,
   workers      => pos_integer(),
   duration_s   => pos_integer(),
-  payload      => binary()
+  payload      => binary(),
+  external_server => boolean()
 }.
 
 -define(POOL, poolboy_bench_pool).
@@ -106,6 +107,13 @@ help() ->
     "                   How long to hammer the pool, in seconds.~n"
     "  payload       => binary()  (default: a short fixed binary)~n"
     "                   The {echo, Payload} request body sent on every call.~n"
+    "  external_server => boolean()  (default: false)~n"
+    "                   false: test_tcp_server runs in this VM, same as~n"
+    "                   calling it directly. true: runs it as a standalone~n"
+    "                   child erl node instead -- see~n"
+    "                   bench_external_server's moduledoc for why (keeps~n"
+    "                   test_tcp_server's per-request spawn/1 out of a~n"
+    "                   perf profile taken on this VM).~n"
     "~n"
     "Passing an unrecognized option key raises~n"
     "{unrecognized_bench_opts, Keys} instead of silently ignoring it.~n"
@@ -134,7 +142,8 @@ bench(Opts) ->
     %% idle), same default rationale as arterial_bench:bench/1.
     workers       => PoolSize0,
     duration_s    => 5,
-    payload       => <<"the quick brown fox jumps over the lazy dog">>
+    payload       => <<"the quick brown fox jumps over the lazy dog">>,
+    external_server => false
   },
   case maps:keys(maps:without(maps:keys(Defaults), Opts)) of
     [] -> ok;
@@ -145,10 +154,11 @@ bench(Opts) ->
     pool_strategy := PoolStrategy,
     workers       := Workers,
     duration_s    := DurationS,
-    payload       := Payload
+    payload       := Payload,
+    external_server := ExternalServer
   } = maps:merge(Defaults, Opts),
 
-  {Srv, PoolPid} = setup(PoolSize, PoolStrategy),
+  {Srv, PoolPid} = setup(PoolSize, PoolStrategy, ExternalServer),
   try
     DurationMs = DurationS * 1000,
     Parent = self(),
@@ -172,9 +182,9 @@ bench(Opts) ->
 %%% Internal functions
 %%%-----------------------------------------------------------------------------
 
-setup(PoolSize, PoolStrategy) ->
-  {ok, Srv} = test_tcp_server:start(0),
-  Port = test_tcp_server:port(Srv),
+setup(PoolSize, PoolStrategy, ExternalServer) ->
+  Srv = bench_external_server:start(ExternalServer),
+  Port = bench_external_server:port(Srv),
   PoolArgs = [
     {name, {local, ?POOL}},
     {worker_module, poolboy_echo_worker},
@@ -188,7 +198,7 @@ setup(PoolSize, PoolStrategy) ->
 
 teardown(Srv, PoolPid) ->
   ok = poolboy:stop(PoolPid),
-  test_tcp_server:stop(Srv).
+  bench_external_server:stop(Srv).
 
 %% Mirrors arterial_bench:worker_loop/5 and shackle_bench:worker_loop/5:
 %% hammer requests back-to-back until Deadline, recording wall-clock
