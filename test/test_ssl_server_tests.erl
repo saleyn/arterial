@@ -43,8 +43,16 @@ setup(Size) ->
   end.
 
 teardown({Srv, SupPid}) ->
-  ok = supervisor:stop(SupPid),
-  ok = arterial_nif:destroy(ssl_echo_pool),
+  case is_process_alive(SupPid) of
+    true ->
+      case supervisor:stop(SupPid) of
+        ok -> ok;
+        {error, not_found} -> ok;
+        Other -> error({supervisor_stop_failed, Other})
+      end;
+    false -> ok
+  end,
+  try arterial_nif:destroy(ssl_echo_pool) catch _:_ -> ok end,
   test_ssl_server:stop(Srv).
 
 %% Same retry/checkout-then-checkin idiom as test_tcp_server_tests --

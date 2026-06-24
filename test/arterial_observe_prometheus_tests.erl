@@ -39,8 +39,16 @@ setup() ->
   end.
 
 teardown({Srv, SupPid}) ->
-  ok = supervisor:stop(SupPid),
-  ok = arterial_nif:destroy(?POOL),
+  case is_process_alive(SupPid) of
+    true ->
+      case supervisor:stop(SupPid) of
+        ok -> ok;
+        {error, not_found} -> ok;
+        Other -> error({supervisor_stop_failed, Other})
+      end;
+    false -> ok
+  end,
+  try arterial_nif:destroy(?POOL) catch _:_ -> ok end,
   test_tcp_server:stop(Srv).
 
 wait_until_available(_Pool, 0, _Retries) ->

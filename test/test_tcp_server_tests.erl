@@ -46,8 +46,16 @@ setup(Size) ->
   end.
 
 teardown({Srv, SupPid}) ->
-  ok = supervisor:stop(SupPid),
-  ok = arterial_nif:destroy(tcp_echo_pool),
+  case is_process_alive(SupPid) of
+    true ->
+      case supervisor:stop(SupPid) of
+        ok -> ok;
+        {error, not_found} -> ok;
+        Other -> error({supervisor_stop_failed, Other})
+      end;
+    false -> ok
+  end,
+  try arterial_nif:destroy(tcp_echo_pool) catch _:_ -> ok end,
   test_tcp_server:stop(Srv).
 
 %% Block until all `N' connections of `Pool' have (re)connected, by
@@ -240,8 +248,11 @@ tcp_multi_address_failover_test() ->
     wait_until_available(tcp_echo_pool, 1, 100),
     {ok, hello} = arterial_client:call(tcp_echo_pool, {echo, hello}, 1000)
   after
-    supervisor:stop(SupPid),
-    arterial_nif:destroy(tcp_echo_pool),
+    case is_process_alive(SupPid) of
+      true -> supervisor:stop(SupPid);
+      false -> ok
+    end,
+    try arterial_nif:destroy(tcp_echo_pool) catch _:_ -> ok end,
     test_tcp_server:stop(Srv)
   end.
 
@@ -276,7 +287,10 @@ tcp_multi_address_per_entry_port_test() ->
     wait_until_available(tcp_echo_pool, 1, 100),
     {ok, hello} = arterial_client:call(tcp_echo_pool, {echo, hello}, 1000)
   after
-    supervisor:stop(SupPid),
-    arterial_nif:destroy(tcp_echo_pool),
+    case is_process_alive(SupPid) of
+      true -> supervisor:stop(SupPid);
+      false -> ok
+    end,
+    try arterial_nif:destroy(tcp_echo_pool) catch _:_ -> ok end,
     test_tcp_server:stop(Srv)
   end.
