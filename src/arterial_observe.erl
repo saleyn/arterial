@@ -114,7 +114,7 @@ Perform finalization of an observability component.
 """.
 -callback stop() -> ok.
 
--export([start_link/2, span/3, event/2, event/3]).
+-export([start_link/2, span/3, event/2, event/3, enabled/0]).
 
 -doc """
 Start (and register locally as `?MODULE`) the singleton process that owns
@@ -218,6 +218,18 @@ span(EventNameSuffix, StartMetadata, Fun) when is_list(EventNameSuffix), is_func
         erlang:raise(Class, Reason, Stacktrace)
       end
   end.
+
+-doc """
+Whether an observability backend is currently configured. Callers on a
+hot path (e.g. `arterial_client2:call/3,2`) can check this first to skip
+building `span/3`'s metadata map and closure entirely when there's no
+backend to receive them -- `span/3` itself only skips the *event
+emission* cost in that case, not the construction cost its caller
+already paid to produce the arguments.
+""".
+-spec enabled() -> boolean().
+enabled() ->
+  backend() =/= nil.
 
 -doc "Equivalent to `event/3` with `Measurements = #{}`.".
 -spec event([atom()], map()) -> ok.

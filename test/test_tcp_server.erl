@@ -82,6 +82,7 @@ accept_loop(LSock, ListenPort, Conns) ->
         %% hand ownership to the long-lived connection process *before*
         %% this one-shot acceptor exits, or ASock gets closed right away.
         ConnPid = spawn(fun() -> conn_recv_loop(ASock, <<>>) end),
+        ok = socket:setopt(ASock, tcp, nodelay, true),
         ok = socket:setopt(ASock, otp, controlling_process, ConnPid),
         Self ! {self(), accepted, ConnPid};
       {error, Reason} ->

@@ -76,7 +76,7 @@ init([]) ->
       telemetry             -> {arterial_observe_telemetry,   #{}};
       {prometheus, Opts}    -> {arterial_observe_prometheus, Opts};
       {telemetry,  Opts}    -> {arterial_observe_telemetry,  Opts};
-      undefined             -> {nil, []};
+      undefined             -> {undefined, []};
       Mod when is_atom(Mod) -> {Mod, []};
       {Mod, Opts} when is_atom(Mod) -> {Mod, Opts}
     end,

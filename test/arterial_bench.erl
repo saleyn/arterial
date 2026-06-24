@@ -75,7 +75,8 @@ $ make bench BENCH_OPTS='#{pool_size => 16, payload => <<"hi">>}'
   duration_s => pos_integer(),
   payload    => binary(),
   fifo       => boolean(),
-  backoff    => arterial_connection:reconnect_time()
+  backoff    => arterial_connection:reconnect_time(),
+  external_server => boolean()
 }.
 
 -define(POOL, arterial_bench_pool).
@@ -140,6 +141,13 @@ help() ->
     "                reconnect_time -- either a fixed non_neg_integer()~n"
     "                delay, or {backoff, Min, Max} for exponential~n"
     "                backoff between reconnect attempts.~n"
+    "  external_server => boolean()  (default: false)~n"
+    "                false: test_tcp_server runs in this VM, same as~n"
+    "                calling it directly. true: runs it as a standalone~n"
+    "                child erl node instead -- see bench_external_server's~n"
+    "                moduledoc for why (keeps test_tcp_server's~n"
+    "                per-request spawn/1 out of a perf profile taken on~n"
+    "                this VM).~n"
     "~n"
     "Examples:~n"
     "  1> arterial_bench:bench().~n"
@@ -190,7 +198,8 @@ bench(Opts) ->
     %% `workers` explicitly.
     workers    => PoolSize0,
     duration_s => 5,
-    payload    => <<"the quick brown fox jumps over the lazy dog">>
+    payload    => <<"the quick brown fox jumps over the lazy dog">>,
+    external_server => false
   },
   #{
     mode       := Mode,
@@ -199,10 +208,11 @@ bench(Opts) ->
     workers    := Workers,
     duration_s := DurationS,
     payload    := Payload,
-    fifo       := Fifo
+    fifo       := Fifo,
+    external_server := ExternalServer
   } = maps:merge(Defaults, Opts),
 
-  {Srv, SupPid} = setup(PoolSize, Backlog, Fifo, Mode, maps:get(backoff, Opts, undefined)),
+  {Srv, SupPid} = setup(PoolSize, Backlog, Fifo, Mode, maps:get(backoff, Opts, undefined), ExternalServer),
   try
     DurationMs = DurationS * 1000,
     Parent = self(),
@@ -226,10 +236,15 @@ bench(Opts) ->
 %%% Internal functions
 %%%-----------------------------------------------------------------------------
 
-setup(PoolSize, Backlog, Fifo, Mode, Backoff) ->
-  {ok, Srv} = test_tcp_server:start(0),
-  Port = test_tcp_server:port(Srv),
-  ClientOpts0 = #{address => "127.0.0.1", port => Port, protocol => tcp},
+setup(PoolSize, Backlog, Fifo, Mode, Backoff, ExternalServer) ->
+  Srv = bench_external_server:start(ExternalServer),
+  Port = bench_external_server:port(Srv),
+  ClientOpts0 = #{
+    address        => "127.0.0.1",
+    port           => Port,
+    protocol       => tcp,
+    socket_options => [{{tcp, nodelay}, true}]
+  },
   ClientOpts = case Backoff of
     undefined -> ClientOpts0;
     _         -> ClientOpts0#{reconnect_time => Backoff}
@@ -256,7 +271,7 @@ teardown({Srv, SupPid}, Mode) ->
   Mode =:= async andalso arterial_async_driver:stop(?POOL),
   ok = supervisor:stop(SupPid),
   try arterial_nif:destroy(?POOL) catch _:_ -> ok end,
-  test_tcp_server:stop(Srv).
+  bench_external_server:stop(Srv).
 
 %% Block until all `N` connections have (re)connected, the same way
 %% test_tcp_server_tests:wait_until_available/3 does: check them all out

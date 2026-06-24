@@ -80,7 +80,8 @@ $ make bench-shackle  BENCH_OPTS='pool_size=16 duration_s=10'
   backlog_size  => pos_integer(),
   workers       => pos_integer(),
   duration_s    => pos_integer(),
-  payload       => binary()
+  payload       => binary(),
+  external_server => boolean()
 }.
 
 -define(POOL, shackle_bench_pool).
@@ -138,6 +139,13 @@ help() ->
     "                   How long to hammer the pool, in seconds.~n"
     "  payload       => binary()  (default: a short fixed binary)~n"
     "                   The {echo, Payload} request body sent on every call.~n"
+    "  external_server => boolean()  (default: false)~n"
+    "                   false: test_tcp_server runs in this VM, same as~n"
+    "                   calling it directly. true: runs it as a standalone~n"
+    "                   child erl node instead -- see~n"
+    "                   bench_external_server's moduledoc for why (keeps~n"
+    "                   test_tcp_server's per-request spawn/1 out of a~n"
+    "                   perf profile taken on this VM).~n"
     "~n"
     "Passing an unrecognized option key raises~n"
     "{unrecognized_bench_opts, Keys} instead of silently ignoring it.~n"
@@ -186,7 +194,8 @@ bench(Opts) ->
     %% idle), same default rationale as arterial_bench:bench/1.
     workers       => PoolSize0,
     duration_s    => 5,
-    payload       => <<"the quick brown fox jumps over the lazy dog">>
+    payload       => <<"the quick brown fox jumps over the lazy dog">>,
+    external_server => false
   },
   case maps:keys(maps:without(maps:keys(Defaults), Opts)) of
     [] -> ok;
@@ -200,11 +209,12 @@ bench(Opts) ->
     backlog_size  := BacklogSize,
     workers       := Workers,
     duration_s    := DurationS,
-    payload       := Payload
+    payload       := Payload,
+    external_server := ExternalServer
   } = maps:merge(Defaults, Opts),
 
   ok = ensure_shackle_started(),
-  Srv = setup(PoolSize, PoolStrategy, MaxRetries, BacklogSize),
+  Srv = setup(PoolSize, PoolStrategy, MaxRetries, BacklogSize, ExternalServer),
   try
     DurationMs = DurationS * 1000,
     Parent = self(),
@@ -234,9 +244,9 @@ ensure_shackle_started() ->
     {error, Reason} -> error({shackle_start_failed, Reason})
   end.
 
-setup(PoolSize, PoolStrategy, MaxRetries, BacklogSize) ->
-  {ok, Srv} = test_tcp_server:start(0),
-  Port = test_tcp_server:port(Srv),
+setup(PoolSize, PoolStrategy, MaxRetries, BacklogSize, ExternalServer) ->
+  Srv = bench_external_server:start(ExternalServer),
+  Port = bench_external_server:port(Srv),
   ok = shackle_pool:start(?POOL, shackle_echo_client, [
     {address, "127.0.0.1"},
     {port, Port},
@@ -266,7 +276,7 @@ setup(PoolSize, PoolStrategy, MaxRetries, BacklogSize) ->
 
 teardown(Srv) ->
   ok = shackle_pool:stop(?POOL),
-  test_tcp_server:stop(Srv).
+  bench_external_server:stop(Srv).
 
 %% shackle has no synchronous "checkout" primitive to probe readiness
 %% with (unlike arterial_nif:checkout_connection/2) -- the closest
