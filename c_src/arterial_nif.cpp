@@ -105,7 +105,7 @@ struct alignas(64) ConnSlot {
 // 64 is already the hard cap (lease_mask is one uint64), so a plain
 // array costs nothing extra.
 struct PoolStripe {
-  std::atomic<uint64_t> lease_mask{~0ULL};
+  std::atomic<uint64_t> lease_mask;  // Initialized explicitly in init_pool_nif
   std::array<ConnSlot, 64> slots{};
   size_t capacity{0};
 };
@@ -383,7 +383,17 @@ static ERL_NIF_TERM init_pool_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM a
     ctx->stripes[i] = std::make_unique<PoolStripe>();
     auto& stripe = *ctx->stripes[i];
     stripe.capacity = slots_per_stripe;
-    stripe.lease_mask.store(~0ULL, std::memory_order_relaxed);
+
+    // Initialize lease mask: 0 = available, 1 = leased
+    // Set all slots beyond capacity as permanently leased (unavailable)
+    uint64_t initial_mask;
+    if (slots_per_stripe < 64) {
+      initial_mask = ~((1ULL << slots_per_stripe) - 1);
+    } else {
+      initial_mask = 0ULL;
+    }
+    stripe.lease_mask.store(initial_mask, std::memory_order_relaxed);
+
     for (unsigned int j = 0; j < 64; ++j) {
       stripe.slots[j].fd = -1;
       stripe.slots[j].stripe_id = i;
@@ -625,34 +635,32 @@ static ERL_NIF_TERM send_and_release_nif(ErlNifEnv* env, int argc, const ERL_NIF
   auto  current_mask = stripe.lease_mask.load(std::memory_order_relaxed);
   auto  slot_id      = -1;
 
-  // Try each available slot until we find one that passes throttling
-  uint64_t tried_mask = 0;
+  // Original CAS loop structure - throttle check after successful CAS
   do {
     slot_id = std::countr_zero(~current_mask);
     if (static_cast<size_t>(slot_id) >= stripe.capacity) [[unlikely]]
       return make(env, std::make_tuple(am_error, am_no_connections_available));
 
     uint64_t target_bit = (1ULL << slot_id);
+    uint64_t new_mask = current_mask | target_bit;
 
-    // Check if this slot passes throttling before attempting to lease it
-    auto& candidate_slot = stripe.slots[slot_id];
-    if (candidate_slot.status.load(std::memory_order_relaxed) == SLOT_AVAILABLE &&
-        throttle_allow(ctx, candidate_slot)) {
+    if (stripe.lease_mask.compare_exchange_weak(
+          current_mask, new_mask,
+          std::memory_order_acquire,
+          std::memory_order_relaxed)) [[likely]] {
 
-      uint64_t new_mask = current_mask | target_bit;
-      if (stripe.lease_mask.compare_exchange_weak(
-            current_mask, new_mask,
-            std::memory_order_acquire,
-            std::memory_order_relaxed)) [[likely]]
+      // CAS succeeded - now check if slot is available and passes throttling
+      auto& candidate_slot = stripe.slots[slot_id];
+      if (candidate_slot.status.load(std::memory_order_relaxed) == SLOT_AVAILABLE &&
+          throttle_allow(ctx, candidate_slot)) {
+        // Success - slot is leased and passes throttling
         break;
-    } else {
-      // This slot is throttled or not available, mark as tried and continue
-      tried_mask   |= target_bit;
-      current_mask |= target_bit;  // Temporarily mark as unavailable for this attempt
-
-      // If we've tried all slots, reset and check if any became available
-      if (__builtin_popcountll(tried_mask) >= static_cast<int>(stripe.capacity))
-        return make(env, std::make_tuple(am_error, am_no_connections_available));
+      } else {
+        // Slot doesn't pass throttling or isn't available - release it and try next
+        stripe.lease_mask.fetch_and(~target_bit, std::memory_order_release);
+        current_mask = stripe.lease_mask.load(std::memory_order_relaxed);
+        continue;
+      }
     }
 
   } while (true);
