@@ -1,304 +1,235 @@
 -module(arterial_client).
 
 -moduledoc """
-Behaviour implemented by callback modules that own a connection's
-request/reply lifecycle, plus the synchronous `call/3` request API.
+Public request API for `arterial_pool` (`arterial`'s second connection-
+pool backend, see `arterial_pool`'s moduledoc).
 
-An `arterial_client` callback module is paired with an `arterial_protocol`
-module: `arterial_protocol` handles the wire transport and per-request
-codec, while `arterial_client` owns per-connection setup/teardown and
-(for the asynchronous path) request/reply bookkeeping driven by
-`handle_request/2` and `handle_data/2`.
-
-Implementations are passed to `arterial_pool:start_link/2` via the
-`client` and `client_opts` options.
+Unlike `arterial_client:call/3` (the original backend, where the caller
+checks out and holds a connection for the call's whole round trip),
+`call/2,3` here writes the request inline (via
+`arterial_nif:send_and_release/3`) and immediately gives up any
+claim on "its" connection -- multiplexing is entirely by the wire-level
+correlation id the request was encoded with, looked up against the
+pool's public ETS table by whichever `arterial_connection` worker
+decodes the matching reply off the wire.
 """.
 
--export([call/3, cast/2]).
+-export([call/2, call/3, cast/2]).
+-export([new_corr_id/0]).
 
--optional_callbacks([handle_timeout/2]).
+%%%-----------------------------------------------------------------------------
+%%% Public API
+%%%-----------------------------------------------------------------------------
 
--doc """
-Initialize per-connection callback state from `Options` (the pool's
-`client_opts`, see `t:options/0`), before a socket exists. Called once
-each time `arterial_connection` (re)connects, before `c:setup/2`.
-""".
--callback init(Options::map()) ->
-  {ok, State::any()} | {error, Reason::term()}.
-
--doc """
-Perform any post-connect handshake/setup on the freshly connected `Socket`
-(e.g. authentication). Called once per connection, right after `c:init/1`
-succeeds and before the connection is made available for checkout.
-""".
--callback setup(Socket::inet:socket(), State::any()) ->
-  {ok, State::any()} | {error, Reason::term(), State::any()}.
+-doc "Equivalent to `call/3` with `Timeout` defaulting to the pool's `default_timeout_ms`.".
+-spec call(arterial_pool:name(), term()) -> {ok, arterial:response()} | {error, term()}.
+call(Pool, Request) ->
+  call(Pool, Request, arterial_pool:default_timeout_ms(Pool)).
 
 -doc """
-Encode `Request` for the asynchronous path: assign it one or more
-wire-level request ids and produce the bytes to send on the wire.
-Not used by the synchronous `call/3` path, which talks to
-`arterial_protocol` directly.
-""".
--callback handle_request(Request::term(), State::any()) ->
-  {ok, [RequestID::arterial:request_id()], Data::iodata(), State::any()}.
+Encode and send `Request` on any currently available connection of
+`Pool` (tried round-robin, starting from a scheduler-affine offset to
+spread contention -- see `arterial_pool`'s moduledoc),
+then block for its reply (matched purely by wire-level correlation id,
+see `c:arterial_codec:decode/1`) or `Timeout` milliseconds, whichever
+comes first.
 
--doc """
-Decode newly received `Data` (asynchronous path) into zero or more
-completed responses, given the callback module's own buffering/framing
-state.
-""".
--callback handle_data(Data::binary(), State::any()) ->
-  {ok, [arterial:response()], State::any()} | {error, Reason::term(), State::any()}.
-
--doc """
-Optional: produce a synthetic response for a request that timed out
-(asynchronous path) instead of letting the caller only see
-`{arterial_timeout, Pool, RequestID}` (see `arterial_nif:track_inflight/5`).
-""".
--callback handle_timeout(RequestID::arterial:request_id(), State::any()) ->
-  {ok, arterial:response(), State::any()} | {error,  Reason::term(), State::term()}.
-
--doc """
-Called when the connection is torn down (cleanly or due to an error), to
-let the callback module release any resources held in `State`.
-""".
--callback terminate(Reason::any(), State::any()) ->
-  ok.
-
--doc """
-Pool/connection options accepted under the `client_opts` key of
-`t:arterial_pool:options/0`.
-
-`addresses` (a non-empty list, tried in order on every reconnect until
-one connects) takes priority over the single-address `address`/`ip` if
-both are given; useful for failing over across a fixed set of
-known-good backup addresses. Each entry is either a plain address
-(sharing this `port`/`socket_options`/`tls_options`) or a map overriding
-any of those for that entry alone -- see
-`t:arterial_connection:address_entry/0`, e.g. to reach several
-independent server instances on localhost, each on its own port. Once
-the whole list has been tried and failed, the connection backs off
-(`reconnect_time`) before restarting from the first address again.
-
-`reconnect_time` controls that backoff: a fixed interval (plain
-integer), or `{backoff, Min, Max}` for exponential backoff -- see
-`t:arterial_connection:reconnect_time/0`. The legacy `reconnect_time_min`/
-`reconnect_time_max` pair still works (folded into the equivalent
-`{backoff, Min, Max}`) if `reconnect_time` isn't given.
-
-`tls_options` (requires **OTP 28+**) is only used when this connection's
-transport (the `client_opts` `protocol` key, distinct from
-`t:arterial_pool:options/0`'s `protocol` key, which names the wire codec
-module) is `ssl` -- passed straight through to `ssl:connect/3` after
-this connection's `socket_options` are applied via the `socket` module.
-See `m:arterial_socket`'s moduledoc for why `ssl` needs OTP 28+.
+Returns `{error, no_connection}` if every connection is currently
+unavailable or throttled, `{error, disconnected}` if the connection that
+carried this request dies before a reply arrives (see
+`arterial_connection`'s disconnect-notification path), or
+`{error, timeout}` if `Timeout` elapses first either way.
 
 ## Examples
 
 ```
-1> Opts = #{address => "db.internal", port => 5432, protocol => tcp,
-2>          reconnect => true, reconnect_time => {backoff, 500, 30000}}.
-#{address => "db.internal",port => 5432,protocol => tcp,
-  reconnect => true,reconnect_time => {backoff,500,30000}}
-3> Opts2 = #{addresses => ["db1.internal", "db2.internal", "db3.internal"],
-4>           port => 5432, protocol => tcp}.
-#{addresses => ["db1.internal","db2.internal","db3.internal"],
-  port => 5432,protocol => tcp}
-5> Opts3 = #{addresses => [#{address => "127.0.0.1", port => 9001},
-6>                          #{address => "127.0.0.1", port => 9002}],
-7>           protocol => tcp}.
-#{addresses => [#{address => "127.0.0.1",port => 9001},
-                 #{address => "127.0.0.1",port => 9002}],
-  protocol => tcp}
-8> Opts4 = #{address => "db.internal", port => 5432, protocol => ssl,
-9>           tls_options => [{verify, verify_peer}, {cacertfile, "/etc/ssl/ca.pem"}]}.
-#{address => "db.internal",port => 5432,protocol => ssl,
-  tls_options => [{verify,verify_peer},{cacertfile,"/etc/ssl/ca.pem"}]}
-```
-""".
--type options() :: #{
-  init_options       => arterial_connection:init_options(),
-  address            => arterial:inet_address(),
-  addresses          => [arterial_connection:address_entry(), ...],
-  ip                 => arterial:inet_address(),
-  port               => arterial:inet_port(),
-  protocol           => tcp | udp | ssl,
-  reconnect          => boolean(),
-  reconnect_time     => arterial_connection:reconnect_time(),
-  reconnect_time_max => arterial:time()   | infinity, % deprecated, use reconnect_time
-  reconnect_time_min => arterial:time(),              % deprecated, use reconnect_time
-  bounce_interval_ms => non_neg_integer() | infinity,
-  socket_options     => arterial:socket_options(),
-  tls_options        => arterial:tls_options()
-}.
-
--export_type([options/0]).
-
-%%%-----------------------------------------------------------------------------
-%%% Synchronous request API
-%%%-----------------------------------------------------------------------------
--doc """
-Send `Request` on a connection checked out from `Pool` and block for its
-reply (or `Timeout` milliseconds, whichever comes first).
-
-The calling process owns the socket directly for the duration of the call:
-it checks out a connection, encodes/sends/receives on the raw socket via
-the pool's `arterial_protocol` module, then checks the connection back in.
-`arterial_connection` (the pool's `gen_server` worker for this connection)
-is not involved in the call itself -- it only owns reconnect/health
-monitoring between calls.
-
-## Examples
-
-```
-1> arterial_pool:start_link(my_pool, #{protocol => my_proto, client => my_client,
-2>                                      client_opts => #{address => "localhost", port => 9000}}).
-{ok,<0.123.0>}
-2> arterial_client:call(my_pool, {get, <<"key">>}, 5000).
+1> arterial_client:call(my_pool, {get, <<"key">>}, 5000).
 {ok, <<"value">>}
 ```
 """.
--spec call(arterial_pool:name(), term(), non_neg_integer()) ->
+-spec call(arterial_pool:name(), term(), non_neg_integer() | infinity) ->
   {ok, arterial:response()} | {error, term()}.
 call(Pool, Request, Timeout) ->
-  arterial_observe:span([call], #{pool => Pool}, fun() ->
-    Result = do_call(Pool, Request, Timeout),
-    Outcome = case Result of {ok, _} -> ok; _ -> error end,
-    {Result, #{pool => Pool, result => Outcome}}
-  end).
+  case arterial_observe:enabled() of
+    false ->
+      do_call(Pool, Request, Timeout);
+    true ->
+      arterial_observe:span([call], #{pool => Pool}, fun() ->
+        Result = do_call(Pool, Request, Timeout),
+        Outcome = case Result of {ok, _} -> ok; _ -> error end,
+        {Result, #{pool => Pool, result => Outcome}}
+      end)
+  end.
 
 do_call(Pool, Request, Timeout) ->
-  case checkout(Pool, sync) of
-    {ok, #{
-      conn_id  := ConnID,
-      protocol := Proto,
-      socket   := Socket,
-      buffer   := Buffer,
-      req_ids  := [ReqID | _] = ReqIDs
-    }} ->
-      try
-        TS = os:system_time(microsecond),
-        maybe
-          {ok, Data}         ?= Proto:encode_request(ReqID, Request, Timeout),
-          ok                 ?= Proto:send(Socket, Data),
-          Expire              = arterial_util:calc_expiration(TS, Timeout),
-          {ok, Result, Rest} ?= receive_response(Socket, Proto, ReqID, Buffer, Expire),
-          ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, Rest),
-          {ok, Result}
-        else
-          {error, _} = Error ->
-            ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, <<>>),
-            Error
-        end
-      catch E:R:ST ->
-        arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, <<>>),
-        erlang:raise(E, R, ST)
-      end;
+  CorrId = new_corr_id(),
+  Codec = arterial_pool:codec(Pool),
+  Data = iolist_to_binary(Codec:encode_request(CorrId, Request)),
+  Size = arterial_pool:size(Pool),
+  case send_to_any(Pool, Size, [], CorrId, Data, Timeout) of
+    ok ->
+      await_reply(Pool, CorrId, Timeout);
     {error, _} = Error ->
       Error
   end.
 
-%% Wraps arterial_nif:checkout_connection/2 with a [arterial, checkout, ...]
-%% span -- shared by call/3 (Mode = sync) and cast/2 (Mode = async).
-checkout(Pool, Mode) ->
-  arterial_observe:span([checkout], #{pool => Pool, mode => Mode}, fun() ->
-    Result = arterial_nif:checkout_connection(Pool, Mode),
-    Outcome = case Result of {ok, _} -> ok; {error, Reason} -> Reason end,
-    {Result, #{pool => Pool, mode => Mode, outcome => Outcome}}
-  end).
-
 -doc """
-Send `Request` on a connection checked out from `Pool` without waiting
-for (or expecting) any reply -- mode (e) of the backlog/protocol design:
-send-and-forget protocols (e.g. fire-and-forget logging/metrics) where
-every message is inherently one-way. The backlog slot is reserved and
-released back-to-back within this one call, never actually left
-in-flight: there's nothing to check in later, so unlike `call/3` there's
-no `req_ids` for a caller to hold onto, and `checkout_connection/2,3`'s
-`backlog`/multiplexing settings don't matter here -- `cast/2` never holds
-a slot long enough to contend with itself.
-
-Returns as soon as the bytes are handed to the transport's `send/2`
-(e.g. accepted into the OS socket buffer), not when (or whether) the
-remote peer actually processes them -- there is no protocol-level
-acknowledgement to wait for. If the underlying protocol needs delivery
-confirmation, use mode (f) (ack-based protocols) instead, which has a
-real reply to correlate (see `c:arterial_protocol:decode_reply/2`'s
-moduledoc).
+Encode and send `Request` on any currently available connection of
+`Pool` without waiting for (or expecting) any reply -- the
+send-and-forget path (mode (e) of `arterial`'s protocol design; see the
+top-level README's "Protocol" section). Returns as soon as the bytes are
+accepted by `arterial_nif:send_and_release/3`, never registering
+any correlation-id bookkeeping (there's no `call/3`-style reply to match
+it up with later).
 
 ## Examples
 
 ```
-1> arterial_pool:start_link(my_pool, #{protocol => my_log_proto, client => my_client,
-2>                                      client_opts => #{address => "localhost", port => 9000}}).
-{ok,<0.123.0>}
-2> arterial_client:cast(my_pool, {log, info, <<"started">>}).
+1> arterial_client:cast(my_pool, {log, info, <<"started">>}).
 ok
 ```
 """.
 -spec cast(arterial_pool:name(), term()) -> ok | {error, term()}.
 cast(Pool, Request) ->
-  arterial_observe:span([cast], #{pool => Pool}, fun() ->
-    Result = do_cast(Pool, Request),
-    Outcome = case Result of ok -> ok; _ -> error end,
-    {Result, #{pool => Pool, result => Outcome}}
-  end).
+  case arterial_observe:enabled() of
+    false ->
+      do_cast(Pool, Request);
+    true ->
+      arterial_observe:span([cast], #{pool => Pool}, fun() ->
+        Result = do_cast(Pool, Request),
+        Outcome = case Result of ok -> ok; _ -> error end,
+        {Result, #{pool => Pool, result => Outcome}}
+      end)
+  end.
 
 do_cast(Pool, Request) ->
-  case checkout(Pool, async) of
-    {ok, #{
-      conn_id  := ConnID,
-      protocol := Proto,
-      socket   := Socket,
-      buffer   := Buffer,
-      req_ids  := [ReqID | _] = ReqIDs
-    }} ->
-      try
-        case Proto:encode_request(ReqID, Request, infinity) of
-          {ok, Data} ->
-            Result = Proto:send(Socket, Data),
-            %% Preserve Buffer as-is on checkin: cast/2 never reads from
-            %% the socket, so any bytes already buffered from a prior
-            %% call/3 on this connection (e.g. a reply's trailing bytes
-            %% belonging to the next response) must not be discarded here.
-            ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, Buffer),
-            case Result of
-              ok -> ok;
-              {error, _} = Error -> Error
-            end;
-          {error, _} = Error ->
-            ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, Buffer),
-            Error
-        end
-      catch E:R:ST ->
-        arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, Buffer),
-        erlang:raise(E, R, ST)
-      end;
-    {error, _} = Error ->
-      Error
-  end.
+  CorrId = new_corr_id(),
+  Codec = arterial_pool:codec(Pool),
+  Data = iolist_to_binary(Codec:encode_request(CorrId, Request)),
+  Size = arterial_pool:size(Pool),
+  send_cast_to_any(Pool, Size, [], Data).
+
+-doc """
+A fresh wire-level correlation id, truncated to 32 bits (the width
+`arterial_codec_default`'s framing reserves for it) -- custom
+`c:arterial_codec` implementations with a wider/narrower id field
+should generate and pass their own instead of relying on this.
+
+Deliberately `[positive]` only, no `monotonic`: nothing here needs
+correlation ids globally ordered across processes (each is only ever
+matched against the single pool-wide ETS table, never compared to
+another id), and `monotonic` forces a single counter shared across every
+scheduler -- measurably more contended under concurrency than the
+per-scheduler counters backing plain `unique_integer/1`.
+""".
+-spec new_corr_id() -> non_neg_integer().
+new_corr_id() ->
+  erlang:unique_integer([positive]) band 16#FFFFFFFF.
 
 %%%-----------------------------------------------------------------------------
 %%% Internal functions
 %%%-----------------------------------------------------------------------------
 
--spec receive_response(arterial:socket(), arterial:protocol(),
-                        arterial:request_id(), binary(),
-                        non_neg_integer() | infinity) ->
-  {ok, arterial:response(), binary()} | {error, term()}.
-receive_response(Socket, Proto, ReqID, Buffer, Expire) ->
-  case Proto:decode_reply(ReqID, Buffer) of
-    {ok, Result, Rest} ->
-      {ok, Result, Rest};
-    {more, Buffer1} ->
-      Timeout = arterial_util:calc_timeout(Expire),
-      case Proto:recv(Socket, Timeout) of
-        {ok, Chunk} ->
-          receive_response(Socket, Proto, ReqID, <<Buffer1/binary, Chunk/binary>>, Expire);
-        {error, _} = Error ->
-          Error
-      end;
-    {error, _} = Error ->
-      Error
+send_to_any(_Pool, Size, Tried, _CorrId, _Data, _Timeout) when length(Tried) >= Size ->
+  {error, no_connection};
+send_to_any(Pool, Size, Tried, CorrId, Data, Timeout) ->
+  case next_candidate(Pool, Size, Tried) of
+    none ->
+      {error, no_connection};
+    ConnID ->
+      case try_send(Pool, ConnID, CorrId, Data, Timeout) of
+        ok    -> ok;
+        retry -> send_to_any(Pool, Size, [ConnID | Tried], CorrId, Data, Timeout)
+      end
   end.
+
+try_send(Pool, ConnID, CorrId, Data, Timeout) ->
+  CorrTable = arterial_pool:corr_table(Pool),
+  TS        = os:system_time(microsecond),
+  Deadline  = arterial_util:calc_expiration(TS, Timeout),
+  %% Inserted before sending: the reply (or even a disconnect) can only
+  %% ever be noticed by arterial_connection after the write below
+  %% returns, so there's no risk of it being decoded and dropped for
+  %% lack of a matching entry yet.
+  ets:insert(CorrTable, {CorrId, self(), ConnID, Deadline}),
+  PoolRef = arterial_pool:pool_ref(Pool),
+  case arterial_observe:enabled() of
+    false ->
+      case arterial_nif:send_and_release(PoolRef, ConnID, [Data]) of
+        {ok, _SlotId} -> ok;
+        {error, _Reason} -> ets:delete(CorrTable, CorrId), retry
+      end;
+    true ->
+      case arterial_observe:span([nif, send], #{pool => Pool, conn_id => ConnID}, fun() ->
+        case arterial_nif:send_and_release(PoolRef, ConnID, [Data]) of
+          {ok, SlotId} -> {{ok, SlotId}, #{result => ok, slot_id => SlotId}};
+          {error, Reason} -> {{error, Reason}, #{result => error, reason => Reason}}
+        end
+      end) of
+        {ok, _SlotId} -> ok;
+        {error, _Reason} -> ets:delete(CorrTable, CorrId), retry
+      end
+  end.
+
+send_cast_to_any(_Pool, Size, Tried, _Data) when length(Tried) >= Size ->
+  {error, no_connection};
+send_cast_to_any(Pool, Size, Tried, Data) ->
+  case next_candidate(Pool, Size, Tried) of
+    none ->
+      {error, no_connection};
+    ConnID ->
+      PoolRef = arterial_pool:pool_ref(Pool),
+      case arterial_observe:enabled() of
+        false ->
+          case arterial_nif:send_and_release(PoolRef, ConnID, [Data]) of
+            {ok, _SlotId}    -> ok;
+            {error, _Reason} -> send_cast_to_any(Pool, Size, [ConnID | Tried], Data)
+          end;
+        true ->
+          case arterial_observe:span([nif, send], #{pool => Pool, conn_id => ConnID}, fun() ->
+            case arterial_nif:send_and_release(PoolRef, ConnID, [Data]) of
+              {ok, SlotId} -> {{ok, SlotId}, #{result => ok, slot_id => SlotId}};
+              {error, Reason} -> {{error, Reason}, #{result => error, reason => Reason}}
+            end
+          end) of
+            {ok, _SlotId}    -> ok;
+            {error, _Reason} -> send_cast_to_any(Pool, Size, [ConnID | Tried], Data)
+          end
+      end
+  end.
+
+await_reply(Pool, CorrId, Timeout) ->
+  receive
+    {arterial_reply,        CorrId, Reply} -> {ok, Reply};
+    {arterial_disconnected, Pool,  CorrId} -> {error, disconnected};
+    {arterial_timeout,      Pool,  CorrId} -> {error, timeout};
+    Other ->
+      error({invalid_reply, Other, #{pool => Pool, corr_id => CorrId}})
+  after Timeout ->
+    ets:delete(arterial_pool:corr_table(Pool), CorrId),
+    {error, timeout}
+  end.
+
+%% Scheduler-affine starting offset, then a linear scan of every
+%% remaining ConnID (wrapping), skipping any already in `Tried` and any
+%% currently unavailable connection (no socket / disconnected /
+%% draining for a bounce). Throttling is handled in the NIF.
+next_candidate(Pool, Size, Tried) ->
+  Start = erlang:system_info(scheduler_id) rem Size,
+  find_candidate(Pool, Size, Tried, Start, 0).
+
+find_candidate(_Pool, Size, _Tried, _Start, Size) ->
+  none;
+find_candidate(Pool, Size, Tried, Start, Offset) ->
+  ConnID = (Start + Offset) rem Size,
+  case lists:member(ConnID, Tried) of
+    true ->
+      find_candidate(Pool, Size, Tried, Start, Offset + 1);
+    false ->
+      case arterial_pool:is_available(Pool, ConnID) of
+        true  -> ConnID;
+        false -> find_candidate(Pool, Size, Tried, Start, Offset + 1)
+      end
+  end.
+
+%% Throttling is now handled directly in the NIF during send_and_release/3

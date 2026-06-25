@@ -1,749 +1,392 @@
 -module(arterial_nif).
 
 -moduledoc """
-NIF bindings to the C++ connection-pool engine: pool lifecycle, checkout/
-checkin, asynchronous queue-when-busy, and in-flight request timeout
-tracking/sweeping.
+NIF bindings to the raw-socket connection-pool engine (`c_src/arterial_nif.cpp`)
+-- the low-level half of `arterial`'s NIF-resident-I/O connection
+pool backend (see `arterial_pool`'s moduledoc for the full picture).
 
-This module is the low-level engine used internally by `arterial_pool`,
-`arterial_connection`, and `arterial_client`; most users of the library
-only need `arterial_client:call/3` (synchronous) or this module's
-`checkout_async/3` + `track_inflight/5` (asynchronous) directly when
-implementing their own asynchronous request path.
+This NIF performs the actual `read(2)`/
+`write(2)`/`writev(2)` syscalls itself, directly inside whichever Erlang
+process calls in: `send_and_release/3` writes synchronously inside the
+calling process (typically the request's own caller, see
+`arterial_client:call/3`), and `handle_readable/3`/`handle_writable/3`
+perform a read/flush synchronously inside whichever process calls them
+(expected to be the slot's registered "owner" process, normally an
+`arterial_connection` worker).
 
-Every connection reservation made via `checkout_connection/2` or
-`checkout_async/3` monitors the calling process for as long as the
-reservation is outstanding. If that process dies before calling
-`checkin_connection/2,4`, the C++ pool's resource `down` callback releases
-the reserved backlog slot(s) and makes the connection available again --
-equivalent to that process having called `checkin_connection/2` itself --
-so a crashing caller can never permanently strand a connection. This is
-independent of (and in addition to) the TTL-based timeout registry (see
-`track_inflight/5`), which only covers requests explicitly registered as
-in-flight.
+Sockets are organized into `Stripes` (assigned by the caller, e.g. by
+scheduler id, to spread atomic-CAS contention across cores) of up to 64
+`Slots` each (one real socket per slot) -- a single stripe's free/busy
+state lives in one lock-free `uint64` bitmask, which is also why 64 is a
+hard per-stripe cap.
+
+There is no callback invoked automatically by the NIF runtime when a
+socket becomes readable/writable (no such mechanism exists in
+`erl_nif.h`): `enif_select` only ever delivers a message --
+`{arterial_event, StripeId, SlotId, read | write | closed}` -- to
+the slot's owner pid, which must then call `handle_readable/3` or
+`handle_writable/3` to actually do the I/O and re-arm the next
+notification. `closed` needs no further NIF call; the fd is already
+gone by the time it's delivered.
 """.
 
--export([create/5, create/6, create/7, create/8, destroy/1]).
--export([checkin_connection/2, checkin_connection/4]).
--export([checkout_connection/2, checkout_connection/3]).
--export([checkout_async/3, checkout_async/4]).
--export([set_socket/3, make_available/2, make_unavailable/2, connection_drained/2]).
--export([connection_down/2, checkin_up_to/3]).
--export([track_inflight/5, sweep_timeouts/1]).
--export([start_link/0]).
+-export([init/0]).
+-export([init_pool/2, configure_throttle/3, register_socket/4, connect/7, connect_async/6, connect_proto/8, connect_async_proto/7, send_and_release/3]).
+-export([connect_with_opts/8, connect_proto_with_opts/9]).
+-export([handle_readable/3, handle_writable/3, close_slot/3]).
 
 -on_load(init/0).
 
--define(LIBNAME, arterial).
+-define(LIBNAME, arterial_nif).
 -define(NOT_LOADED_ERROR,
   erlang:nif_error({not_loaded, [{module, ?MODULE}, {line, ?LINE}]})).
 
--doc "The atom identifying a pool, as passed to `arterial_pool:start_link/2`.".
--type pool() :: atom().
+-doc "Opaque NIF resource returned by `init_pool/2`, identifying one pool.".
+-type pool_ref() :: reference().
 
--doc """
-How the caller intends to use a checked-out connection. Purely
-informational (see `checkout_connection/2`); does not change pool
-behavior.
-""".
--type mode() :: sync | async.
-
--export_type([pool/0, mode/0]).
+-export_type([pool_ref/0]).
 
 %%%-----------------------------------------------------------------------------
-%%% Public API
+%%% Public API (thin NIF bindings)
 %%%-----------------------------------------------------------------------------
 
 -doc """
-Equivalent to `create/6` with `FixedTimeoutUs = 0` (per-request timeouts,
-set individually via `track_inflight/5`).
+Create a pool resource with `NumStripes` stripes of `SlotsPerStripe` slots
+each (`SlotsPerStripe` must be `=< 64`). Every slot starts unregistered
+(no socket); use `register_socket/4` to attach a real, already-connected
+socket's file descriptor to one.
 
 ## Examples
 
 ```
-1> arterial_nif:create(my_pool, 4, 16, true, my_protocol).
+1> arterial_nif:init_pool(4, 8).
+{ok, PoolRef}
+```
+""".
+-spec init_pool(non_neg_integer(), non_neg_integer()) ->
+  {ok, pool_ref()} | {error, max_slots_exceeded_64}.
+init_pool(_NumStripes, _SlotsPerStripe) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Configure throttling for a pool resource. Sets the rate limit to
+`RatePerSec` tokens per second with a burst capacity of `Burst` tokens.
+Setting `RatePerSec` to 0 disables throttling entirely.
+
+## Examples
+
+```
+1> arterial_nif:configure_throttle(PoolRef, 100, 10).
 ok
 ```
 """.
--spec create(pool(), pos_integer(), pos_integer(), boolean(), module()) -> ok.
-create(Pool, Size, Backlog, Fifo, Protocol) ->
-  create(Pool, Size, Backlog, Fifo, Protocol, 0).
+-spec configure_throttle(pool_ref(), non_neg_integer(), non_neg_integer()) -> ok.
+configure_throttle(_PoolRef, _RatePerSec, _Burst) ->
+  ?NOT_LOADED_ERROR.
 
 -doc """
-Equivalent to `create/7` with `MaxWaiters = 0` (queue-when-busy disabled;
-`checkout_async/3` behaves like `checkout_connection/2`).
+Hand off raw file descriptor `RawFd` (e.g. extracted from an OTP
+`socket()` via `socket:getopt(Sock, otp, fd)`) to stripe `StripeId` of
+`PoolRef`, under an idle slot chosen automatically. Sets `RawFd`
+non-blocking and arms its first read-readiness notification, targeted at
+`OwnerPid` -- every future `{arterial_event, StripeId, SlotId, _}`
+message for this slot (read, write, or closed) is sent to that same pid
+for as long as the slot stays registered.
+
+**Prefer `connect/7`** for a brand-new outgoing connection: `RawFd` here
+still has another resource (whatever opened it, e.g. the `socket()`
+term's own `esock` resource) believing it owns it too, and erts logs a
+"stealing control of fd=N" warning both when this call takes it over and
+again, potentially against a since-reused fd number, when that other
+owner's resource is eventually garbage collected. Kept for callers that
+genuinely need to register an fd opened by something other than this
+NIF (there's no other way to get one in).
 
 ## Examples
 
 ```
-1> arterial_nif:create(my_pool, 4, 16, true, my_protocol, 5000000).
+1> arterial_nif:register_socket(PoolRef, 0, RawFd, self()).
+{ok, SlotId}
+```
+""".
+-spec register_socket(pool_ref(), non_neg_integer(), non_neg_integer(), pid()) ->
+  {ok, non_neg_integer()} |
+  {error, failed_to_set_nonblocking | stripe_full}.
+register_socket(_PoolRef, _StripeId, _RawFd, _OwnerPid) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Open a brand-new IPv4 TCP socket, connect it to `IP`:`Port` (waiting up
+to `TimeoutMs` milliseconds), and -- on success -- claim an idle slot of
+stripe `StripeId` for it, exactly like `register_socket/4`. `Nodelay`
+sets `TCP_NODELAY` on the new socket when `true`.
+
+Unlike `register_socket/4`, the fd is opened by this NIF and never has
+any other owner at any point: nothing else (no Erlang `socket()` term,
+no `prim_socket`/`esock` resource) ever believes it owns this fd, so
+there is no "stealing control of fd=N" warning and no fd-reuse risk on
+teardown. This runs as a dirty, IO-bound NIF (`connect/2` can block for
+up to `TimeoutMs`), so it never ties up a regular scheduler thread.
+
+## Examples
+
+```
+1> arterial_nif:connect(PoolRef, 0, {127,0,0,1}, 9000, 5000, true, self()).
+{ok, SlotId}
+2> arterial_nif:connect(PoolRef, 0, {127,0,0,1}, 1, 200, true, self()).
+{error, connect_failed}
+```
+""".
+-spec connect(pool_ref(), non_neg_integer(), inet:ip4_address(),
+              arterial:inet_port(), non_neg_integer(), boolean(), pid()) ->
+  {ok, non_neg_integer()} |
+  {error, socket_failed | failed_to_set_nonblocking | connect_failed | timeout | stripe_full}.
+connect(_PoolRef, _StripeId, _IP, _Port, _TimeoutMs, _Nodelay, _OwnerPid) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Open a brand-new IPv4 TCP socket and start connecting to `IP`:`Port`
+asynchronously. Unlike `connect/7`, this function returns immediately
+after starting the connection attempt.
+
+Returns `{ok, SlotId}` if connection completes immediately,
+`{ok, connecting, SlotId}` if connection is in progress, or
+`{error, Reason}` if the connection attempt fails immediately.
+
+When an async connection completes, sends a message to `OwnerPid`:
+`{arterial_event, StripeId, SlotId, connect_result, Result}`
+where `Result` is `ok` for success or an error atom for failure.
+
+`Nodelay` sets `TCP_NODELAY` on the new socket when `true`.
+
+## Examples
+
+```
+1> arterial_nif:connect_async(PoolRef, 0, {127,0,0,1}, 9000, true, self()).
+{ok, 0}
+2> arterial_nif:connect_async(PoolRef, 0, {127,0,0,1}, 9001, true, self()).
+{ok, connecting, 1}
+```
+""".
+-spec connect_async(pool_ref(), non_neg_integer(), inet:ip4_address(),
+                   arterial:inet_port(), boolean(), pid()) ->
+  {ok, non_neg_integer()} | {ok, connecting, non_neg_integer()} |
+  {error, socket_failed | failed_to_set_nonblocking | connect_failed | stripe_full}.
+connect_async(_PoolRef, _StripeId, _IP, _Port, _Nodelay, _OwnerPid) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Open a brand-new IPv4 socket with the specified protocol and connect to
+`IP`:`Port` (waiting up to `TimeoutMs` milliseconds). Supports `tcp`, `udp`,
+and `ssl` protocols. This is the protocol-aware version of `connect/7`.
+
+For `tcp`: behaves identically to `connect/7`.
+For `udp`: creates a UDP socket and optionally "connects" it to the remote address.
+For `ssl`: creates a TCP socket and performs SSL handshake.
+
+`Nodelay` sets `TCP_NODELAY` for TCP/SSL protocols (ignored for UDP).
+
+## Examples
+
+```
+1> arterial_nif:connect_proto(PoolRef, 0, {127,0,0,1}, 9000, 5000, tcp, true, self()).
+{ok, 0}
+2> arterial_nif:connect_proto(PoolRef, 0, {127,0,0,1}, 9001, 5000, udp, false, self()).
+{ok, 1}
+```
+""".
+-spec connect_proto(pool_ref(), non_neg_integer(), inet:ip4_address(),
+                   arterial:inet_port(), non_neg_integer(), tcp | udp | ssl, boolean(), pid()) ->
+  {ok, non_neg_integer()} |
+  {error, socket_failed | failed_to_set_nonblocking | connect_failed |
+          timeout       | stripe_full               | unsupported_protocol}.
+connect_proto(_PoolRef, _StripeId, _IP, _Port, _TimeoutMs, _Protocol, _Nodelay, _OwnerPid) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Async version of `connect_proto/8`. Opens a socket with the specified protocol
+and starts connecting asynchronously.
+
+## Examples
+
+```
+1> arterial_nif:connect_async_proto(PoolRef, 0, {127,0,0,1}, 9000, tcp, true, self()).
+{ok, connecting, 0}
+2> arterial_nif:connect_async_proto(PoolRef, 0, {127,0,0,1}, 9001, udp, false, self()).
+{ok, 1}
+```
+""".
+-spec connect_async_proto(pool_ref(), non_neg_integer(), inet:ip4_address(),
+                         arterial:inet_port(), tcp | udp | ssl, boolean(), pid()) ->
+  {ok, non_neg_integer()} | {ok, connecting, non_neg_integer()} |
+  {error, socket_failed | failed_to_set_nonblocking | connect_failed | stripe_full | unsupported_protocol}.
+connect_async_proto(_PoolRef, _StripeId, _IP, _Port, _Protocol, _Nodelay, _OwnerPid) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Write `IoList` (a list of binaries) to any currently idle slot of stripe
+`StripeId`, chosen automatically (lock-free CAS over the stripe's lease
+bitmask) -- the calling process never picks (or even learns, in advance)
+which physical socket it lands on.
+
+Runs the `write(2)`/`writev(2)` syscall synchronously inside the calling
+process. If the kernel socket buffer can't accept all of `IoList`
+immediately, the remainder is buffered and flushed later via
+`handle_writable/3` (called by the slot's owner, not this caller) --
+either way, `{ok, SlotId}` is returned as soon as the bytes are *accepted*
+(by the kernel or this NIF's own pending buffer), not once a peer
+necessarily receives them. The returned `SlotId` is the caller's only way
+to know which physical connection carried this write (e.g. to record
+alongside a request's correlation id for later disconnect-notification
+bookkeeping, see `arterial_connection`).
+
+`{error, no_connections_available}` if every slot in `StripeId` is
+currently unregistered or already leased (busy writing/flushing) --
+callers are expected to retry against a different `StripeId` themselves
+(see `arterial_client`); this NIF never spreads one logical request
+across stripes.
+
+## Examples
+
+```
+1> arterial_nif:send_and_release(PoolRef, 0, [<<1,2,3>>]).
+{ok, SlotId}
+```
+""".
+-spec send_and_release(pool_ref(), non_neg_integer(), [binary()]) ->
+  {ok, non_neg_integer()} |
+  {error, no_connections_available | write_failed}.
+send_and_release(_PoolRef, _StripeId, _IoList) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Called by a slot's owner process upon receiving
+`{arterial_event, StripeId, SlotId, read}`: reads whatever is
+currently available on the slot's socket (one `ioctl(FIONREAD)` + one
+`read(2)`, synchronously inside the calling process) and re-arms the next
+read-readiness notification.
+
+Returns `{ok, Binary}` (possibly `<<>>` on a spurious wakeup -- still
+re-armed, safe to ignore) with the raw bytes read, or `closed` if the
+peer closed the connection (or the read failed for any other reason) --
+the fd is already gone and deselected by the time this returns; no
+further cleanup call is needed.
+
+## Examples
+
+```
+1> arterial_nif:handle_readable(PoolRef, 0, SlotId).
+{ok, <<"...">>}
+```
+""".
+-spec handle_readable(pool_ref(), non_neg_integer(), non_neg_integer()) ->
+  {ok, binary()} | closed.
+handle_readable(_PoolRef, _StripeId, _SlotId) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Called by a slot's owner process upon receiving
+`{arterial_event, StripeId, SlotId, write}`: flushes as much of the
+slot's pending write buffer (left over from a `send_and_release/3` that
+couldn't complete immediately) as the kernel will currently accept.
+
+Returns `ok` whether or not the buffer is now fully flushed (re-arming
+the next write-readiness notification itself if not) -- the slot becomes
+available for a new `send_and_release/3` exactly when fully flushed, with
+no separate signal to the original caller (which already got `{ok,
+SlotId}` back from `send_and_release/3` regardless). Returns `closed` if
+the connection died before the buffer could be flushed.
+
+## Examples
+
+```
+1> arterial_nif:handle_writable(PoolRef, 0, SlotId).
 ok
 ```
 """.
--spec create(pool(), pos_integer(), pos_integer(), boolean(), module(),
-              non_neg_integer()) -> ok.
-create(Pool, Size, Backlog, Fifo, Protocol, FixedTimeoutUs) ->
-  create(Pool, Size, Backlog, Fifo, Protocol, FixedTimeoutUs, 0).
+-spec handle_writable(pool_ref(), non_neg_integer(), non_neg_integer()) ->
+  ok | closed.
+handle_writable(_PoolRef, _StripeId, _SlotId) ->
+  ?NOT_LOADED_ERROR.
 
 -doc """
-Create a pool of `Size` connections with a per-connection backlog of
-`Backlog` in-flight requests (FIFO order if `Fifo` is true, otherwise
-random-access by wire-level request ID), using `Protocol` to encode/decode
-wire-level messages on every connection in the pool. Connections have no
-socket and are unavailable for checkout until `set_socket/3` +
-`make_available/2` are called on each one (see `arterial_connection`'s
-reconnect logic).
-
-`FixedTimeoutUs` selects how asynchronous in-flight requests tracked via
-`track_inflight/5` expire: `0` means each request uses its own timeout
-(the `TtlUs` passed to `track_inflight/5`); a positive value makes every
-in-flight request in this pool expire after that same fixed duration (the
-`TtlUs` argument to `track_inflight/5` is then ignored).
-
-`MaxWaiters` bounds the queue-when-busy feature used by `checkout_async/3`:
-`0` disables it (a checkout attempt with no connection available fails
-immediately, like `checkout_connection/2` does); a positive value allows
-up to that many callers to be queued while every connection is busy, each
-serviced (or timed out) later.
+Force-close slot `SlotId` of stripe `StripeId` (e.g. `arterial_bouncer`
+recycling a connection, or `arterial_connection` tearing one down) --
+deselects and closes its fd without sending any `closed` notification
+(the caller already knows; compare the `closed` event delivered by
+`handle_readable/3`/`send_and_release/3` discovering a dead peer on their
+own). The slot becomes unregistered and its stripe bit reverts to
+"unavailable" until a future `register_socket/4` reuses it.
 
 ## Examples
 
 ```
-1> arterial_nif:create(my_pool, 4, 16, true, my_protocol, 5000000, 100).
+1> arterial_nif:close_slot(PoolRef, 0, SlotId).
 ok
 ```
 """.
--spec create(pool(), pos_integer(), pos_integer(), boolean(), module(),
-              non_neg_integer(), non_neg_integer()) -> ok.
-create(Pool, Size, Backlog, Fifo, Protocol, FixedTimeoutUs, MaxWaiters) ->
-  create(Pool, Size, Backlog, Fifo, Protocol, FixedTimeoutUs, MaxWaiters, nproc).
+-spec close_slot(pool_ref(), non_neg_integer(), non_neg_integer()) -> ok.
+close_slot(_PoolRef, _StripeId, _SlotId) ->
+  ?NOT_LOADED_ERROR.
 
 -doc """
-Like `create/7`, but additionally controls the shard count of the pool's
-internal in-flight-request/queued-waiter registries (see
-`c_src/sharded_ttl_map.hpp`) via `TtlShards`:
+Enhanced `connect/7` with socket options support. Like `connect/7` but accepts
+an additional list of socket options to apply to the socket before connecting.
 
-* `nproc` (the default via `create/5`, `create/6`, `create/7`) picks a
-  shard count scaled to `std::thread::hardware_concurrency()` on the C++
-  side (see `ShardedTTLMap::DefaultShardCount()`) -- a good default for a
-  pool that doesn't share its scheduler budget with many sibling pools.
-* `{nproc, N}` multiplies that same core count by `N` instead of the
-  fixed factor `DefaultShardCount()` uses internally -- e.g. `{nproc, 4}`
-  for a pool expected to see unusually high concurrent contention, or
-  `{nproc, 1}` to shard more conservatively than the default on a pool
-  that mostly serves one caller at a time.
-* A positive integer overrides this directly with an exact shard count,
-  e.g. if many pools run on one machine and each should claim a smaller,
-  fixed share rather than each independently sizing itself off the whole
-  machine's core count.
-
-Contention on a single shard's lock only happens when multiple concurrent
-calls hash to the *same* shard at the *same* instant -- `nproc`/`{nproc,
-N}` bound how many calls can truly run concurrently (BEAM schedulers), but
-hashing isn't perfectly uniform, so a hot pool under heavy load may still
-see occasional collisions even with core-scaled sharding; pass a larger
-fixed value if profiling shows this registry's lock as a bottleneck for a
-specific pool.
+Socket options can be:
+- Atoms: `keepalive`, `nodelay`, `reuseaddr`
+- Tuples: `{keepalive, true}`, `{sndbuf, 8192}`, `{rcvbuf, 8192}`, etc.
 
 ## Examples
 
 ```
-1> arterial_nif:create(my_pool, 4, 16, true, my_protocol, 5000000, 100, nproc).
-ok
-2> arterial_nif:create(my_pool2, 4, 16, true, my_protocol, 5000000, 100, {nproc, 4}).
-ok
-3> arterial_nif:create(my_pool3, 4, 16, true, my_protocol, 5000000, 100, 8).
-ok
+1> arterial_nif:connect_with_opts(PoolRef, 0, {127,0,0,1}, 9000, 5000, true, self(), [keepalive, {sndbuf, 16384}]).
+{ok, SlotId}
 ```
 """.
--spec create(pool(), pos_integer(), pos_integer(), boolean(), module(),
-              non_neg_integer(), non_neg_integer(),
-              non_neg_integer() | nproc | {nproc, pos_integer()}) -> ok.
-create(Pool, Size, Backlog, Fifo, Protocol, FixedTimeoutUs, MaxWaiters, TtlShards)
-    when is_atom(Pool), is_integer(Size), Size > 0,
-         is_integer(Backlog), Backlog > 0, is_boolean(Fifo), is_atom(Protocol),
-         is_integer(FixedTimeoutUs), FixedTimeoutUs >= 0,
-         is_integer(MaxWaiters), MaxWaiters >= 0 ->
-  TtlShards1 = ttl_shards(TtlShards),
-  {ok, Resource} = create_pool(Size, Backlog, Fifo, FixedTimeoutUs, MaxWaiters, TtlShards1),
-  persistent_term:put(pool_key(Pool), Resource),
-  persistent_term:put(proto_key(Pool), Protocol),
-  Owner = ensure_table_owner(),
-  Owner ! {new_table, self(), buf_table(Pool)},
-  receive {Owner, table_ready} -> ok end,
-  ok.
-
-%% `nproc` -> 0, which create_pool/6 (the create_nif NIF) reads as "pick
-%% ShardedTTLMap::DefaultShardCount() based on
-%% std::thread::hardware_concurrency()". Resolving plain `nproc` to an
-%% actual number here instead would just duplicate that core-count logic
-%% on the Erlang side with a different (and possibly inconsistent)
-%% source of "how many cores" -- simplest to let the C++ side own that
-%% one default. `{nproc, N}` can't defer to C++ the same way (it needs
-%% its own core count, not DefaultShardCount()'s fixed multiplier), so it
-%% resolves the core count on the Erlang side via
-%% erlang:system_info/1 instead.
-ttl_shards(nproc) ->
-  0;
-ttl_shards({nproc, N}) when is_integer(N), N > 0 ->
-  Cores = case erlang:system_info(logical_processors_available) of
-    unknown -> erlang:system_info(logical_processors);
-    Known   -> Known
-  end,
-  N * max(1, Cores);
-ttl_shards(N) when is_integer(N), N >= 0 ->
-  N.
+-spec connect_with_opts(pool_ref(), non_neg_integer(), inet:ip4_address(),
+                        arterial:inet_port(), non_neg_integer(), boolean(),
+                        pid(), [atom() | {atom(), term()}]) ->
+  {ok, non_neg_integer()} |
+  {error, socket_failed | failed_to_set_nonblocking | connect_failed | timeout | stripe_full}.
+connect_with_opts(_PoolRef, _StripeId, _IP, _Port, _TimeoutMs, _Nodelay, _OwnerPid, _SocketOpts) ->
+  ?NOT_LOADED_ERROR.
 
 -doc """
-Destroy `Pool`'s NIF resource and release its associated bookkeeping
-(per-connection buffer table, persistent_term entries). The pool's
-supervisor and connection workers must already be stopped; this does not
-stop any processes itself.
-
-Safe to call even if `Pool`'s buffer table's owner process (see
-`create/7`) is gone for some other reason -- the table is simply assumed
-already collected in that case.
+Enhanced `connect_proto/8` with socket options support. Like `connect_proto/8`
+but accepts an additional list of socket options.
 
 ## Examples
 
 ```
-1> arterial_nif:destroy(my_pool).
-ok
+1> arterial_nif:connect_proto_with_opts(PoolRef, 0, {127,0,0,1}, 9000, 5000, tcp, true, self(), [keepalive]).
+{ok, SlotId}
 ```
 """.
--spec destroy(pool()) -> ok.
-destroy(Pool) when is_atom(Pool) ->
-  Resource = resource(Pool),
-  case ets:whereis(buf_table(Pool)) of
-    undefined -> ok;
-    _Tid      -> ets:delete(buf_table(Pool))
-  end,
-  persistent_term:erase(pool_key(Pool)),
-  persistent_term:erase(proto_key(Pool)),
-  destroy_pool(Resource).
-
--doc """
-Set the socket currently used by connection `ConnID` of `Pool`. Called by
-the connection worker right after it (re)connects, before
-`make_available/2`.
-
-## Examples
-
-```
-1> arterial_nif:set_socket(my_pool, 0, Socket).
-true
-```
-""".
--spec set_socket(pool(), non_neg_integer(), arterial:socket()) -> boolean().
-set_socket(Pool, ConnID, Socket) ->
-  ets:insert_new(buf_table(Pool), {ConnID, <<>>}),
-  set_socket_nif(resource(Pool), ConnID, Socket).
-
--doc """
-Mark connection `ConnID` of `Pool` as available for checkout. Called by
-the connection worker after `set_socket/3` succeeds.
-
-## Examples
-
-```
-1> arterial_nif:make_available(my_pool, 0).
-true
-```
-""".
--spec make_available(pool(), non_neg_integer()) -> boolean().
-make_available(Pool, ConnID) ->
-  make_available_nif(resource(Pool), ConnID).
-
--doc """
-Mark connection `ConnID` of `Pool` as unavailable for checkout (e.g. the
-connection just dropped). Called by the connection worker before
-disconnecting.
-
-## Examples
-
-```
-1> arterial_nif:make_unavailable(my_pool, 0).
-true
-```
-""".
--spec make_unavailable(pool(), non_neg_integer()) -> boolean().
-make_unavailable(Pool, ConnID) ->
-  make_unavailable_nif(resource(Pool), ConnID).
-
--doc """
-Returns `true` if connection `ConnID` of `Pool` currently has zero
-in-flight requests checked out of its backlog -- i.e. it's safe to
-disconnect without abandoning a pending request. Used to implement a
-"bounce" cycle: mark the connection unavailable (see `make_unavailable/2`)
-so no new request selects it, poll this until it drains, then disconnect
-and reconnect.
-
-## Examples
-
-```
-1> arterial_nif:connection_drained(my_pool, 0).
-true
-```
-""".
--spec connection_drained(pool(), non_neg_integer()) -> boolean().
-connection_drained(Pool, ConnID) ->
-  connection_drained_nif(resource(Pool), ConnID).
-
--doc """
-Notify every process with an in-flight, unconfirmed request on connection
-`ConnID` of `Pool` that the connection has died, then release those
-requests' backlog slots and make the connection available again. Call
-this from `arterial_connection`'s disconnect path right before closing a
-connection's socket (and before any reconnect attempt reuses `ConnID`).
-
-Each owning process receives one `{arterial_disconnected, Pool, ReqID}`
-message per outstanding request it still held on this connection (not
-batched into a single message, even if a process owned more than one),
-so it can resubmit or persist that specific request outside `arterial`.
-Only requests registered via `track_inflight/5` (the asynchronous path)
-are covered -- a synchronous caller blocked in its own `recv/2` call is
-not tracked here and instead learns about the dead connection directly
-from that call's `{error, closed}` return.
-
-A no-op if `ConnID` currently has no outstanding requests (e.g. a
-connection that was idle, or whose last request already timed out via
-`sweep_timeouts/1` or was checked in normally).
-
-## Examples
-
-```
-1> arterial_nif:connection_down(my_pool, 0).
-ok
-```
-""".
--spec connection_down(pool(), non_neg_integer()) -> ok.
-connection_down(Pool, ConnID) ->
-  connection_down_nif(resource(Pool), ConnID, Pool).
-
--doc """
-Bulk/cumulative ack (mode (f-2)): release every backlog slot on
-connection `ConnID` of `Pool` up to and including `UptoReqID`, in FIFO
-order -- as if `checkin_connection/4` had been called once per slot --
-for a protocol whose acks confirm "everything through sequence N" in one
-message instead of acking each request individually (e.g. a heartbeat
-carrying the last sequence number the server has fully processed).
-
-`UptoReqID` must be one of the `req_ids` returned by a prior
-`checkout_connection/2,3`/`checkout_async/3,4` call on this connection --
-it is not a raw protocol sequence number; mapping your protocol's own
-cumulative sequence number to the corresponding `req_id` is the caller's
-responsibility (e.g. by recording each `req_id` alongside the sequence
-number your protocol assigned it at send time).
-
-Only meaningful for a connection created with `fifo => true`
-(`create/6,7,8`) -- a no-op returning `{ok, []}` against a random-access
-backlog (`fifo => false`), since each of its requests is already
-individually id-matched and there's no FIFO order to collapse. Also a
-no-op if `UptoReqID` doesn't match any currently outstanding slot on
-`ConnID` (already checked in, never reserved, or belongs to a different
-connection) -- this is all-or-nothing, never a partial release.
-
-Unlike `checkin_connection/4`, the released requests may belong to
-*different* owning processes (each may have been reserved by a separate
-`checkout_async/3,4` call over time) -- each is released under its own
-owner's bookkeeping automatically. This does NOT send any notification
-to those owners (compare `connection_down/2`); it only releases backlog
-capacity. Only requests registered via `track_inflight/5` have their
-owner-table reservation released here -- this is expected to always be
-the case in practice, since a synchronous `call/3` caller has no way to
-participate in a bulk ack (it blocks for its own individual reply).
-
-## Examples
-
-```
-1> arterial_nif:checkin_up_to(my_pool, 0, 47).
-{ok, [42, 43, 47]}
-```
-""".
--spec checkin_up_to(pool(), non_neg_integer(), non_neg_integer()) ->
-  {ok, [non_neg_integer()]}.
-checkin_up_to(Pool, ConnID, UptoReqID) ->
-  checkin_up_to_nif(resource(Pool), ConnID, UptoReqID, Pool).
-
--doc """
-Equivalent to `checkout_connection/3` with `Samples = 1`.
-
-## Examples
-
-```
-1> arterial_nif:checkout_connection(my_pool, sync).
-{ok,#{conn_ref => #Ref<0.123.456.789>,conn_id => 0,
-      protocol => my_protocol,socket => Socket,buffer => <<>>,
-      req_ids => [42]}}
-```
-""".
--spec checkout_connection(pool(), mode()) ->
-  {ok, #{
-    conn_ref => reference(),
-    conn_id  => non_neg_integer(),
-    protocol => module(),
-    socket   => arterial:socket(),
-    buffer   => binary(),
-    req_ids  => [non_neg_integer()]
-  }} | {error, no_connection}.
-checkout_connection(Pool, Mode) when Mode =:= sync; Mode =:= async ->
-  checkout_connection(Pool, Mode, 1).
-
--doc """
-Check out a connection able to accept `Samples` new requests in one shot
--- i.e. reserve `Samples` backlog slots on a single connection, so the
-caller can multiplex that many concurrently outstanding requests on it
-(mode (d) of the backlog-matching design: `backlog > 1, fifo => true`).
-This only succeeds if one connection currently has `Samples` free slots
-AND is itself available (not already checked out by another caller);
-it never spreads `Samples` across multiple connections. `Mode` does not
-change the underlying reservation; it only selects how the caller
-intends to use the connection (kept for callers that want to log/
-instrument sync vs async use).
-
-`req_ids` in the result has exactly `Samples` entries, in the order the
-underlying backlog will expect replies back -- for a FIFO backlog
-(`fifo => true`), check them in in the same order with
-`checkin_connection/4` (one at a time or all together), since
-`FIFOBackLog::CheckIn` always resolves the oldest still-outstanding
-slot regardless of which `req_id` is passed; the protocol's wire-level
-reply order is the only thing keeping them lined up correctly. For a
-random-access backlog (`fifo => false`), `req_ids` order doesn't matter
-since each slot is resolved by its own id independently.
-
-Like `checkout_connection/2`, the calling process is monitored for as
-long as it holds the returned reservation: if it dies before calling
-`checkin_connection/2,4`, all `Samples` reserved backlog slots are
-released and the connection is made available again automatically (see
-`c:arterial_protocol`/death handling in the moduledoc).
-
-## Examples
-
-```
-1> arterial_nif:checkout_connection(my_pool, sync, 3).
-{ok,#{conn_ref => #Ref<0.123.456.789>,conn_id => 0,
-      protocol => my_protocol,socket => Socket,buffer => <<>>,
-      req_ids => [42,43,44]}}
-```
-""".
--spec checkout_connection(pool(), mode(), pos_integer()) ->
-  {ok, #{
-    conn_ref => reference(),
-    conn_id  => non_neg_integer(),
-    protocol => module(),
-    socket   => arterial:socket(),
-    buffer   => binary(),
-    req_ids  => [non_neg_integer()]
-  }} | {error, no_connection}.
-checkout_connection(Pool, Mode, Samples)
-    when (Mode =:= sync orelse Mode =:= async), is_integer(Samples), Samples > 0 ->
-  case checkout_nif(resource(Pool), self(), Samples) of
-    {ok, {ConnID, Socket, ReqIDs}} ->
-      Buffer = case ets:lookup(buf_table(Pool), ConnID) of
-        [{_, Buf}] -> Buf;
-        []         -> <<>>
-      end,
-      {ok, #{
-        conn_ref => make_ref(),
-        conn_id  => ConnID,
-        protocol => protocol(Pool),
-        socket   => Socket,
-        buffer   => Buffer,
-        req_ids  => ReqIDs
-      }};
-    {error, no_connection} ->
-      {error, no_connection}
-  end.
-
--doc """
-Release a connection back to the pool without completing any of its
-reserved requests (e.g. the connection died before a reply was received).
-The reserved backlog slots are intentionally not released here: the
-corresponding requests may still arrive on the wire once the connection
-is reused, and FIFO backlogs in particular require slots to be released
-in checkout order.
-
-Also tries to service the head of `Pool`'s queue-when-busy wait-list (see
-`checkout_async/3`) now that this connection is available again.
-
-Must be called by the same process that checked the connection out (see
-`checkout_connection/2`, `checkout_async/3`), since that's the process
-this call's matching `checkin_nif` call releases bookkeeping for.
-
-## Examples
-
-```
-1> arterial_nif:checkin_connection(my_pool, 0).
-ok
-```
-""".
--spec checkin_connection(pool(), non_neg_integer()) -> ok.
-checkin_connection(Pool, ConnID) ->
-  checkin_nif(resource(Pool), ConnID, [], Pool, self()).
-
--doc """
-Release a connection back to the pool after successfully completing
-requests `ReqIDs` (freeing their backlog slots), storing `Buffer` as the
-connection's leftover (undecoded) bytes for the next checkout.
-
-Also tries to service the head of `Pool`'s queue-when-busy wait-list (see
-`checkout_async/3`) now that this connection is available again.
-
-Must be called by the same process that checked the connection out (see
-`checkout_connection/2`, `checkout_async/3`), since that's the process
-this call's matching `checkin_nif` call releases bookkeeping for.
-
-## Examples
-
-```
-1> arterial_nif:checkin_connection(my_pool, 0, [42], <<>>).
-ok
-```
-""".
--spec checkin_connection(pool(), non_neg_integer(), [non_neg_integer()], binary()) -> ok.
-checkin_connection(Pool, ConnID, ReqIDs, Buffer)
-    when is_list(ReqIDs), is_binary(Buffer) ->
-  ets:insert(buf_table(Pool), {ConnID, Buffer}),
-  checkin_nif(resource(Pool), ConnID, ReqIDs, Pool, self()).
-
--doc "Equivalent to `checkout_async/4` with `Samples = 1`.".
--spec checkout_async(pool(), pid(), non_neg_integer()) ->
-  {ok, #{
-    conn_id  => non_neg_integer(),
-    protocol => module(),
-    socket   => arterial:socket(),
-    buffer   => binary(),
-    req_ids  => [non_neg_integer()]
-  }} | {queued, non_neg_integer()} | {error, no_connection}.
-checkout_async(Pool, Pid, TtlUs) ->
-  checkout_async(Pool, Pid, TtlUs, 1).
-
--doc """
-Check out a connection for asynchronous use with `Samples` backlog slots
-reserved on it in one shot (see `checkout_connection/3` for what
-multiplexing `Samples > 1` slots on a single connection means and its
-FIFO-ordering caveat), queuing the request (up to `Pool`'s `MaxWaiters`,
-see `create/7`) if no connection currently has `Samples` free slots
-instead of failing immediately. `TtlUs` bounds the total time from this
-call until a reply is checked in (covering both time spent queued and
-time spent in-flight once a connection is assigned); it's ignored if
-`Pool` was created with a fixed timeout (see `create/7`).
-
-Three outcomes:
-
-- `{ok, Map}` -- a connection was available immediately, exactly like
-  `checkout_connection/3`. No message will follow; `req_ids` in the
-  returned map (with `Samples` entries) are the correlation ids to use
-  with `checkin_connection/4`.
-- `{queued, WaiterID}` -- no connection currently had `Samples` free
-  slots, so the request was queued; the caller's process will later
-  receive either `{arterial_ready, Pool, ReqID, ConnID, Socket, ReqIDs}`
-  (call `checkin_connection/4` when done, using the real wire-level
-  `ReqID`/`ReqIDs` from that message, exactly as with a synchronous
-  checkout) or `{arterial_timeout, Pool, WaiterID}` if `TtlUs`
-  microseconds pass first while still queued. `WaiterID` (an opaque
-  internal id, NOT a wire-level request id) is only ever used to match
-  that eventual message back to this call.
-- `{error, no_connection}` -- no connection qualified AND the wait-list
-  was disabled (`MaxWaiters = 0`) or already full.
-
-## Examples
-
-```
-1> arterial_nif:checkout_async(my_pool, self(), 5000000, 1).
-{ok,#{conn_id => 0,protocol => my_protocol,socket => Socket,
-      buffer => <<>>,req_ids => [42]}}
-2> arterial_nif:checkout_async(my_pool, self(), 5000000, 1). % all connections busy
-{queued,7}
-```
-""".
--spec checkout_async(pool(), pid(), non_neg_integer(), pos_integer()) ->
-  {ok, #{
-    conn_id  => non_neg_integer(),
-    protocol => module(),
-    socket   => arterial:socket(),
-    buffer   => binary(),
-    req_ids  => [non_neg_integer()]
-  }} | {queued, non_neg_integer()} | {error, no_connection}.
-checkout_async(Pool, Pid, TtlUs, Samples)
-    when is_pid(Pid), is_integer(TtlUs), TtlUs >= 0, is_integer(Samples), Samples > 0 ->
-  case checkout_async_nif(resource(Pool), Pid, TtlUs, Samples) of
-    {ok, {ConnID, Socket, ReqIDs}} ->
-      Buffer = case ets:lookup(buf_table(Pool), ConnID) of
-        [{_, Buf}] -> Buf;
-        []         -> <<>>
-      end,
-      {ok, #{
-        conn_id  => ConnID,
-        protocol => protocol(Pool),
-        socket   => Socket,
-        buffer   => Buffer,
-        req_ids  => ReqIDs
-      }};
-    {queued, WaiterID} ->
-      {queued, WaiterID};
-    {error, no_connection} ->
-      {error, no_connection}
-  end.
-
--doc """
-Register `ReqID` (reserved on connection `ConnID`, as returned by
-`checkout_connection/2`) as an in-flight asynchronous request owned by
-`Pid`, so that if no matching `checkin_connection/2,4` call (which
-untracks it) happens within `TtlUs` microseconds, `Pid` receives
-`{arterial_timeout, Pool, ReqID}` the next time `sweep_timeouts/1` runs,
-and `ReqID`'s backlog slot on `ConnID` is released automatically.
-
-`Pid` must be the same process that performed the checkout
-(`checkout_connection/2` or `checkout_async/3`) -- on timeout, the
-reservation is released under that same pid's bookkeeping, so passing a
-different pid here is undefined behavior (and may eventually exhaust the
-pool's owner-tracking capacity instead of releasing anything).
-
-Only meant for the asynchronous request path: synchronous callers block
-on their own socket-level timeout and never need this. `TtlUs` is ignored
-if `Pool` was created with a fixed timeout (see `create/6`).
-
-## Examples
-
-```
-1> arterial_nif:track_inflight(my_pool, 0, 42, self(), 5000000).
-ok
-```
-""".
--spec track_inflight(pool(), non_neg_integer(), non_neg_integer(), pid(),
-                      non_neg_integer()) -> ok.
-track_inflight(Pool, ConnID, ReqID, Pid, TtlUs)
-    when is_integer(ConnID), is_integer(ReqID), is_pid(Pid),
-         is_integer(TtlUs), TtlUs >= 0 ->
-  track_inflight_nif(resource(Pool), ConnID, ReqID, Pid, TtlUs).
-
--doc """
-Evict every in-flight request of `Pool` that has expired, sending each
-owning process `{arterial_timeout, Pool, ReqID}`. Meant to be called
-periodically (e.g. via `erlang:send_after/3`) by a supervised process;
-see `arterial_sweeper`.
-
-## Examples
-
-```
-1> arterial_nif:sweep_timeouts(my_pool).
-{ok,2}
-```
-""".
--spec sweep_timeouts(pool()) -> {ok, non_neg_integer()}.
-sweep_timeouts(Pool) ->
-  sweep_timeouts_nif(resource(Pool), Pool).
+-spec connect_proto_with_opts(pool_ref(), non_neg_integer(), inet:ip4_address(),
+                              arterial:inet_port(), non_neg_integer(),
+                              tcp | udp | ssl, boolean(), pid(), [atom() | {atom(), term()}]) ->
+  {ok, non_neg_integer()} |
+  {error, socket_failed | failed_to_set_nonblocking | connect_failed | timeout | stripe_full | unsupported_protocol}.
+connect_proto_with_opts(_PoolRef, _StripeId, _IP, _Port, _TimeoutMs, _Protocol, _Nodelay, _OwnerPid, _SocketOpts) ->
+  ?NOT_LOADED_ERROR.
 
 %%%-----------------------------------------------------------------------------
-%%% Internal functions
+%%% NIF loading
 %%%-----------------------------------------------------------------------------
 
-pool_key(Pool)  -> {?MODULE, Pool, resource}.
-proto_key(Pool) -> {?MODULE, Pool, protocol}.
-buf_table(Pool) -> list_to_atom("arterial_buf_" ++ atom_to_list(Pool)).
-
-resource(Pool) ->
-  case persistent_term:get(pool_key(Pool), undefined) of
-    undefined -> error({unknown_pool, Pool});
-    Resource  -> Resource
-  end.
-
-protocol(Pool) ->
-  case persistent_term:get(proto_key(Pool), undefined) of
-    undefined -> error({unknown_pool, Pool});
-    Protocol  -> Protocol
-  end.
-
-%% ETS tables die with the process that created them. create/7 may run
-%% inside a caller-supplied process (e.g. an arterial_pool supervisor's
-%% init/1), which can legitimately stop independently of destroy/1 being
-%% called (e.g. a supervisor:stop/1 during teardown, or a crash/restart).
-%% A buffer table created there would vanish under the connections still
-%% using it. Routing every create/7 through one long-lived owner process
-%% decouples each pool's buffer table lifetime from whichever process
-%% happened to call create/7.
-%%
-%% Deliberately a bare spawn/receive loop instead of a gen_server: it has
-%% exactly one message and no state besides "am I alive" -- start_link/
-%% init/handle_call scaffolding would add ceremony without adding safety
-%% here. start_link/0 below lets a supervisor own its lifecycle like any
-%% other OTP worker even though its loop isn't gen_server-shaped.
--define(TABLE_OWNER, arterial_nif_table_owner).
-
--doc """
-Start (and register) the singleton process that owns every pool's
-per-connection buffer ETS table, linked to the caller.
-
-Started as a permanent child of `arterial_sup` when the `arterial`
-application is running (see `arterial_app`), so that stopping the
-application takes this process -- and every buffer table it owns -- down
-with it, rather than leaking them across application restarts.
-
-Pools created without the `arterial` application running at all (e.g. in
-tests that call `arterial_pool:start_link/2` directly) never call this;
-`create/7` falls back to lazily spawning its own unsupervised, unlinked
-owner the first time it's needed in that case (see `ensure_table_owner/0`).
-""".
--spec start_link() -> {ok, pid()}.
-start_link() ->
-  Pid = spawn_link(fun table_owner_loop/0),
-  true = register(?TABLE_OWNER, Pid),
-  {ok, Pid}.
-
-ensure_table_owner() ->
-  case whereis(?TABLE_OWNER) of
-    undefined ->
-      Pid = spawn(fun table_owner_loop/0),
-      %% Lost the race against a concurrent create/7: use whichever
-      %% registration won instead of leaking our own spawn.
-      try register(?TABLE_OWNER, Pid) of
-        true -> Pid
-      catch
-        error:badarg -> exit(Pid, kill), whereis(?TABLE_OWNER)
-      end;
-    Pid ->
-      Pid
-  end.
-
-table_owner_loop() ->
-  receive
-    {new_table, From, Table} ->
-      ets:new(Table, [set, public, named_table]),
-      From ! {self(), table_ready},
-      table_owner_loop()
-  end.
-
-%%%-----------------------------------------------------------------------------
-%%% NIF functions
-%%%-----------------------------------------------------------------------------
-
-create_pool(_Size, _Backlog, _Fifo, _FixedTtlUs, _MaxWaiters, _TtlShards) -> ?NOT_LOADED_ERROR.
-destroy_pool(_Rsrc)                                      -> ?NOT_LOADED_ERROR.
-set_socket_nif(_Rsrc, _ConnID, _Socket)                  -> ?NOT_LOADED_ERROR.
-make_available_nif(_Rsrc, _ConnID)                       -> ?NOT_LOADED_ERROR.
-make_unavailable_nif(_Rsrc, _ConnID)                     -> ?NOT_LOADED_ERROR.
-connection_drained_nif(_Rsrc, _ConnID)                    -> ?NOT_LOADED_ERROR.
-connection_down_nif(_Rsrc, _ConnID, _PoolName)            -> ?NOT_LOADED_ERROR.
-checkin_up_to_nif(_Rsrc, _ConnID, _UptoReqID, _PoolName)  -> ?NOT_LOADED_ERROR.
-checkout_nif(_Rsrc, _Pid, _Samples)                      -> ?NOT_LOADED_ERROR.
-checkin_nif(_Rsrc, _ConnID, _ReqIDs, _PoolName, _Pid)    -> ?NOT_LOADED_ERROR.
-checkout_async_nif(_Rsrc, _Pid, _TtlUs, _Samples)        -> ?NOT_LOADED_ERROR.
-track_inflight_nif(_Rsrc, _ConnID, _ReqID, _Pid, _TtlUs) -> ?NOT_LOADED_ERROR.
-sweep_timeouts_nif(_Rsrc, _PoolName)                     -> ?NOT_LOADED_ERROR.
-
+-doc false.
 init() ->
-  SoName  =
-    case code:priv_dir(?LIBNAME) of
-      {error, bad_name} ->
-        case code:which(?MODULE) of
-          Filename when is_list(Filename) ->
-            Dir = filename:dirname(filename:dirname(Filename)),
-            filename:join([Dir, "priv", "arterial"]);
-          _ ->
-            filename:join("../priv", "arterial")
-        end;
-      Dir ->
-        filename:join(Dir, "arterial")
+  SoName = case code:priv_dir(?LIBNAME) of
+    {error, bad_name} ->
+      case code:which(?MODULE) of
+        Filename when is_list(Filename) ->
+          Dir = filename:dirname(filename:dirname(Filename)),
+          filename:join([Dir, "priv", "arterial_nif"]);
+        _ ->
+          filename:join("../priv", "arterial_nif")
+      end;
+    Dir ->
+      filename:join(Dir, "arterial_nif")
   end,
   erlang:load_nif(SoName, 0).

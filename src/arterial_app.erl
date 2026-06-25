@@ -5,13 +5,13 @@ The `arterial` OTP application and its top-level supervisor.
 
 `arterial_sup` is a static `one_for_one` supervisor with two children:
 
-- `arterial_nif` (a worker; see `arterial_nif:start_link/0`) -- the
-  singleton process that owns every pool's per-connection buffer ETS
-  table, so that those tables are torn down when the `arterial`
-  application stops rather than leaking across restarts.
+- `arterial_observe` (a worker; see `arterial_observe:start_link/2`) -- the
+  observability backend for metrics and tracing.
 - `arterial_pool_sup`, a `simple_one_for_one` supervisor whose children
   are `arterial_pool` supervisors, one per pool started via
   `arterial_pool:start_link/2`.
+
+This version only supports the NIF-based arterial implementation.
 """.
 
 -behaviour(application).
@@ -81,11 +81,8 @@ init([]) ->
       {Mod, Opts} when is_atom(Mod) -> {Mod, Opts}
     end,
 
-  %% Top-level: the singleton arterial_nif table owner plus the
-  %% simple_one_for_one sub-supervisor for pools below. A
-  %% simple_one_for_one supervisor can only ever hold one (homogeneous)
-  %% child spec, so arterial_nif can't be a sibling inside it directly --
-  %% it needs this static one_for_one wrapper instead.
+  %% Top-level: the observability backend plus the simple_one_for_one
+  %% sub-supervisor for arterial2 pools below.
   {ok, {{one_for_one, 5, 10}, [
     #{
       id       => arterial_observe,
@@ -93,15 +90,7 @@ init([]) ->
       restart  => permanent,
       shutdown => 1000,
       type     => worker,
-      modules  => [arterial_nif]
-    },
-    #{
-      id       => arterial_nif,
-      start    => {arterial_nif, start_link, []},
-      restart  => permanent,
-      shutdown => 1000,
-      type     => worker,
-      modules  => [arterial_nif]
+      modules  => [arterial_observe]
     },
     #{
       id       => arterial_pool_sup,
@@ -115,11 +104,11 @@ init([]) ->
 init(pool_sup) ->
   {ok, {{simple_one_for_one, 5, 10}, [
     #{
-      id       => undefined,                       % Id       = internal id
+      id       => undefined,                        % Id       = internal id
       start    => {arterial_pool, start_link, []}, % StartFun = {M, F, A}
-      restart  => permanent,                       % Restart  = permanent | transient | temporary
-      shutdown => infinity,                        % Shutdown = brutal_kill | int() >= 0 | infinity
-      type     => supervisor,                      % Type     = worker | supervisor
+      restart  => permanent,                        % Restart  = permanent | transient | temporary
+      shutdown => infinity,                         % Shutdown = brutal_kill | int() >= 0 | infinity
+      type     => supervisor,                       % Type     = worker | supervisor
       modules  => [arterial_pool]                  % Modules  = [Module] | dynamic
     }
   ]}}.

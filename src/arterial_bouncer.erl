@@ -1,39 +1,15 @@
 -module(arterial_bouncer).
 
 -moduledoc """
-Periodic `gen_server` that recycles a pool's connections one at a time:
-on each `bounce_interval_ms` tick, it bounces the next connection (in
-round-robin order) via `arterial_connection:bounce/2` -- marking it
-unavailable, waiting for its backlog to drain, then disconnecting and
-reconnecting it -- before going idle until the next tick. A full pool
-rotation therefore takes `Size * bounce_interval_ms`.
+Periodic `gen_server` that recycles one of `arterial_pool`'s connections
+at a time, round-robin -- the same role and rationale as `arterial_bouncer`
+in the original backend (see its moduledoc for the full "why bounce
+connections at all" rationale, identical here), just driving
+`arterial_connection:bounce/2` instead.
 
 Started once per pool by `arterial_pool`'s supervisor only if the
 `bounce_interval_ms` option is set; not meant to be used directly by
 callers of the library.
-
-## Why bounce connections at all?
-
-A connection pool's sockets are normally connected once and kept open
-indefinitely -- great for latency, but it means whatever backend
-endpoint a connection resolved to at connect time is the endpoint it
-talks to forever, even if better/different endpoints become available
-later. This is a real problem behind a Kubernetes `Service` fronting a
-`Deployment` that autoscales: the Service's DNS name or virtual IP only
-balances *new* connections across the current set of pod endpoints --
-existing long-lived connections are never rebalanced. So:
-
-* When the `Deployment` scales up, pods added by the autoscaler receive
-  no traffic at all, since every existing connection is already pinned
-  to one of the older pods.
-* When it scales down, connections pinned to a terminated pod either
-  break outright or (worse, depending on the Service/proxy setup) sit
-  silently broken until a request actually tries to use them.
-
-Periodically bouncing each connection forces it to re-resolve and
-reconnect through the Service on a regular cadence, so load gradually
-spreads across whatever set of backend pods currently exists -- without
-ever taking more than one connection out of service at a time.
 """.
 
 -behaviour(gen_server).
@@ -58,8 +34,8 @@ ever taking more than one connection out of service at a time.
 Start a process that bounces one connection of `Pool` (out of `Size`
 total, ids `0..Size-1`) every `IntervalMs` milliseconds, round-robin.
 `DrainTimeoutMs` bounds how long a single bounce waits for its
-connection's backlog to drain before forcing the disconnect anyway (see
-`arterial_connection:bounce/2`).
+connection's in-flight correlation entries to drain before forcing the
+disconnect anyway (see `arterial_connection:bounce/2`).
 
 ## Examples
 
@@ -122,7 +98,7 @@ bounce(Pool, ConnID, DrainTimeoutMs) ->
         {error, timeout} ->
           ?LOG_WARNING("~w: bounce of connection ~p timed out waiting for drain", [Pool, ConnID])
       catch
-        exit:{noproc, _} -> ok; % worker not up right now; skip this tick
+        exit:{noproc, _} -> ok;
         exit:{normal, _} -> ok;
         E:R              ->
           ?LOG_WARNING("~w: bounce of connection ~p failed: ~p:~p", [Pool, ConnID, E, R])

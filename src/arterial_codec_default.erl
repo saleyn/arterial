@@ -1,18 +1,18 @@
--module(arterial_codec2_default).
+-module(arterial_codec_default).
 
 -moduledoc """
-Default `arterial_codec2` implementation: frames each message as
+Default `arterial_codec` implementation: frames each message as
 `<<CorrId:32, Len:32, Payload:Len/binary>>` with `Payload =
 term_to_binary(Term)` -- the same convention `test_echo_protocol` uses
 for the original backend, just with the request id repurposed as the
-pool-wide dispatch correlation id (see `arterial_codec2`'s moduledoc).
+pool-wide dispatch correlation id (see `arterial_codec`'s moduledoc).
 
 Good enough for tests and for any protocol willing to adopt this exact
 framing; real-world wire protocols with their own request-id field and
-framing should implement `arterial_codec2` directly instead.
+framing should implement `arterial_codec` directly instead.
 """.
 
--behaviour(arterial_codec2).
+-behaviour(arterial_codec).
 
 -export([encode_request/2, decode/1]).
 -export([frame/2, unframe/1]).

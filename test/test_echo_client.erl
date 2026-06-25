@@ -1,5 +1,4 @@
 -module(test_echo_client).
--behaviour(arterial_client).
 
 -moduledoc """
 Minimal `arterial_client` callback module paired with
