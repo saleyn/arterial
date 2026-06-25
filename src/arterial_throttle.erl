@@ -1,11 +1,11 @@
--module(arterial_throttle2).
+-module(arterial_throttle).
 
 -moduledoc """
-Per-connection token-bucket rate limiter for `arterial_pool2`, backed by
+Per-connection token-bucket rate limiter for `arterial_pool`, backed by
 a single `atomics` array (two cells per connection: milli-tokens and the
 microsecond timestamp they were last refilled at) -- no NIF involved,
-just plain `atomics` operations, checked by `arterial_client2:call/3`/
-`cast/2` before attempting `arterial_nif_pool:send_and_release/3` on a
+just plain `atomics` operations, checked by `arterial_client:call/3`/
+`cast/2` before attempting `arterial_nif:send_and_release/3` on a
 connection's stripe.
 
 Best-effort, not perfectly linearizable: under heavy concurrent
@@ -17,7 +17,7 @@ makes the next refill's elapsed-time estimate very slightly off), and
 unlike the original backend's NIF-resident `basic_time_spacing_throttle`
 (`c_src/throttle.hpp`), this is intentionally simple Erlang-side
 bookkeeping, consistent with this whole backend's design of keeping
-`arterial_nif_pool` itself down to raw I/O only.
+`arterial_nif` itself down to raw I/O only.
 
 Tokens are tracked scaled by 1000 ("milli-tokens") so fractional
 per-microsecond refill rates don't need floats.
@@ -33,7 +33,7 @@ call (see below).
 ## Examples
 
 ```
-1> arterial_throttle2:new(4).
+1> arterial_throttle:new(4).
 #Ref<0.123.456.789>
 ```
 """.
@@ -46,7 +46,7 @@ Try to consume one token for connection `ConnID` against a bucket
 refilling at `RatePerSec` tokens/second, capped at `Burst` tokens.
 Returns `true` (and consumes the token) if one was available, `false`
 otherwise -- callers should treat `false` like a busy connection (e.g.
-try a different stripe; see `arterial_client2`).
+try a different stripe; see `arterial_client`).
 
 A connection's bucket starts implicitly full (every cell in the
 `atomics` array `new/1` allocates starts at `0`, which this function
@@ -56,8 +56,8 @@ refill to a full `Burst`) -- no separate initialization call needed.
 ## Examples
 
 ```
-1> Ref = arterial_throttle2:new(4).
-2> arterial_throttle2:allow(Ref, 0, 100, 10).
+1> Ref = arterial_throttle:new(4).
+2> arterial_throttle:allow(Ref, 0, 100, 10).
 true
 ```
 """.

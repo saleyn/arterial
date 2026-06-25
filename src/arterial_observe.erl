@@ -221,7 +221,7 @@ span(EventNameSuffix, StartMetadata, Fun) when is_list(EventNameSuffix), is_func
 
 -doc """
 Whether an observability backend is currently configured. Callers on a
-hot path (e.g. `arterial_client2:call/3,2`) can check this first to skip
+hot path (e.g. `arterial_client:call/3,2`) can check this first to skip
 building `span/3`'s metadata map and closure entirely when there's no
 backend to receive them -- `span/3` itself only skips the *event
 emission* cost in that case, not the construction cost its caller
@@ -258,6 +258,7 @@ backend() ->
           prometheus            -> arterial_observe_prometheus;
           telemetry             -> arterial_observe_telemetry;
           nil                   -> nil;
+          undefined             -> nil;
           Mod when is_atom(Mod) -> Mod
         end,
       persistent_term:put(?MODULE, Module),

@@ -29,10 +29,11 @@ setup(Size) ->
   {ok, Srv} = test_tcp_server:start(0),
   Port = test_tcp_server:port(Srv),
   {ok, SupPid} = arterial_pool:start_link(tcp_echo_pool, #{
-    size        => Size,
-    protocol    => test_echo_protocol,
-    client      => test_echo_client,
-    client_opts => #{address => "127.0.0.1", port => Port, protocol => tcp}
+    size      => Size,
+    codec     => test_echo_protocol,
+    address   => "127.0.0.1",
+    port      => Port,
+    protocol  => tcp
   }),
   try
     %% Give the pool's connections a moment to dial in before the test
@@ -55,38 +56,29 @@ teardown({Srv, SupPid}) ->
       end;
     false -> ok
   end,
-  try arterial_nif:destroy(tcp_echo_pool) catch _:_ -> ok end,
+  arterial_pool:stop(tcp_echo_pool),
   test_tcp_server:stop(Srv).
 
-%% Block until all `N' connections of `Pool' have (re)connected, by
-%% checking out all of them at once (so they must all be simultaneously
-%% available) and then checking each back in with its reserved ReqID, so
-%% as not to (per checkin_connection/2's contract) permanently strand
-%% that backlog slot.
+%% Block until all `N' connections of `Pool' have (re)connected by
+%% checking that all connections are marked as available in the pool's
+%% availability bitmap.
 wait_until_available(Pool, N, Retries) ->
-  case checkout_n(Pool, N, []) of
-    {ok, Reservations} ->
-      lists:foreach(
-        fun({ConnID, ReqIDs}) -> ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, <<>>) end,
-        Reservations);
-    {error, no_connection} when Retries > 0 ->
+  case check_all_available(Pool, N) of
+    true -> ok;
+    false when Retries > 0 ->
       timer:sleep(20),
       wait_until_available(Pool, N, Retries - 1);
-    {error, no_connection} ->
+    false ->
       error(pool_not_ready)
   end.
 
-checkout_n(_Pool, 0, Acc) ->
-  {ok, Acc};
-checkout_n(Pool, N, Acc) ->
-  case arterial_nif:checkout_connection(Pool, sync) of
-    {ok, #{conn_id := ConnID, req_ids := ReqIDs}} ->
-      checkout_n(Pool, N - 1, [{ConnID, ReqIDs} | Acc]);
-    {error, no_connection} = Error ->
-      lists:foreach(
-        fun({ConnID, ReqIDs}) -> ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, <<>>) end,
-        Acc),
-      Error
+check_all_available(Pool, N) ->
+  try
+    lists:all(fun(ConnID) ->
+      arterial_pool:is_available(Pool, ConnID)
+    end, lists:seq(0, N - 1))
+  catch
+    error:{unknown_pool, _} -> false
   end.
 
 tcp_echo_test() ->
@@ -175,10 +167,10 @@ tcp_bounce_waits_for_drain_test() ->
     spawn(fun() -> Parent ! {slow_result, arterial_client:call(tcp_echo_pool, {delay, 150, slow}, 1000)} end),
     timer:sleep(20), % give the slow call time to actually check out conn 0
 
-    {ok, Pid} = conn_pid(tcp_echo_pool, 0),
+    {ok, Pid}   = conn_pid(tcp_echo_pool, 0),
     BounceStart = erlang:monotonic_time(millisecond),
-    ok = arterial_connection:bounce(Pid, 1000),
-    BounceMs = erlang:monotonic_time(millisecond) - BounceStart,
+    ok          = arterial_connection:bounce(Pid, 1000),
+    BounceMs    = erlang:monotonic_time(millisecond) - BounceStart,
 
     %% The bounce must not have returned before the slow call's ~150ms
     %% reply landed -- proves it waited for drain rather than abandoning
@@ -235,14 +227,11 @@ tcp_multi_address_failover_test() ->
   ok = test_tcp_server:stop(DeadSrv),
 
   {ok, SupPid} = arterial_pool:start_link(tcp_echo_pool, #{
-    size        => 1,
-    protocol    => test_echo_protocol,
-    client      => test_echo_client,
-    client_opts => #{
-      addresses => ["127.0.0.2", "127.0.0.1"],
-      port      => Port,
-      protocol  => tcp
-    }
+    size => 1,
+    codec => arterial_codec_default,
+    addresses => ["127.0.0.2", "127.0.0.1"],
+    port => Port,
+    protocol => tcp
   }),
   try
     wait_until_available(tcp_echo_pool, 1, 100),
@@ -252,7 +241,7 @@ tcp_multi_address_failover_test() ->
       true -> supervisor:stop(SupPid);
       false -> ok
     end,
-    try arterial_nif:destroy(tcp_echo_pool) catch _:_ -> ok end,
+    arterial_pool:stop(tcp_echo_pool),
     test_tcp_server:stop(Srv)
   end.
 
@@ -272,16 +261,13 @@ tcp_multi_address_per_entry_port_test() ->
   Port = test_tcp_server:port(Srv),
 
   {ok, SupPid} = arterial_pool:start_link(tcp_echo_pool, #{
-    size        => 1,
-    protocol    => test_echo_protocol,
-    client      => test_echo_client,
-    client_opts => #{
-      addresses => [
-        #{address => "127.0.0.1", port => DeadPort},
-        #{address => "127.0.0.1", port => Port}
-      ],
-      protocol => tcp
-    }
+    size => 1,
+    codec => arterial_codec_default,
+    addresses => [
+      #{address => "127.0.0.1", port => DeadPort},
+      #{address => "127.0.0.1", port => Port}
+    ],
+    protocol => tcp
   }),
   try
     wait_until_available(tcp_echo_pool, 1, 100),
@@ -291,6 +277,6 @@ tcp_multi_address_per_entry_port_test() ->
       true -> supervisor:stop(SupPid);
       false -> ok
     end,
-    try arterial_nif:destroy(tcp_echo_pool) catch _:_ -> ok end,
+    arterial_pool:stop(tcp_echo_pool),
     test_tcp_server:stop(Srv)
   end.

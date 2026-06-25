@@ -13,7 +13,7 @@ profile of the *same* VM the client/NIF code under test is running in,
 alongside whatever is actually being profiled. Running the server as a
 separate OS process moves that noise out of the profiled VM entirely.
 
-Used by `arterial_bench`, `arterial_bench2`, `shackle_bench`, and
+Used by `arterial_bench`, `arterial_bench`, `shackle_bench`, and
 `poolboy_bench` via their `external_server` opt -- see each module's
 `help/0`. Defaults to `false` (in-process) everywhere; only flip it on
 when profiling the client side in isolation.

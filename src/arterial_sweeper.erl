@@ -1,8 +1,12 @@
 -module(arterial_sweeper).
 
 -moduledoc """
-Periodic `gen_server` that calls `arterial_nif:sweep_timeouts/1` for a
-pool, evicting expired in-flight asynchronous requests.
+Periodic `gen_server` that evicts expired in-flight requests from
+`arterial_pool`'s correlation-id ETS table, mirroring
+`arterial_sweeper`'s role in the original backend (see
+`arterial_nif:sweep_timeouts/1`) -- except entirely in plain Erlang here,
+since the bookkeeping it sweeps lives in an ETS table this backend owns
+directly, not inside a NIF resource.
 
 Started once per pool by `arterial_pool`'s supervisor; not meant to be
 used directly by callers of the library.
@@ -22,10 +26,11 @@ used directly by callers of the library.
 %%% Public API
 %%%-----------------------------------------------------------------------------
 -doc """
-Start a process that calls `arterial_nif:sweep_timeouts/1` for `Pool`
-every `IntervalMs` milliseconds, evicting any in-flight async request
-whose TTL has expired and notifying its owning process with
-`{arterial_timeout, Pool, ReqID}` (see `arterial_nif:track_inflight/5`).
+Start a process that evicts every expired entry of `Pool`'s correlation
+table every `IntervalMs` milliseconds, sending each owning process
+`{arterial_timeout, Pool, CorrId}` (matching `arterial_client:call/3`'s
+own `receive` clause for it, for entries whose owner is still waiting
+when the sweep beats its own `after Timeout`).
 
 ## Examples
 
@@ -57,7 +62,7 @@ handle_cast(_Msg, State) ->
 
 -doc false.
 handle_info(sweep, #state{pool = Pool} = State) ->
-  {ok, Count} = arterial_nif:sweep_timeouts(Pool),
+  Count = sweep(Pool),
   arterial_observe:event([sweep, stop], #{expired_count => Count}, #{pool => Pool}),
   schedule(State),
   {noreply, State}.
@@ -65,6 +70,20 @@ handle_info(sweep, #state{pool = Pool} = State) ->
 %%%-----------------------------------------------------------------------------
 %%% Internal functions
 %%%-----------------------------------------------------------------------------
+
+%% Deadlines are microsecond timestamps (see arterial_util:calc_expiration/2)
+%% or the atom `infinity` -- `infinity < Now` is always false under
+%% Erlang's standard term order (atoms compare greater than any number),
+%% so infinity-deadline entries are naturally never selected here.
+sweep(Pool) ->
+  Now = os:system_time(microsecond),
+  Table = arterial_pool:corr_table(Pool),
+  Expired = ets:select(Table, [{{'$1', '$2', '$3', '$4'}, [{'<', '$4', Now}], [{{'$1', '$2'}}]}]),
+  lists:foreach(fun({CorrId, Pid}) ->
+    ets:delete(Table, CorrId),
+    Pid ! {arterial_timeout, Pool, CorrId}
+  end, Expired),
+  length(Expired).
 
 schedule(#state{interval_ms = IntervalMs}) ->
   erlang:send_after(IntervalMs, self(), sweep).
