@@ -368,7 +368,8 @@ static int notify_and_close(ErlNifEnv* env, PoolContext* ctx,
     enif_send(env, &slot.owner_pid, msg_env, msg);
   }
 
-  // Clean up slot state and lease mask immediately to allow reuse
+  // Clear status and lease bit immediately so claim_slot can reuse this
+  // slot. Leave fd so pool_resource_stop can find and close it.
   slot.status.store(SLOT_EMPTY, std::memory_order_release);
   auto& stripe = *ctx->stripes[slot.stripe_id];
   stripe.lease_mask.fetch_and(~(1ULL << slot.slot_id),
@@ -398,7 +399,7 @@ static ERL_NIF_TERM claim_slot(ErlNifEnv* env, PoolContext* ctx,
       return make(env, std::make_tuple(am_error, am_stripe_full));
 
     auto& slot = stripe.slots[slot_id];
-    if (slot.fd > -1) {
+    if (slot.status.load(std::memory_order_acquire) != SLOT_EMPTY) {
       current_mask |= (1ULL << slot_id);
       continue;
     }
@@ -467,7 +468,7 @@ static void pool_resource_stop(PoolContext* ctx, ErlNifEnv*, ErlNifEvent fd, int
         slot.pending_buffer.clear();
         slot.bytes_written = 0;
         slot.status.store(SLOT_EMPTY, std::memory_order_release);
-        stripe.lease_mask.fetch_or(1ULL << slot.slot_id, std::memory_order_release);
+        stripe.lease_mask.fetch_and(~(1ULL << slot.slot_id), std::memory_order_release);
         return;
       }
     }
@@ -990,6 +991,25 @@ static ERL_NIF_TERM handle_readable_nif(ErlNifEnv* env, int argc, const ERL_NIF_
   auto bin_term = TERM(enif_make_binary(env, &bin));
 
   arm_read(env, ctx, slot);
+
+  // FIFO Mode 3: if this slot is reserved, deliver reply directly
+  // to the waiting caller instead of returning bytes for codec decoding.
+  if (slot.fifo_request_active.load(std::memory_order_acquire)) {
+    nifpp::msg_env msg_env;
+    auto reply_msg = make(msg_env, std::make_tuple(
+      am_arterial_fifo_reply,
+      slot.stripe_id,
+      slot.slot_id,
+      bin_term
+    ));
+    enif_send(env, &slot.fifo_requester_pid, msg_env, reply_msg);
+    slot.clear_fifo_request();
+    // Return empty binary so arterial_connection has nothing to decode.
+    ErlNifBinary empty;
+    enif_alloc_binary(0, &empty);
+    return make(env, std::make_tuple(am_ok, TERM(enif_make_binary(env, &empty))));
+  }
+
   return make(env, std::make_tuple(am_ok, bin_term));
 }
 
@@ -1772,7 +1792,7 @@ static ERL_NIF_TERM connect_async_proto_nif(ErlNifEnv* env, int argc, const ERL_
         }
 
         auto& slot = stripe.slots[slot_id];
-        if (slot.fd > -1) {
+        if (slot.status.load(std::memory_order_acquire) != SLOT_EMPTY) {
           current_mask |= (1ULL << slot_id);
           continue;
         }
@@ -1844,7 +1864,7 @@ static ERL_NIF_TERM connect_async_proto_nif(ErlNifEnv* env, int argc, const ERL_
       }
 
       auto& slot = stripe.slots[slot_id];
-      if (slot.fd > -1) {
+      if (slot.status.load(std::memory_order_acquire) != SLOT_EMPTY) {
         current_mask |= (1ULL << slot_id);
         continue;
       }
@@ -1895,6 +1915,13 @@ static ERL_NIF_TERM close_slot_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
 #ifdef HAVE_OPENSSL
   cleanup_slot_ssl(slot);
 #endif
+
+  // Clear lease bit and set status to SLOT_EMPTY immediately so
+  // claim_slot (which checks status, not fd) can reuse this slot before
+  // the async pool_resource_stop callback fires and calls close(fd).
+  slot.status.store(SLOT_EMPTY, std::memory_order_release);
+  auto& stripe = *ctx->stripes[slot.stripe_id];
+  stripe.lease_mask.fetch_and(~(1ULL << slot.slot_id), std::memory_order_release);
 
   enif_select(env, slot.fd, ERL_NIF_SELECT_STOP, ctx, nullptr, am_stop);
   return am_ok;
@@ -2324,6 +2351,10 @@ static ERL_NIF_TERM send_fifo_request_nif(ErlNifEnv* env, int argc, const ERL_NI
     iov[i].iov_len = bin.size;
   }
 
+  // Capture the calling process as the reply destination
+  ErlNifPid caller_pid;
+  enif_self(env, &caller_pid);
+
   // Write data to socket
   ssize_t bytes_written = writev(slot.fd, iov, list_len);
 
@@ -2332,7 +2363,9 @@ static ERL_NIF_TERM send_fifo_request_nif(ErlNifEnv* env, int argc, const ERL_NI
     return make(env, std::make_tuple(am_error, am_write_failed));
   }
 
-  // Update slot status to indicate request sent
+  // Record who to reply to when bytes arrive, then mark sent
+  slot.fifo_requester_pid    = caller_pid;
+  slot.fifo_request_active.store(true, std::memory_order_release);
   slot.status.store(SLOT_FIFO_REQUEST_SENT, std::memory_order_release);
 
   return make(env, std::make_tuple(am_ok, am_fifo_request_sent));

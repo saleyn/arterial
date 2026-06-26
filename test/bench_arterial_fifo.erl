@@ -440,8 +440,11 @@ run_worker_requests(PoolName, fifo, StripeId, NumRequests, ReqTimeout, ResTimeou
                             ReqTimeout, ResTimeout, [Duration | Acc])
       end;
 
-    {error, _} ->
-      % Skip this request, count as error
+    {error, ReserveErr} ->
+      % Log first few failures for diagnosis, then skip
+      NumRequests =:= 1 andalso
+        io:format("[worker] reserve_connection failed: ~p (stripe ~p)~n",
+                  [ReserveErr, StripeId]),
       run_worker_requests(PoolName, fifo, StripeId, NumRequests - 1,
                         ReqTimeout, ResTimeout, Acc)
   end;
@@ -487,12 +490,12 @@ run_worker_requests(PoolName, shackle, _StripeId, NumRequests, ReqTimeout, _ResT
 %%%-----------------------------------------------------------------------------
 
 %% Select stripe ID based on configuration
-select_stripe_id(_WorkerId, #{stripe_selection := scheduler_id}) ->
-  erlang:system_info(scheduler_id) rem 8;  % Assuming max 8 stripes
-select_stripe_id(WorkerId, #{stripe_selection := round_robin}) ->
-  WorkerId rem 8;
-select_stripe_id(_WorkerId, #{stripe_selection := random}) ->
-  rand:uniform(8) - 1.
+select_stripe_id(_WorkerId, #{stripe_selection := scheduler_id, pool_size := N}) ->
+  erlang:system_info(scheduler_id) rem N;
+select_stripe_id(WorkerId, #{stripe_selection := round_robin, pool_size := N}) ->
+  WorkerId rem N;
+select_stripe_id(_WorkerId, #{stripe_selection := random, pool_size := N}) ->
+  rand:uniform(N) - 1.
 
 %% Create test request
 make_test_request() ->
