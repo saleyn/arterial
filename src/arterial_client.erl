@@ -210,6 +210,10 @@ await_reply(Pool, CorrId, Timeout) ->
       % Filter out stray EXIT messages from linked processes (common in test environments)
       % These can accumulate in the mailbox when trap_exit is true and interfere with replies
       await_reply(Pool, CorrId, Timeout);
+    {arterial_event, _StripeId, _SlotId, _Event} ->
+      % Filter out stray arterial_event messages that might be sent to wrong process
+      % These should normally go to the connection process, not the client
+      await_reply(Pool, CorrId, Timeout);
     Other ->
       error({invalid_reply, Other, #{pool => Pool, corr_id => CorrId}})
   after Timeout ->

@@ -141,20 +141,29 @@ server_init(Module, Options) ->
   true = register(?MODULE, self()),
   process_flag(trap_exit, true),
   try
-    case Module of
-      undefined ->
+    % Resolve module name to actual implementation module
+    ResolvedModule = resolve_module(Module),
+    case ResolvedModule of
+      nil ->
         persistent_term:put(?MODULE, nil);
       _ ->
-        {module, Module} = code:ensure_loaded(Module),
-        ok = Module:start(Options),
-        persistent_term:put(?MODULE, Module)
+        case code:ensure_loaded(ResolvedModule) of
+          {module, ResolvedModule} ->
+            ok = ResolvedModule:start(Options),
+            persistent_term:put(?MODULE, ResolvedModule);
+          {error, _Reason} ->
+            % If module loading fails, disable observability gracefully
+            ?LOG_WARNING("~p observability module ~p could not be loaded, disabling observability",
+                        [arterial, ResolvedModule]),
+            persistent_term:put(?MODULE, nil)
+        end
     end
   catch E:R:ST ->
     ?LOG_ERROR("~p failed to start observability module ~p with arguments:\n  ~p\n",
                [arterial, Module, Options]),
     erlang:raise(E, R, ST)
   end,
-  server_loop(Module).
+  server_loop(resolve_module(Module)).
 
 server_loop(Module) ->
   receive
@@ -169,8 +178,22 @@ server_loop(Module) ->
 
 -spec stop(atom()) -> ok.
 stop(Module) ->
-  Module:stop(),
+  (Module =/= nil) andalso Module:stop(),
   persistent_term:erase(?MODULE).
+
+%% Resolve module names to actual implementation modules
+resolve_module(Module) ->
+  case Module of
+    undefined -> nil;
+    nil -> nil;
+    ok -> nil;  % Handle weird supervisor restart cases
+    telemetry -> arterial_observe_telemetry;
+    prometheus -> arterial_observe_prometheus;
+    arterial_observe_telemetry -> arterial_observe_telemetry;
+    arterial_observe_prometheus -> arterial_observe_prometheus;
+    Mod when is_atom(Mod) -> Mod;
+    _ -> nil  % Invalid input, disable observability
+  end.
 
 -doc """
 Runs `Fun/0` (expected to return `{Result, StopMetadata}` or `{Result,
