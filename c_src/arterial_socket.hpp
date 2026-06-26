@@ -158,24 +158,25 @@ bool apply_sock_opts(int fd, ErlNifEnv* env, ERL_NIF_TERM sock_opts_list) {
 //=============================================================================
 
 // Set up the event notification system for a slot
-void arm_read(ErlNifEnv* env, PoolContext* ctx, ConnSlot& slot) {
-  enif_select(env, slot.fd, ERL_NIF_SELECT_READ | ERL_NIF_SELECT_CUSTOM_MSG,
-              ctx, &slot.owner_pid, am_arterial_event);
+inline int arm_read(ErlNifEnv* env, PoolContext* ctx, ConnSlot& slot) {
+  return enif_select(env, slot.fd, ERL_NIF_SELECT_READ | ERL_NIF_SELECT_CUSTOM_MSG,
+                     ctx, &slot.owner_pid, am_arterial_event);
 }
 
-void arm_write(ErlNifEnv* env, PoolContext* ctx, ConnSlot& slot) {
-  enif_select(env, slot.fd, ERL_NIF_SELECT_WRITE | ERL_NIF_SELECT_CUSTOM_MSG,
-              ctx, &slot.owner_pid, am_arterial_event);
+inline int arm_write(ErlNifEnv* env, PoolContext* ctx, ConnSlot& slot) {
+  return enif_select(env, slot.fd, ERL_NIF_SELECT_WRITE | ERL_NIF_SELECT_CUSTOM_MSG,
+                     ctx, &slot.owner_pid, am_arterial_event);
 }
 
-void arm_connect(ErlNifEnv* env, PoolContext* ctx, ConnSlot& slot) {
-  enif_select(env, slot.fd, ERL_NIF_SELECT_WRITE | ERL_NIF_SELECT_CUSTOM_MSG,
+inline int arm_connect(ErlNifEnv* env, PoolContext* ctx, ConnSlot& slot) {
+  return enif_select(env, slot.fd, ERL_NIF_SELECT_WRITE | ERL_NIF_SELECT_CUSTOM_MSG,
               ctx, &slot.owner_pid, am_arterial_event);
 }
 
 // Message generation for connection results
-TERM make_connect_result_msg(nifpp::msg_env& msg_env, unsigned int stripe_id,
-                            unsigned int slot_id, TERM result) {
+inline TERM make_connect_result_msg(
+  nifpp::msg_env& msg_env, unsigned int stripe_id, unsigned int slot_id, TERM result)
+{
   return make(msg_env, std::make_tuple(am_arterial_event, stripe_id, slot_id,
                                        am_connect_result, result));
 }
@@ -185,7 +186,7 @@ void notify_and_close(ErlNifEnv* env, PoolContext* ctx, ConnSlot& slot) {
   nifpp::msg_env msg_env;
   auto msg = make(msg_env, std::make_tuple(am_arterial_event,
                                           slot.stripe_id, slot.slot_id, am_closed));
-  enif_send(env, &slot.owner_pid, msg_env, msg);
+  enif_send(env, &slot.owner_pid, msg_env, msg);  // TODO: error checking?
 
   if (slot.fd != -1) {
     close(slot.fd);
@@ -229,7 +230,7 @@ ERL_NIF_TERM claim_slot(ErlNifEnv* env, PoolContext* ctx,
           current_mask, new_mask,
           std::memory_order_release,
           std::memory_order_relaxed)) {
-      arm_read(env, ctx, slot);
+      arm_read(env, ctx, slot);  // TODO: error checking?
       return make(env, std::make_tuple(am_ok,
                                       static_cast<unsigned int>(slot_id)));
     }

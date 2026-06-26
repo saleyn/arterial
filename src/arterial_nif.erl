@@ -46,6 +46,7 @@ group membership management. See `connect_proto_with_opts/9`.
 -export([connect_with_opts/8, connect_proto_with_opts/9]).
 -export([handle_readable/3, handle_writable/3, close_slot/3]).
 -export([is_slot_available/3, set_slot_available/3, set_slot_unavailable/3]).
+-export([reserve_fifo_connection/3, send_fifo_request/6, release_fifo_connection/4, fifo_connection_status/3, handle_fifo_reply/4]).
 
 -on_load(init/0).
 
@@ -461,6 +462,71 @@ ok
 """.
 -spec set_slot_unavailable(pool_ref(), non_neg_integer(), non_neg_integer()) -> ok.
 set_slot_unavailable(_PoolRef, _StripeId, _SlotId) ->
+  ?NOT_LOADED_ERROR.
+
+%%%-----------------------------------------------------------------------------
+%%% FIFO Mode 3 functions
+%%%-----------------------------------------------------------------------------
+
+-doc """
+Reserve a connection slot for FIFO Mode 3 operation. Atomically reserves
+a connection slot for exclusive use by the calling process, with a timeout.
+
+Returns `{ok, SlotId, ConnectionInfo}` if a slot is successfully reserved,
+or `{error, Reason}` if no slots are available or other error occurs.
+""".
+-spec reserve_fifo_connection(pool_ref(), non_neg_integer(),
+                             non_neg_integer()) ->
+  {ok, non_neg_integer(), term()} | {error, term()}.
+reserve_fifo_connection(_PoolRef, _StripeId, _TimeoutMs) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Send request data through a reserved FIFO connection slot.
+
+The slot must have been previously reserved with `reserve_fifo_connection/3`.
+Returns `{ok, BytesSent}` on success or `{error, Reason}` on failure.
+""".
+-spec send_fifo_request(pool_ref(), non_neg_integer(), non_neg_integer(),
+                       [binary()], non_neg_integer(), pid()) ->
+  {ok, non_neg_integer()} | {error, term()}.
+send_fifo_request(_PoolRef, _StripeId, _SlotId, _IoList, _TimeoutMs, _RequesterPid) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Release a reserved FIFO connection slot back to the pool.
+
+Should be called after processing the response from a FIFO request.
+Returns `ok` on success.
+""".
+-spec release_fifo_connection(pool_ref(), non_neg_integer(),
+                             non_neg_integer(), term()) ->
+  ok | {error, term()}.
+release_fifo_connection(_PoolRef, _StripeId, _SlotId, _Result) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Get the status and statistics of a FIFO connection slot.
+
+Returns information about the current state of the slot including
+whether it's reserved, connection status, and timing statistics.
+""".
+-spec fifo_connection_status(pool_ref(), non_neg_integer(),
+                            non_neg_integer()) ->
+  {ok, term()} | {error, term()}.
+fifo_connection_status(_PoolRef, _StripeId, _SlotId) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Handle incoming reply data for a FIFO request.
+
+Called when data is received on a FIFO connection slot to route
+the reply to the appropriate waiting process.
+""".
+-spec handle_fifo_reply(pool_ref(), non_neg_integer(), non_neg_integer(),
+                       binary()) ->
+  ok | {error, term()}.
+handle_fifo_reply(_PoolRef, _StripeId, _SlotId, _ReplyData) ->
   ?NOT_LOADED_ERROR.
 
 %%%-----------------------------------------------------------------------------
