@@ -112,15 +112,16 @@ struct PoolStripe {
 };
 
 struct PoolContext {
+  using StripeVec = std::vector<std::unique_ptr<PoolStripe>>;
   // unique_ptr<PoolStripe>, not PoolStripe, for the same reason: the
   // vector itself must be able to grow (move elements) at init_pool
   // time, which a non-movable PoolStripe can't do directly.
-  std::vector<std::unique_ptr<PoolStripe>> stripes;
-  size_t stripe_count{0};
+  StripeVec stripes;
+  size_t    stripe_count{0};
 
   // Throttling configuration (0 means no throttling)
-  uint32_t throttle_rate_per_sec{0};   // requests per second
-  uint32_t throttle_window_msec{0};    // time window in milliseconds
+  uint32_t  throttle_rate_per_sec{0};   // requests per second
+  uint32_t  throttle_window_msec{0};    // time window in milliseconds
 
   // Raw fds aren't RAII-managed by any member here, so closing them on
   // teardown needs an explicit destructor (unlike ConnectionPool in
