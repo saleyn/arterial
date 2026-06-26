@@ -453,11 +453,16 @@ connection_drained(Pool, ConnID) ->
 %%%-----------------------------------------------------------------------------
 
 disconnect(Reason, #state{pool = Pool, conn_id = ConnID, connected = Connected} = State) ->
-  Connected andalso begin
+  PoolRef = arterial_pool:pool_ref(Pool),
+  if Connected ->
     arterial_pool:set_unavailable(Pool, ConnID),
     notify_inflight_disconnected(Pool, ConnID),
-    _ = arterial_nif:close_slot(arterial_pool:pool_ref(Pool), ConnID, 0),
-    arterial_observe:event([disconnect], #{pool => Pool, conn_id => ConnID, reason => Reason})
+    _ = arterial_nif:close_slot(PoolRef, ConnID, 0),
+    arterial_observe:event([disconnect], #{pool => Pool, conn_id => ConnID, reason => Reason});
+  true ->
+    % Not yet connected — slot may still be leased (SLOT_CONNECTING).
+    % close_slot clears the lease bit so the next reconnect can claim it.
+    _ = arterial_nif:close_slot(PoolRef, ConnID, 0)
   end,
   {noreply, recon_timer(State#state{connected = false})}.
 
