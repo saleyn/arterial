@@ -1,4 +1,4 @@
--module(arterial_bench).
+-module(bench_arterial).
 
 -moduledoc """
 Throughput/latency micro-benchmark for `arterial_pool`/`arterial_client`
@@ -7,7 +7,7 @@ against a real `test_tcp_server` over loopback TCP.
 
 `test_tcp_server` already speaks `<<ReqID:32, Len:32, Payload/binary>>`
 with `Payload = term_to_binary(Term)` (see `test_echo_protocol`) -- the
-exact same framing `arterial_codec2_default` uses with `ReqID` repurposed
+exact same framing `arterial_codec_default` uses with `ReqID` repurposed
 as the correlation id -- so this benchmark needs no protocol glue of its
 own, unlike `arterial_bench` (which pairs `test_tcp_server` with
 `test_echo_client`/`arterial_async_driver` to get a comparable dispatch
@@ -42,8 +42,8 @@ ok
 Tune the load shape via `bench/1`; see `help/0` for the full option list:
 
 ```
-1> arterial_bench:bench(#{pool_size => 16, duration_s => 10}).
-2> arterial_bench:bench(#{throttle => #{rate => 1000, burst => 100}}).
+1> arterial_bench:bench(#{pool_size => 16, duration => 10}).
+2> arterial_bench:bench(#{throttle => #{rate_per_sec => 1000, window_msec => 1000}}).
 ```
 
 From the shell, `BENCH_OPTS` takes a plain comma-separated `key=value`
@@ -52,7 +52,7 @@ real Erlang syntax (e.g. a binary or nested map), pass a map literal
 directly -- detected by a leading `#{` and passed through as-is:
 
 ```
-$ make bench2 BENCH_OPTS='pool_size=16 duration_s=10'
+$ make bench2 BENCH_OPTS='pool_size=16 duration=10'
 $ make bench2 BENCH_OPTS='#{pool_size => 16, payload => <<"hi">>}'
 ```
 """.
@@ -61,8 +61,9 @@ $ make bench2 BENCH_OPTS='#{pool_size => 16, payload => <<"hi">>}'
 
 -type opts() :: #{
   pool_size       => pos_integer(),
+  pool_sizes      => [pos_integer()],
   workers         => pos_integer(),
-  duration_s      => pos_integer(),
+  duration      => pos_integer(),
   payload         => binary(),
   backoff         => arterial_connection:reconnect_time(),
   throttle        => undefined | arterial_pool:throttle_opts(),
@@ -94,6 +95,9 @@ help() ->
     "                (also the number of arterial_nif stripes, one~n"
     "                connection per stripe -- see arterial_pool's~n"
     "                moduledoc).~n"
+    "  pool_sizes => [pos_integer()]  (default: undefined)~n"
+    "                If set, runs scaling test across multiple pool sizes.~n"
+    "                Overrides pool_size. Example: [2,4,8,16,32,64]~n"
     "  workers    => pos_integer()  (default: same as pool_size)~n"
     "                Concurrent callers. There is no queue-when-busy~n"
     "                here, so workers > pool_size just oversubscribes~n"
@@ -101,7 +105,7 @@ help() ->
     "                no_connection} instead of measuring sustained~n"
     "                throughput) -- only raise this above pool_size~n"
     "                deliberately, to study that case.~n"
-    "  duration_s => pos_integer()  (default: 5)~n"
+    "  duration   => pos_integer()  (default: 5)~n"
     "                How long to hammer the pool, in seconds.~n"
     "  payload    => binary()  (default: a short fixed binary)~n"
     "                The {echo, Payload} request body sent on every call.~n"
@@ -111,11 +115,11 @@ help() ->
     "                a fixed non_neg_integer() delay, or {backoff, Min,~n"
     "                Max} for exponential backoff between reconnect~n"
     "                attempts.~n"
-    "  throttle   => undefined | #{rate := pos_integer(), burst := pos_integer()}~n"
+    "  throttle   => undefined | #{rate_per_sec := pos_integer(), window_msec => pos_integer()}~n"
     "                (default: undefined, disabled)~n"
-    "                Per-connection token-bucket rate limit -- see~n"
-    "                arterial_throttle2. Set this to see its effect on~n"
-    "                throughput/rejection rate under load.~n"
+    "                Per-connection time-spacing rate limit. Set this to see~n"
+    "                its effect on throughput/rejection rate under load.~n"
+    "                Example: #{rate_per_sec => 100, window_msec => 1000}~n"
     "  external_server => boolean()  (default: false)~n"
     "                false: test_tcp_server runs in this VM, same as~n"
     "                calling it directly. true: runs it as a standalone~n"
@@ -126,14 +130,16 @@ help() ->
     "~n"
     "Examples:~n"
     "  1> arterial_bench:bench().~n"
-    "  2> arterial_bench:bench(#{pool_size => 16, duration_s => 10}).~n"
-    "  3> arterial_bench:bench(#{throttle => #{rate => 1000, burst => 100}}).~n"
+    "  2> arterial_bench:bench(#{pool_size => 16, duration => 10}).~n"
+    "  3> arterial_bench:bench(#{throttle => #{rate_per_sec => 1000}}).~n"
     "  4> arterial_bench:bench(#{backoff => {backoff, 100, 5000}}).~n"
+    "  5> arterial_bench:bench(#{pool_sizes => [2,4,8,16,32,64]}).~n"
     "~n"
     "  $ make bench2~n"
-    "  $ make bench BENCH_OPTS='pool_size=16 duration_s=10'~n"
-    "  $ make bench2 BENCH_OPTS='pool_size=16 duration_s=10'~n"
-    "  $ make bench2 BENCH_OPTS='#{pool_size => 16, duration_s => 10}'~n"
+    "  $ make bench BENCH_OPTS='pool_size=16 duration=10'~n"
+    "  $ make bench2 BENCH_OPTS='pool_size=16 duration=10'~n"
+    "  $ make bench2 BENCH_OPTS='#{pool_size => 16, duration => 10}'~n"
+    "  $ make bench2 BENCH_OPTS='#{pool_sizes => [2,4,8,16]}'~n"
   ),
   ok.
 
@@ -144,6 +150,17 @@ return `ok`. Starts and tears down its own `test_tcp_server` and
 """.
 -spec bench(opts()) -> ok.
 bench(Opts) ->
+  % Check if this is a scaling test across multiple pool sizes
+  case maps:get(pool_sizes, Opts, undefined) of
+    undefined ->
+      % Single pool size test
+      bench_single(Opts);
+    PoolSizes when is_list(PoolSizes) ->
+      % Scaling test across multiple pool sizes
+      bench_scaling(PoolSizes, Opts)
+  end.
+
+bench_single(Opts) ->
   PoolSize0 = maps:get(pool_size, Opts, 8),
   Defaults = #{
     pool_size  => PoolSize0,
@@ -151,7 +168,7 @@ bench(Opts) ->
     %% excess workers retry inline on {error, no_connection} instead of
     %% measuring real throughput. Default to one worker per connection.
     workers    => PoolSize0,
-    duration_s => 5,
+    duration   => 5,
     payload    => <<"the quick brown fox jumps over the lazy dog">>,
     throttle   => undefined,
     external_server => false
@@ -159,7 +176,7 @@ bench(Opts) ->
   #{
     pool_size  := PoolSize,
     workers    := Workers,
-    duration_s := DurationS,
+    duration := DurationS,
     payload    := Payload,
     throttle   := Throttle,
     external_server := ExternalServer
@@ -185,6 +202,99 @@ bench(Opts) ->
     teardown(Srv)
   end.
 
+bench_scaling(PoolSizes, Opts) ->
+  io:format("~n=== Arterial Scaling Analysis ===~n"),
+  io:format("Testing pool sizes: ~p~n~n", [PoolSizes]),
+
+  Results = lists:map(fun(PoolSize) ->
+    io:format("Testing pool_size=~w...~n", [PoolSize]),
+
+    % Create options for this pool size, remove pool_sizes to avoid recursion
+    SingleOpts = maps:without([pool_sizes], Opts#{pool_size => PoolSize,
+                                                   workers => PoolSize}),
+
+    % Capture the metrics
+    case capture_single_bench(SingleOpts) of
+      {ok, Metrics} ->
+        #{throughput := ThroughputReqS,
+          rejected := Rejected,
+          rejected_percent := RejectedPercent} = Metrics,
+
+        io:format("  pool_size=~w: ~.1f req/s, rejected: ~w (~.1f%)~n",
+                  [PoolSize, ThroughputReqS, Rejected, RejectedPercent]),
+
+        {PoolSize, Metrics};
+      {error, Error} ->
+        io:format("  pool_size=~w: FAILED (~p)~n", [PoolSize, Error]),
+        {PoolSize, #{throughput => 0.0, rejected => 0, rejected_percent => 0.0}}
+    end
+  end, PoolSizes),
+
+  % Display summary table
+  io:format("~n┌───────────┬─────────────┬──────────────────────┐~n"),
+  io:format("│ Pool Size │   Arterial  │      Rejected        │~n"),
+  io:format("│           │   (req/s)   │   (count / %)        │~n"),
+  io:format("├───────────┼─────────────┼──────────────────────┤~n"),
+
+  lists:foreach(fun({PoolSize, Metrics}) ->
+    case Metrics of
+      #{throughput := ThroughputReqS,
+        rejected := Rejected,
+        rejected_percent := RejectedPercent} ->
+        io:format("│~10w │~12.1f │~12w (~5.1f%) │~n",
+                  [PoolSize, ThroughputReqS, Rejected, RejectedPercent]);
+      _ ->
+        io:format("│~9w │    FAILED   │        FAILED        │~n", [PoolSize])
+    end
+  end, Results),
+
+  io:format("└───────────┴─────────────┴──────────────────────┘~n"),
+  ok.
+
+capture_single_bench(Opts) ->
+  % Run a single benchmark and capture its metrics
+  PoolSize0 = maps:get(pool_size, Opts, 8),
+  Defaults = #{
+    pool_size  => PoolSize0,
+    workers    => PoolSize0,
+    duration   => 5,
+    payload    => <<"the quick brown fox jumps over the lazy dog">>,
+    throttle   => undefined,
+    external_server => false
+  },
+  #{
+    pool_size  := PoolSize,
+    workers    := Workers,
+    duration := DurationS,
+    payload    := Payload,
+    throttle   := Throttle,
+    external_server := ExternalServer
+  } = maps:merge(Defaults, Opts),
+
+  Srv = setup(PoolSize, Throttle, maps:get(backoff, Opts, undefined), ExternalServer),
+  try
+    DurationMs = DurationS * 1000,
+    Parent = self(),
+    StartAt = erlang:monotonic_time(millisecond),
+    Deadline = StartAt + DurationMs,
+
+    WorkerPids = [
+      spawn_link(fun() -> worker_loop(Parent, Deadline, Payload, []) end)
+      || _ <- lists:seq(1, Workers)
+    ],
+
+    {AllLatenciesUs, Rejected} = collect(WorkerPids, [], 0),
+    ElapsedMs = erlang:monotonic_time(millisecond) - StartAt,
+
+    Metrics = report_metrics(PoolSize, Workers, ElapsedMs, AllLatenciesUs, Rejected),
+    {ok, Metrics}
+  catch
+    Class:Reason ->
+      {error, {Class, Reason}}
+  after
+    teardown(Srv)
+  end.
+
 %%%-----------------------------------------------------------------------------
 %%% Internal functions
 %%%-----------------------------------------------------------------------------
@@ -194,7 +304,7 @@ setup(PoolSize, Throttle, Backoff, ExternalServer) ->
   Port = bench_external_server:port(Srv),
   PoolOpts0 = #{
     size       => PoolSize,
-    codec      => arterial_codec2_default,
+    codec      => arterial_codec_default,
     address    => "127.0.0.1",
     port       => Port,
     throttle   => Throttle
@@ -295,6 +405,29 @@ report(PoolSize, Workers, DurationMs, ElapsedMs, LatenciesUs, Rejected) ->
       ])
   end,
   ok.
+
+report_metrics(PoolSize, Workers, ElapsedMs, LatenciesUs, Rejected) ->
+  N                = length(LatenciesUs),
+  Sorted           = lists:sort(LatenciesUs),
+  ThroughputPerSec = N * 1000 / ElapsedMs,
+  RejectedPercent  =
+    case N + Rejected of
+      0     -> 0.0;
+      Total -> (Rejected * 100.0) / Total
+    end,
+  #{
+    pool_size        => PoolSize,
+    workers          => Workers,
+    elapsed_ms       => ElapsedMs,
+    requests         => N,
+    rejected         => Rejected,
+    rejected_percent => RejectedPercent,
+    throughput       => ThroughputPerSec,
+    latency_p50      => case N of 0 -> 0; _ -> percentile(Sorted, 0.50) end,
+    latency_p95      => case N of 0 -> 0; _ -> percentile(Sorted, 0.95) end,
+    latency_p99      => case N of 0 -> 0; _ -> percentile(Sorted, 0.99) end,
+    latency_max      => case N of 0 -> 0; _ -> lists:last(Sorted)       end
+  }.
 
 percentile(Sorted, P) ->
   N = length(Sorted),

@@ -23,7 +23,7 @@ options. Called by `arterial_connection` on (re)connect, before
 `c:arterial_client:setup/2`.
 """.
 -callback connect(arterial:inet_address(), arterial:inet_port(),
-                  arterial:socket_options()) ->
+                  [arterial_pool:sockopt()]) ->
   {ok, arterial:socket()} | {error, atom()}.
 
 -doc "Close `Socket`. Called by `arterial_connection` on disconnect.".
@@ -40,7 +40,7 @@ Read the next available chunk of bytes from `Socket`, waiting up to
   {ok, binary()} | {error, any()}.
 
 -doc "Apply socket options to `Socket` after it's connected.".
--callback setopts(arterial:socket(), [gen_tcp:option() | gen_udp:option()]) ->
+-callback setopts(arterial:socket(), [arterial_pool:sockopt()]) ->
   ok | {error, atom()}.
 
 -doc """

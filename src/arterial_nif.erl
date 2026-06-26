@@ -69,19 +69,24 @@ init_pool(_NumStripes, _SlotsPerStripe) ->
   ?NOT_LOADED_ERROR.
 
 -doc """
-Configure throttling for a pool resource. Sets the rate limit to
-`RatePerSec` tokens per second with a burst capacity of `Burst` tokens.
+Configure throttling for a pool resource. Sets up time-spacing throttle
+with `RatePerSec` requests per second over a `WindowMsec` millisecond window.
 Setting `RatePerSec` to 0 disables throttling entirely.
+
+The throttle enforces a minimum interval of `WindowMsec / RatePerSec`
+milliseconds between successive requests on each connection slot.
 
 ## Examples
 
 ```
-1> arterial_nif:configure_throttle(PoolRef, 100, 10).
+1> arterial_nif:configure_throttle(PoolRef, 100, 1000).  % 100 req/sec, 1s window
+ok
+2> arterial_nif:configure_throttle(PoolRef, 50, 500).    % 50 req/sec, 0.5s window
 ok
 ```
 """.
 -spec configure_throttle(pool_ref(), non_neg_integer(), non_neg_integer()) -> ok.
-configure_throttle(_PoolRef, _RatePerSec, _Burst) ->
+configure_throttle(_PoolRef, _RatePerSec, _WindowMs) ->
   ?NOT_LOADED_ERROR.
 
 -doc """
@@ -384,7 +389,9 @@ init() ->
           Dir = filename:dirname(filename:dirname(Filename)),
           filename:join([Dir, "priv", "arterial_nif"]);
         _ ->
-          filename:join("../priv", "arterial_nif")
+          % More robust fallback using absolute path from current working directory
+          {ok, Cwd} = file:get_cwd(),
+          filename:join([Cwd, "_build", "default", "lib", "arterial", "priv", "arterial_nif"])
       end;
     Dir ->
       filename:join(Dir, "arterial_nif")

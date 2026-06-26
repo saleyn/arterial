@@ -75,12 +75,15 @@ born inside the NIF and never touches Erlang's `socket` module at all.
 
 -doc """
 One entry of the `addresses` option: either a plain address (using the
-connection's shared `port`), or a map overriding `port` for that entry
-alone.
+connection's shared `port`), or a map overriding `port`, `sock_opts`,
+or `tls_options` for that entry alone. Socket and TLS options use
+arterial's custom types `t:arterial_pool:sockopt/0` and `t:arterial_pool:tlsopt/0`.
 """.
 -type address_entry() :: arterial:inet_address() | #{
   address := arterial:inet_address(),
-  port    => arterial:inet_port()
+  port    => arterial:inet_port(),
+  sock_opts => [arterial_pool:sockopt()],
+  tls_options => [arterial_pool:tlsopt()]
 }.
 
 -type reconnect_time() :: {backoff, pos_integer(), pos_integer()} | any().
@@ -97,7 +100,7 @@ Start a connection worker for slot `ConnID` (0-based) of `Pool`. Connects
 
 `Opts` accepts `address`/`addresses`/`ip`/`port`/`nodelay`/`reconnect`/
 `reconnect_time` (and the legacy `reconnect_time_min`/`reconnect_time_max`
-pair) -- see the moduledoc for why there's no `protocol`/`socket_options`/
+pair) -- see the moduledoc for why there's no `protocol`/`sock_opts`/
 `tls_options` here, unlike `t:arterial_client:options/0`.
 """.
 -spec start_link(arterial_pool:name(), non_neg_integer(), map()) -> {ok, pid()}.
@@ -129,7 +132,7 @@ init([Pool, ConnID, Opts]) ->
   Addresses   = addresses(Opts),
   Port        = maps:get(port, Opts, undefined),
   Protocol    = maps:get(protocol, Opts, tcp),
-  SocketOpts  = maps:get(socket_options, Opts, []),
+  SocketOpts  = maps:get(sock_opts, Opts, []),
   ReconState  = recon_state(Opts),
   Pfx         = list_to_binary(io_lib:format("~w:~w: ", [Pool, ConnID])),
 
@@ -227,7 +230,12 @@ try_addresses([Entry | Rest], #state{
   protocol = Protocol, nodelay = Nodelay, socket_opts = SocketOpts,
   conn_timeout = _Timeout
 } = State) ->
-  {Address, Port} = resolve_entry(Entry, DefaultPort),
+  {Address, Port, EntrySocketOpts} = resolve_entry(Entry, DefaultPort),
+  % Use per-entry socket options if specified, otherwise use connection-level options
+  ActualSocketOpts = case EntrySocketOpts of
+    undefined -> SocketOpts;
+    _ -> EntrySocketOpts
+  end,
   case inet:getaddrs(Address, inet) of
     {ok, IPs} ->
       IP = arterial_util:random_element(IPs),
@@ -237,16 +245,17 @@ try_addresses([Entry | Rest], #state{
         Result = case Protocol of
           P when P == tcp; P == udp; P == ssl ->
             % Built-in NIF protocols
-            case SocketOpts of
+            case ActualSocketOpts of
               [] ->
                 arterial_nif:connect_async_proto(PoolRef, ConnID, IP, Port, Protocol, Nodelay, self());
               _ ->
-                % TODO: Use socket options when implemented
-                arterial_nif:connect_async_proto(PoolRef, ConnID, IP, Port, Protocol, Nodelay, self())
+                % Use the new socket options aware function
+                arterial_nif:connect_proto_with_opts(PoolRef, ConnID, IP, Port,
+                    State#state.conn_timeout, Protocol, Nodelay, self(), ActualSocketOpts)
             end;
           ProtocolModule when is_atom(ProtocolModule) ->
             % Custom protocol module - use arterial_protocol callbacks
-            connect_with_protocol_module(ProtocolModule, PoolRef, ConnID, IP, Port, SocketOpts, Nodelay, self())
+            connect_with_protocol_module(ProtocolModule, PoolRef, ConnID, IP, Port, ActualSocketOpts, Nodelay, self())
         end,
         Outcome = case Result of
           {ok, _} -> ok;
@@ -458,9 +467,11 @@ addresses(Opts) ->
   end.
 
 resolve_entry(#{address := Address} = Entry, DefaultPort) ->
-  {Address, maps:get(port, Entry, DefaultPort)};
+  Port = maps:get(port, Entry, DefaultPort),
+  SockOpts = maps:get(sock_opts, Entry, undefined),
+  {Address, Port, SockOpts};
 resolve_entry(Address, DefaultPort) ->
-  {Address, DefaultPort}.
+  {Address, DefaultPort, undefined}.
 
 needs_default_port(#{port := _}) -> false;
 needs_default_port(_)            -> true.

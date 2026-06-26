@@ -82,7 +82,7 @@ init([]) ->
     end,
 
   %% Top-level: the observability backend plus the simple_one_for_one
-  %% sub-supervisor for arterial2 pools below.
+  %% sub-supervisor for arterial pools below.
   {ok, {{one_for_one, 5, 10}, [
     #{
       id       => arterial_observe,
@@ -101,14 +101,15 @@ init([]) ->
       modules  => [?MODULE]
     }
   ]}};
+
 init(pool_sup) ->
   {ok, {{simple_one_for_one, 5, 10}, [
     #{
-      id       => undefined,                        % Id       = internal id
+      id       => undefined,                       % Id       = internal id
       start    => {arterial_pool, start_link, []}, % StartFun = {M, F, A}
-      restart  => permanent,                        % Restart  = permanent | transient | temporary
-      shutdown => infinity,                         % Shutdown = brutal_kill | int() >= 0 | infinity
-      type     => supervisor,                       % Type     = worker | supervisor
+      restart  => permanent,                       % Restart  = permanent   | transient  | temporary
+      shutdown => infinity,                        % Shutdown = brutal_kill | int() >= 0 | infinity
+      type     => supervisor,                      % Type     = worker   | supervisor
       modules  => [arterial_pool]                  % Modules  = [Module] | dynamic
     }
   ]}}.

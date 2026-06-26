@@ -92,7 +92,7 @@ schedule(#state{interval_ms = IntervalMs}) ->
 
 bounce(Pool, ConnID, DrainTimeoutMs) ->
   case conn_pid(Pool, ConnID) of
-    {ok, Pid} ->
+    Pid when is_pid(Pid) ->
       try arterial_connection:bounce(Pid, DrainTimeoutMs) of
         ok               -> ok;
         {error, timeout} ->
@@ -110,6 +110,6 @@ bounce(Pool, ConnID, DrainTimeoutMs) ->
 conn_pid(Pool, ConnID) ->
   Children = supervisor:which_children(arterial_pool:sup_name(Pool)),
   case lists:keyfind({arterial_connection, ConnID}, 1, Children) of
-    {_, Pid, _, _} when is_pid(Pid) -> {ok, Pid};
+    {_, Pid, _, _} when is_pid(Pid) -> Pid;
     _                               -> error
   end.

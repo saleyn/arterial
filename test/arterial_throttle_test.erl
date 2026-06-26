@@ -17,13 +17,13 @@ throttling_configuration_test() ->
     address => "127.0.0.1",
     port => 12348,
     protocol => tcp,
-    throttle => #{rate => 10, burst => 5}  % 10 requests/sec, 5 burst
+    throttle => #{rate_per_sec => 10, window_msec => 1000}  % 10 requests/sec, 1s window
   }),
 
   try
     % Verify throttling state is stored
     ThrottleState = arterial_pool:throttle(test_throttle_pool),
-    ?assertMatch({10, 5}, ThrottleState),
+    ?assertMatch({10, 1000}, ThrottleState),
 
     % The throttling logic itself is tested at the NIF level during
     % send_and_release calls, but we can verify the configuration is correct
