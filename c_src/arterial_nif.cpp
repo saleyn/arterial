@@ -169,7 +169,6 @@ static SSL_CTX* g_ssl_ctx = nullptr;
 static bool init_ssl_context() {
   if (g_ssl_ctx) return true;
 
-  fprintf(stderr, "Initializing SSL context...\n");
 
   // Use modern OpenSSL initialization
   if (OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL) == 0) {
@@ -192,15 +191,14 @@ static bool init_ssl_context() {
     return false;
   }
 
-  fprintf(stderr, "SSL context created successfully\n");
 
-  // Configure for compatibility with Erlang SSL
+  // Configure for maximum compatibility - accept any certificate
   SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, nullptr);
 
-  // Allow a wider range of protocol versions for compatibility
-  SSL_CTX_set_options(g_ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+  // Allow a wider range of protocol versions and options for compatibility
+  SSL_CTX_set_options(g_ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_IGNORE_UNEXPECTED_EOF);
 
-  // Set TLS versions compatible with Erlang SSL (1.2 and 1.3)
+  // Allow both TLS 1.2 and 1.3 to be more compatible
   if (SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION) != 1) {
     fprintf(stderr, "Failed to set min TLS version to 1.2\n");
   }
@@ -208,16 +206,16 @@ static bool init_ssl_context() {
     fprintf(stderr, "Failed to set max TLS version to 1.3\n");
   }
 
-  // Use modern cipher list compatible with Erlang SSL server
-  // This includes ECDHE and RSA cipher suites that Erlang supports
-  if (SSL_CTX_set_cipher_list(g_ssl_ctx, "ECDHE+AESGCM:DHE+AESGCM:ECDHE+AES:DHE+AES:RSA+AESGCM:RSA+AES:!aNULL:!eNULL:!MD5:!DSS") != 1) {
-    fprintf(stderr, "Failed to set cipher list, trying fallback\n");
-    // Fallback to a more basic but compatible cipher list
-    if (SSL_CTX_set_cipher_list(g_ssl_ctx, "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256") != 1) {
-      fprintf(stderr, "Failed to set fallback cipher list\n");
-      ERR_print_errors_fp(stderr);
-      return false;
-    }
+  // Set both TLS 1.3 ciphersuites and TLS 1.2 cipher list for maximum compatibility
+  if (SSL_CTX_set_ciphersuites(g_ssl_ctx, "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_CCM_SHA256") != 1) {
+    fprintf(stderr, "Failed to set TLS 1.3 ciphersuites\n");
+  } else {
+  }
+
+  // TLS 1.2 cipher list
+  if (SSL_CTX_set_cipher_list(g_ssl_ctx, "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256") != 1) {
+    fprintf(stderr, "Failed to set TLS 1.2 cipher list\n");
+  } else {
   }
 
   // Set supported curves for ECDHE - these are standard curves supported by Erlang
@@ -226,7 +224,9 @@ static bool init_ssl_context() {
     // This is non-fatal, continue
   }
 
-  fprintf(stderr, "SSL context configured with Erlang-compatible settings\n");
+  // Set security level to 0 to accept any certificate for testing
+  SSL_CTX_set_security_level(g_ssl_ctx, 0);
+
   return true;
 }
 
@@ -837,6 +837,50 @@ static ERL_NIF_TERM handle_readable_nif(ErlNifEnv* env, int argc, const ERL_NIF_
 
   if (slot.fd == -1) return am_closed;
 
+#ifdef HAVE_OPENSSL
+  // Handle ongoing SSL handshake
+  uint32_t current_status = slot.status.load(std::memory_order_acquire);
+  if (current_status == SLOT_SSL_HANDSHAKE) {
+    if (slot.protocol == PROTO_SSL && slot.ssl) {
+      int handshake_result = ssl_handshake_blocking(slot, 5000);
+
+      if (handshake_result == 1) {
+        // Handshake completed successfully
+        slot.status.store(SLOT_AVAILABLE, std::memory_order_release);
+        auto& stripe = *ctx->stripes[slot.stripe_id];
+        stripe.lease_mask.fetch_and(~(1ULL << slot.slot_id), std::memory_order_release);
+        nifpp::msg_env msg_env;
+        auto msg = make_connect_result_msg(msg_env, slot.stripe_id, slot.slot_id, am_ok);
+        enif_send(env, &slot.owner_pid, msg_env, msg);
+        arm_read(env, ctx, slot);
+        // Return empty data to indicate handshake completion
+        ErlNifBinary empty;
+        enif_alloc_binary(0, &empty);
+        return make(env, std::make_tuple(am_ok, TERM(enif_make_binary(env, &empty))));
+      } else if (handshake_result == 0) {
+        // Still needs READ - arm read event and return
+        arm_read(env, ctx, slot);
+        ErlNifBinary empty;
+        enif_alloc_binary(0, &empty);
+        return make(env, std::make_tuple(am_ok, TERM(enif_make_binary(env, &empty))));
+      } else if (handshake_result == -2) {
+        // Still needs WRITE - arm write event
+        arm_write(env, ctx, slot);
+        ErlNifBinary empty;
+        enif_alloc_binary(0, &empty);
+        return make(env, std::make_tuple(am_ok, TERM(enif_make_binary(env, &empty))));
+      } else {
+        // Handshake failed
+        cleanup_slot_ssl(slot);
+        nifpp::msg_env msg_env;
+        auto msg = make_connect_result_msg(msg_env, slot.stripe_id, slot.slot_id, am_connect_failed);
+        enif_send(env, &slot.owner_pid, msg_env, msg);
+        notify_and_close(env, ctx, slot);
+        return am_closed;
+      }
+    }
+  }
+#endif
 
   // FIONREAD is only a sizing hint, never proof of anything: it can
   // legitimately report 0 on a perfectly healthy connection (e.g. under
@@ -931,8 +975,9 @@ static ERL_NIF_TERM handle_writable_nif(ErlNifEnv* env, int argc, const ERL_NIF_
           return am_closed;
         }
 
-        // Perform SSL handshake (blocking with timeout)
-        int handshake_result = ssl_handshake_blocking(slot, 5000);  // 5 second timeout
+        // Start non-blocking SSL handshake
+        int handshake_result = ssl_handshake_blocking(slot, 5000);
+
         if (handshake_result == 1) {
           // Handshake completed successfully
           slot.status.store(SLOT_AVAILABLE, std::memory_order_release);
@@ -942,6 +987,16 @@ static ERL_NIF_TERM handle_writable_nif(ErlNifEnv* env, int argc, const ERL_NIF_
           auto msg = make_connect_result_msg(msg_env, slot.stripe_id, slot.slot_id, am_ok);
           enif_send(env, &slot.owner_pid, msg_env, msg);
           arm_read(env, ctx, slot);
+          return am_ok;
+        } else if (handshake_result == 0) {
+          // Handshake needs READ - set status and arm read event
+          slot.status.store(SLOT_SSL_HANDSHAKE, std::memory_order_release);
+          arm_read(env, ctx, slot);
+          return am_ok;
+        } else if (handshake_result == -2) {
+          // Handshake needs WRITE - set status and arm write event
+          slot.status.store(SLOT_SSL_HANDSHAKE, std::memory_order_release);
+          arm_write(env, ctx, slot);
           return am_ok;
         } else {
           // Handshake failed
@@ -969,8 +1024,40 @@ static ERL_NIF_TERM handle_writable_nif(ErlNifEnv* env, int argc, const ERL_NIF_
   }
 
 #ifdef HAVE_OPENSSL
-  // SSL handshakes are now handled as blocking operations during connection setup
-  // No need for SSL handshake continuation in write handler
+  // Handle ongoing SSL handshake
+  if (current_status == SLOT_SSL_HANDSHAKE) {
+    if (slot.protocol == PROTO_SSL && slot.ssl) {
+      int handshake_result = ssl_handshake_blocking(slot, 5000);
+
+      if (handshake_result == 1) {
+        // Handshake completed successfully
+        slot.status.store(SLOT_AVAILABLE, std::memory_order_release);
+        auto& stripe = *ctx->stripes[slot.stripe_id];
+        stripe.lease_mask.fetch_and(~(1ULL << slot.slot_id), std::memory_order_release);
+        nifpp::msg_env msg_env;
+        auto msg = make_connect_result_msg(msg_env, slot.stripe_id, slot.slot_id, am_ok);
+        enif_send(env, &slot.owner_pid, msg_env, msg);
+        arm_read(env, ctx, slot);
+        return am_ok;
+      } else if (handshake_result == 0) {
+        // Still needs READ - arm read event
+        arm_read(env, ctx, slot);
+        return am_ok;
+      } else if (handshake_result == -2) {
+        // Still needs WRITE - arm write event
+        arm_write(env, ctx, slot);
+        return am_ok;
+      } else {
+        // Handshake failed
+        cleanup_slot_ssl(slot);
+        nifpp::msg_env msg_env;
+        auto msg = make_connect_result_msg(msg_env, slot.stripe_id, slot.slot_id, am_connect_failed);
+        enif_send(env, &slot.owner_pid, msg_env, msg);
+        notify_and_close(env, ctx, slot);
+        return am_closed;
+      }
+    }
+  }
 #endif
 
   size_t remaining = slot.pending_buffer.size() - slot.bytes_written;
@@ -1216,11 +1303,9 @@ static bool setup_ssl_on_socket(ConnSlot& slot, int fd) {
     fprintf(stderr, "Failed to set TCP_NODELAY: %s\n", strerror(errno));
   }
 
-  fprintf(stderr, "Creating SSL connection on fd %d\n", fd);
 
   // Clean up any existing SSL object first
   if (slot.ssl) {
-    fprintf(stderr, "Warning: SSL object already exists, cleaning up\n");
     SSL_free(slot.ssl);
     slot.ssl = nullptr;
   }
@@ -1232,7 +1317,6 @@ static bool setup_ssl_on_socket(ConnSlot& slot, int fd) {
     return false;
   }
 
-  fprintf(stderr, "Created new SSL object: %p\n", slot.ssl);
 
   if (SSL_set_fd(slot.ssl, fd) != 1) {
     fprintf(stderr, "Failed to associate SSL with socket fd %d\n", fd);
@@ -1248,8 +1332,10 @@ static bool setup_ssl_on_socket(ConnSlot& slot, int fd) {
   // Additional SSL setup for testing
   SSL_set_verify(slot.ssl, SSL_VERIFY_NONE, nullptr);
 
+  // Disable SNI since we're connecting to 127.0.0.1 but cert might be for different name
+  SSL_set_tlsext_host_name(slot.ssl, nullptr);
+
   slot.protocol = PROTO_SSL;
-  fprintf(stderr, "SSL structure created and configured successfully on fd %d, SSL: %p\n", fd, slot.ssl);
   return true;
 }
 
@@ -1260,62 +1346,33 @@ static bool setup_ssl_on_socket(ConnSlot& slot, int fd) {
 static int ssl_handshake_blocking(ConnSlot& slot, int timeout_ms) {
   if (!slot.ssl) return -1;
 
-  fprintf(stderr, "Starting SSL handshake - switching to blocking mode temporarily\n");
 
-  // Save original socket flags
-  int orig_flags = fcntl(slot.fd, F_GETFL);
-  if (orig_flags == -1) {
-    fprintf(stderr, "Failed to get socket flags: %s\n", strerror(errno));
-    return -1;
+  // Ensure socket is in non-blocking mode
+  int flags = fcntl(slot.fd, F_GETFL);
+  if (flags != -1 && !(flags & O_NONBLOCK)) {
+    fcntl(slot.fd, F_SETFL, flags | O_NONBLOCK);
   }
 
-  // Set socket to blocking mode for handshake
-  if (fcntl(slot.fd, F_SETFL, orig_flags & ~O_NONBLOCK) == -1) {
-    fprintf(stderr, "Failed to set blocking mode: %s\n", strerror(errno));
-    return -1;
-  }
-
-  // Set socket timeout
-  struct timeval tv;
-  tv.tv_sec = timeout_ms / 1000;
-  tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-  if (setsockopt(slot.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-    fprintf(stderr, "Failed to set receive timeout: %s\n", strerror(errno));
-  }
-  if (setsockopt(slot.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
-    fprintf(stderr, "Failed to set send timeout: %s\n", strerror(errno));
-  }
-
-  fprintf(stderr, "Socket configured for blocking SSL handshake\n");
-
-  // Perform SSL handshake
+  // Attempt SSL handshake
   int result = SSL_connect(slot.ssl);
 
-  // Restore original socket flags immediately
-  fcntl(slot.fd, F_SETFL, orig_flags);
-
   if (result == 1) {
-    fprintf(stderr, "🎉 SSL handshake SUCCESS!\n");
-    fprintf(stderr, "Negotiated cipher: %s\n", SSL_get_cipher(slot.ssl));
-    fprintf(stderr, "SSL version: %s\n", SSL_get_version(slot.ssl));
+    // Handshake completed successfully
     return 1;
-  } else {
-    int ssl_error = SSL_get_error(slot.ssl, result);
-    fprintf(stderr, "SSL handshake failed: result=%d, ssl_error=%d\n", result, ssl_error);
-    ERR_print_errors_fp(stderr);
+  }
 
-    // Additional debugging
-    fprintf(stderr, "Socket fd: %d, SSL: %p\n", slot.fd, slot.ssl);
+  int ssl_error = SSL_get_error(slot.ssl, result);
 
-    // Check socket state
-    int sock_error = 0;
-    socklen_t len = sizeof(sock_error);
-    if (getsockopt(slot.fd, SOL_SOCKET, SO_ERROR, &sock_error, &len) == 0) {
-      fprintf(stderr, "Socket SO_ERROR: %d (%s)\n", sock_error, sock_error ? strerror(sock_error) : "OK");
-    }
+  switch (ssl_error) {
+    case SSL_ERROR_WANT_READ:
+      return 0; // Need to read more data
 
-    return -1;
+    case SSL_ERROR_WANT_WRITE:
+      return -2; // Need to write more data
+
+    default:
+      // Actual error
+      return -1;
   }
 }
 

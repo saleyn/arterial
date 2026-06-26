@@ -48,6 +48,10 @@ test:
 	$(MAKE) --no-print-directory -C c_src test
 	rebar3 eunit
 
+test-ssl:
+	$(MAKE) --no-print-directory -C c_src test
+	rebar3 eunit --module=test_ssl_server_tests
+
 # Runs test/arterial_bench.erl against a real test_tcp_server over
 # loopback TCP -- not part of `test`/eunit (no _test exports), so it
 # needs its own target. Pass options either as a plain comma-separated
