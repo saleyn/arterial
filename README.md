@@ -672,10 +672,24 @@ let arterial be compared against the library that inspired it, using the
 same wire protocol, payload, and workload shape (`test/arterial_bench.erl`
 drives the same workload against `arterial` itself).
 
+```sh
+make bench           BENCH_OPTS='pool_size=8 duration=5'   # arterial
+make bench-shackle   BENCH_OPTS='pool_size=8 duration=5'   # shackle
+make bench-poolboy   BENCH_OPTS='pool_size=8 duration=5'   # poolboy
 ```
-make bench           BENCH_OPTS='pool_size=8, duration=5'   # arterial
-make bench-shackle   BENCH_OPTS='pool_size=8, duration=5'   # shackle
-make bench-poolboy   BENCH_OPTS='pool_size=8, duration=5'   # poolboy
+
+E.g.
+```sh
+$ make bench BENCH_OPTS='pool_size=8'
+
+┌─────────────┬─────────────┬─────────┬─────────┬─────────┬─────────┬──────────┐
+│ Library     │ Throughput  │   P50   │   P95   │   P99   │   Max   │ Rejected │
+│             │   (req/s)   │  (µs)   │  (µs)   │  (µs)   │  (µs)   │          │
+├─────────────┼─────────────┼─────────┼─────────┼─────────┼─────────┼──────────┤
+│ arterial    │    106155.8 │      62 │     144 │     247 │    3704 │        0 │
+│ shackle     │     41197.2 │     134 │     418 │    1340 │   19114 │       90 │
+│ poolboy     │     23933.6 │     265 │     777 │    1411 │   11229 │        0 │
+└─────────────┴─────────────┴─────────┴─────────┴─────────┴─────────┴──────────┘
 ```
 
 All three accept a comma-separated `key=value` list (or a literal `#{...}`
