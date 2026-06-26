@@ -23,10 +23,10 @@ stops).
 
 ## Metrics
 
-* `arterial_call_duration_seconds` (histogram; labels `pool`, `result`)
-* `arterial_cast_duration_seconds` (histogram; labels `pool`, `result`)
-* `arterial_checkout_duration_seconds` (histogram; labels `pool`, `mode`, `outcome`)
-* `arterial_connect_duration_seconds` (histogram; labels `pool`, `result`)
+* `arterial_call_durationeconds` (histogram; labels `pool`, `result`)
+* `arterial_cast_durationeconds` (histogram; labels `pool`, `result`)
+* `arterial_checkout_durationeconds` (histogram; labels `pool`, `mode`, `outcome`)
+* `arterial_connect_durationeconds` (histogram; labels `pool`, `result`)
 * `arterial_disconnects_total` (counter; labels `pool`, `reason`)
 * `arterial_sweep_expired_total` (counter; labels `pool`)
 * `arterial_exceptions_total` (counter; labels `pool`, `span`) -- incremented
@@ -48,7 +48,7 @@ ok
 3> arterial_client:call(my_pool, my_request, 5000).
 {ok, my_response}
 4> prometheus_text_format:format().
-%% ... arterial_call_duration_seconds_bucket{pool="my_pool",result="ok",le="0.005"} 1
+%% ... arterial_call_durationeconds_bucket{pool="my_pool",result="ok",le="0.005"} 1
 %% ...
 ```
 """.
@@ -87,16 +87,16 @@ start(Opts) when is_map(Opts) ->
     _       -> [{buckets, Buckets}]
   end,
 
-  declare_histogram(arterial_call_duration_seconds,
+  declare_histogram(arterial_call_durationeconds,
     "Duration of arterial_client:call/3 calls, in seconds.",
     [pool, result], HistogramOpts),
-  declare_histogram(arterial_cast_duration_seconds,
+  declare_histogram(arterial_cast_durationeconds,
     "Duration of arterial_client:cast/2 calls, in seconds.",
     [pool, result], HistogramOpts),
-  declare_histogram(arterial_checkout_duration_seconds,
+  declare_histogram(arterial_checkout_durationeconds,
     "Duration of arterial connection checkouts, in seconds.",
     [pool, mode, outcome], HistogramOpts),
-  declare_histogram(arterial_connect_duration_seconds,
+  declare_histogram(arterial_connect_durationeconds,
     "Duration of arterial_connection's outbound connect attempts, in seconds.",
     [pool, result], HistogramOpts),
 
@@ -164,23 +164,23 @@ seconds(DurationNative) ->
   erlang:convert_time_unit(DurationNative, native, microsecond) / 1_000_000.
 
 handle_event([arterial, call, stop], #{duration := D}, #{pool := Pool, result := Result}) ->
-  prometheus_histogram:observe(arterial_call_duration_seconds, [Pool, Result], seconds(D));
+  prometheus_histogram:observe(arterial_call_durationeconds, [Pool, Result], seconds(D));
 handle_event([arterial, call, exception], _Measurements, #{pool := Pool}) ->
   prometheus_counter:inc(arterial_exceptions_total, [Pool, call]);
 
 handle_event([arterial, cast, stop], #{duration := D}, #{pool := Pool, result := Result}) ->
-  prometheus_histogram:observe(arterial_cast_duration_seconds, [Pool, Result], seconds(D));
+  prometheus_histogram:observe(arterial_cast_durationeconds, [Pool, Result], seconds(D));
 handle_event([arterial, cast, exception], _Measurements, #{pool := Pool}) ->
   prometheus_counter:inc(arterial_exceptions_total, [Pool, cast]);
 
 handle_event([arterial, checkout, stop], #{duration := D},
              #{pool := Pool, mode := Mode, outcome := Outcome}) ->
-  prometheus_histogram:observe(arterial_checkout_duration_seconds, [Pool, Mode, Outcome], seconds(D));
+  prometheus_histogram:observe(arterial_checkout_durationeconds, [Pool, Mode, Outcome], seconds(D));
 handle_event([arterial, checkout, exception], _Measurements, #{pool := Pool}) ->
   prometheus_counter:inc(arterial_exceptions_total, [Pool, checkout]);
 
 handle_event([arterial, connect, stop], #{duration := D}, #{pool := Pool, result := Result}) ->
-  prometheus_histogram:observe(arterial_connect_duration_seconds, [Pool, Result], seconds(D));
+  prometheus_histogram:observe(arterial_connect_durationeconds, [Pool, Result], seconds(D));
 handle_event([arterial, connect, exception], _Measurements, #{pool := Pool}) ->
   prometheus_counter:inc(arterial_exceptions_total, [Pool, connect]);
 
@@ -190,6 +190,10 @@ handle_event([arterial, disconnect], _Measurements, #{pool := Pool, reason := Re
 handle_event([arterial, sweep, stop], #{expired_count := Count}, #{pool := Pool}) ->
   prometheus_counter:inc(arterial_sweep_expired_total, [Pool], Count);
 
-%% start/start events: this backend only records durations on stop/exception.
+%% start/stop events: this backend only records durations on specific stop/exception events.
+handle_event([arterial, _, _, stop], _Measurements, _Metadata) ->
+  ok;
+handle_event([arterial, _, _, start], _Measurements, _Metadata) ->
+  ok;
 handle_event([arterial, _, start], _Measurements, _Metadata) ->
   ok.

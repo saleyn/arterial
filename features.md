@@ -34,13 +34,6 @@ The original backend emits these events that I should check if arterial2 support
 
 ## Additional Features Found
 
-### **6. Connection Bouncing**
-Both backends support:
-- `bounce_interval_ms` - periodic connection recycling
-- `bounce_drain_timeout_ms` - timeout for draining in-flight requests
-
-**Status**: ✅ Already implemented in arterial2 via `arterial_bouncer2`
-
 ### **7. Request Sweeping**
 Both backends support:
 - `sweep_interval_ms` - periodic cleanup of timed-out requests

@@ -17,7 +17,7 @@ together.
 """.
 
 %% If anything after arterial_pool:start_link/2 fails (most likely
-%% wait_until_available/3 exhausting its retries), this runs *before* any
+%% wait_connected/3 timing out), this runs *before* any
 %% test body's own try/after -- so without cleaning up here, the pool's
 %% registered supervisor name, its buffer ETS table, and the listening
 %% test_tcp_server would all leak past this test, making every subsequent
@@ -30,7 +30,7 @@ setup(Size) ->
   Port = test_tcp_server:port(Srv),
   {ok, SupPid} = arterial_pool:start_link(tcp_echo_pool, #{
     size      => Size,
-    codec     => test_echo_protocol,
+    codec     => arterial_codec_default,
     address   => "127.0.0.1",
     port      => Port,
     protocol  => tcp
@@ -38,8 +38,10 @@ setup(Size) ->
   try
     %% Give the pool's connections a moment to dial in before the test
     %% issues its first call/3.
-    wait_until_available(tcp_echo_pool, Size, 50),
-    {Srv, SupPid}
+    case arterial_pool:wait_connected(tcp_echo_pool, Size, 1000) of
+      ok -> {Srv, SupPid};
+      {error, timeout} -> error(pool_not_ready)
+    end
   catch
     Class:Reason:Stack ->
       teardown({Srv, SupPid}),
@@ -59,27 +61,6 @@ teardown({Srv, SupPid}) ->
   arterial_pool:stop(tcp_echo_pool),
   test_tcp_server:stop(Srv).
 
-%% Block until all `N' connections of `Pool' have (re)connected by
-%% checking that all connections are marked as available in the pool's
-%% availability bitmap.
-wait_until_available(Pool, N, Retries) ->
-  case check_all_available(Pool, N) of
-    true -> ok;
-    false when Retries > 0 ->
-      timer:sleep(20),
-      wait_until_available(Pool, N, Retries - 1);
-    false ->
-      error(pool_not_ready)
-  end.
-
-check_all_available(Pool, N) ->
-  try
-    lists:all(fun(ConnID) ->
-      arterial_pool:is_available(Pool, ConnID)
-    end, lists:seq(0, N - 1))
-  catch
-    error:{unknown_pool, _} -> false
-  end.
 
 tcp_echo_test() ->
   {Srv, SupPid} = setup(),
@@ -234,7 +215,10 @@ tcp_multi_address_failover_test() ->
     protocol => tcp
   }),
   try
-    wait_until_available(tcp_echo_pool, 1, 100),
+    case arterial_pool:wait_connected(tcp_echo_pool, 1, 2000) of
+      ok -> ok;
+      {error, timeout} -> error(pool_not_ready)
+    end,
     {ok, hello} = arterial_client:call(tcp_echo_pool, {echo, hello}, 1000)
   after
     case is_process_alive(SupPid) of
@@ -270,7 +254,10 @@ tcp_multi_address_per_entry_port_test() ->
     protocol => tcp
   }),
   try
-    wait_until_available(tcp_echo_pool, 1, 100),
+    case arterial_pool:wait_connected(tcp_echo_pool, 1, 2000) of
+      ok -> ok;
+      {error, timeout} -> error(pool_not_ready)
+    end,
     {ok, hello} = arterial_client:call(tcp_echo_pool, {echo, hello}, 1000)
   after
     case is_process_alive(SupPid) of

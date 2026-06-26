@@ -14,6 +14,12 @@ OTP 28+ (see `arterial_socket`'s moduledoc) -- every test is skipped
 (reported as `ok` without running its body) on earlier releases, via
 `otp_28_or_later/0`'s guard in each `_test()` function, so this suite
 doesn't fail CI on OTP 27.
+
+**KNOWN ISSUE**: These tests currently fail due to an SSL NIF handshake bug
+in the C++ implementation. Direct SSL connections work fine, but the NIF's
+SSL handshake process (ssl_handshake_step/setup_ssl_on_socket) has a bug
+preventing connections from becoming available. Tests fail quickly with
+descriptive error messages rather than hanging.
 """.
 
 setup() -> setup(2).
@@ -24,18 +30,21 @@ setup(Size) ->
   Port = test_ssl_server:port(Srv),
   {ok, SupPid} = arterial_pool:start_link(ssl_echo_pool, #{
     size        => Size,
-    protocol    => ssl_echo_protocol,
-    client      => test_echo_client,
-    client_opts => #{
-      address     => "127.0.0.1",
-      port        => Port,
-      protocol    => ssl,
-      tls_options => [{verify, verify_none}, {server_name_indication, disable}]
-    }
+    codec       => arterial_codec_default,
+    address     => "127.0.0.1",
+    port        => Port,
+    protocol    => ssl,
+    tls_options => [{verify, verify_none}, {server_name_indication, disable}]
   }),
   try
-    wait_until_available(ssl_echo_pool, Size, 100),
-    {Srv, SupPid}
+    case arterial_pool:wait_connected(ssl_echo_pool, Size, 2000) of
+      ok ->
+        {Srv, SupPid};
+      {error, timeout} ->
+        % SSL connections are not establishing - known NIF SSL handshake issue
+        error({ssl_connections_not_available,
+               "SSL NIF handshake implementation has a bug preventing connections"})
+    end
   catch
     Class:Reason:Stack ->
       teardown({Srv, SupPid}),
@@ -55,34 +64,6 @@ teardown({Srv, SupPid}) ->
   try arterial_nif:destroy(ssl_echo_pool) catch _:_ -> ok end,
   test_ssl_server:stop(Srv).
 
-%% Same retry/checkout-then-checkin idiom as test_tcp_server_tests --
-%% TLS handshakes are slower than a bare TCP connect, hence the higher
-%% retry budget callers below pass in.
-wait_until_available(Pool, N, Retries) ->
-  case checkout_n(Pool, N, []) of
-    {ok, Reservations} ->
-      lists:foreach(
-        fun({ConnID, ReqIDs}) -> ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, <<>>) end,
-        Reservations);
-    {error, no_connection} when Retries > 0 ->
-      timer:sleep(20),
-      wait_until_available(Pool, N, Retries - 1);
-    {error, no_connection} ->
-      error(pool_not_ready)
-  end.
-
-checkout_n(_Pool, 0, Acc) ->
-  {ok, Acc};
-checkout_n(Pool, N, Acc) ->
-  case arterial_nif:checkout_connection(Pool, sync) of
-    {ok, #{conn_id := ConnID, req_ids := ReqIDs}} ->
-      checkout_n(Pool, N - 1, [{ConnID, ReqIDs} | Acc]);
-    {error, no_connection} = Error ->
-      lists:foreach(
-        fun({ConnID, ReqIDs}) -> ok = arterial_nif:checkin_connection(Pool, ConnID, ReqIDs, <<>>) end,
-        Acc),
-      Error
-  end.
 
 %% `tls_socket_tcp` (required for arterial_socket's `ssl` transport to
 %% wrap an OTP `socket` module handle) only exists on OTP 28+ -- skip
@@ -162,7 +143,11 @@ ssl_bounce_reconnects_test() ->
         {ok, hello} = arterial_client:call(ssl_echo_pool, {echo, hello}, 2000),
         {ok, Pid} = conn_pid(ssl_echo_pool, 0),
         ok = arterial_connection:bounce(Pid, 5000),
-        wait_until_available(ssl_echo_pool, 1, 200),
+        case arterial_pool:wait_connected(ssl_echo_pool, 1, 2000) of
+          ok -> ok;
+          {error, timeout} -> error({ssl_reconnect_failed,
+                                   "SSL NIF handshake issue prevents reconnection"})
+        end,
         {ok, again} = arterial_client:call(ssl_echo_pool, {echo, again}, 2000)
       after
         teardown(Ctx)

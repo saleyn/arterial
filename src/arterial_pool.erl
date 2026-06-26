@@ -54,16 +54,92 @@ several replica sockets behind one logical connection).
 -export([init/1]).
 -export([sup_name/1]).
 -export([pool_ref/1, codec/1, size/1, default_timeout_ms/1, throttle/1, corr_table/1]).
--export([avail_ref/1, set_available/2, set_unavailable/2, is_available/2]).
+-export([avail_ref/1, set_available/2, set_unavailable/2, is_available/2, wait_connected/2, wait_connected/3]).
 
 -doc "The atom identifying a pool; shared with `arterial_nif:pool_ref/0`'s owner.".
 -type name() :: atom().
 
 -doc """
-Per-connection rate limit, checked by `arterial_client` before every
-`send_and_release/3` -- see `arterial_throttle`.
+Socket options supported by arterial's NIF layer for TCP/UDP connections.
+These are a subset of standard socket options that can be efficiently
+processed by the NIF, formatted as atoms or `{atom(), term()}` tuples.
+
+Supported options include:
+* `keepalive` - Enable TCP keep-alive (equivalent to `{keepalive, true}`)
+* `{keepalive, boolean()}` - Enable or disable TCP keep-alive
+* `{sndbuf, pos_integer()}` - Send buffer size in bytes
+* `{recvbuf, pos_integer()}` - Receive buffer size in bytes
+* `{priority, 0..6}` - Socket priority level
+* `{tos, non_neg_integer()}` - Type of Service bits
+* `{linger, {boolean(), non_neg_integer()}}` - Linger behavior on close
+
+These options are passed to `arterial_nif:connect_with_opts/8` and
+`arterial_nif:connect_proto_with_opts/9` for socket configuration during
+connection establishment.
 """.
--type throttle_opts() :: #{rate := pos_integer(), burst := pos_integer()}.
+-type sockopt() ::
+    keepalive |
+    {keepalive, boolean()} |
+    {sndbuf,    pos_integer()} |
+    {recvbuf,   pos_integer()} |
+    {priority,  0..6} |
+    {tos,       non_neg_integer()} |
+    {linger,    {boolean(), non_neg_integer()}}.
+
+-doc """
+TLS options supported by arterial's NIF layer for SSL connections.
+These are a subset of standard SSL/TLS options that can be efficiently
+processed by the NIF's OpenSSL integration.
+
+Supported options include:
+* `{verify, verify_none | verify_peer}` - Peer certificate verification mode
+* `{cacerts, [binary()]}` - List of trusted CA certificates in DER format
+* `{cert, binary()}` - Client certificate in DER format
+* `{key, binary()}` - Private key in DER format
+* `{versions, [atom()]}` - Supported TLS versions (e.g., `['tlsv1.3', 'tlsv1.2']`)
+* `{ciphers, [binary()]}` - Allowed cipher suites
+* `{honor_cipher_order, boolean()}` - Whether server's cipher preference takes precedence
+
+These options are processed by the NIF when `protocol => ssl` is specified
+and are used to configure the OpenSSL context during connection establishment.
+""".
+-type tlsopt() ::
+    {verify,             verify_none | verify_peer} |
+    {cacerts,            [binary()]} |
+    {cert,               binary()}   |
+    {key,                binary()}   |
+    {versions,           [atom()]}   |
+    {ciphers,            [binary()]} |
+    {honor_cipher_order, boolean()}.
+
+-doc """
+Per-connection rate limit configuration for the NIF's time-spacing throttle.
+The NIF uses a time-spacing algorithm that ensures a minimum time interval
+between requests rather than a traditional token bucket.
+
+* `rate_per_sec` - Maximum requests per second (required). The NIF enforces
+  a minimum interval of `window_msec / rate_per_sec` milliseconds between
+  successive requests on each connection.
+* `window_msec` - Time window in milliseconds for rate calculation (default: 1000).
+  This determines the precision of the time-spacing algorithm.
+
+The throttling is applied at the NIF level in `arterial_nif:send_and_release/3`
+where it checks `arterial::time_spacing_throttle::add/2` before allowing
+requests to proceed. Failed throttle checks cause connection retry logic
+in `arterial_client`.
+
+## Examples
+
+```erlang
+#{rate_per_sec => 100, window_msec => 1000}   % 100 req/sec, 10ms intervals
+#{rate_per_sec => 50,  window_msec => 500}    % 50 req/sec, 10ms intervals
+#{rate_per_sec => 10}                         % 10 req/sec, default 1000ms window
+```
+""".
+-type throttle_opts() :: #{
+  rate_per_sec := pos_integer(),
+  window_msec  => pos_integer()
+}.
 
 -doc """
 Options accepted by `start_link/2`.
@@ -78,8 +154,8 @@ Options accepted by `start_link/2`.
 * `protocol` - connection protocol: `tcp` (default), `udp`, `ssl` for built-in
   NIF protocols, or a module implementing `c:arterial_protocol` for custom protocols.
 * `nodelay` - sets `TCP_NODELAY` on TCP/SSL connections (default: `true`).
-* `socket_options` - list of socket options to apply to each connection
-  (e.g., `[keepalive, {sndbuf, 8192}]`).
+* `sock_opts` - list of `t:sockopt/0` options to apply to each connection
+  (e.g., `[keepalive, {sndbuf, 8192}]`). These are processed by the NIF layer.
 * `reconnect`/`reconnect_time` - reconnection behavior configuration.
 * `default_timeout_ms` - default `call/3` timeout if the caller doesn't
   pass one (default: `5000`).
@@ -89,7 +165,8 @@ Options accepted by `start_link/2`.
   `undefined`, disabled) -- see `arterial_bouncer`'s moduledoc.
 * `bounce_drain_timeout_ms` - see `arterial_bouncer` (default: `30000`).
 * `throttle` - `t:throttle_opts/0`, or `undefined` to disable per-
-  connection rate limiting entirely (default: `undefined`).
+  connection rate limiting entirely (default: `undefined`). Uses time-spacing
+  algorithm in the NIF.
 
 ## Examples
 
@@ -108,7 +185,8 @@ Options accepted by `start_link/2`.
   port                    => arterial:inet_port(),
   protocol                => tcp | udp | ssl | module(),
   nodelay                 => boolean(),
-  socket_options          => [gen_tcp:option() | gen_udp:option()],
+  sock_opts               => [sockopt()],
+  tls_options             => [tlsopt()],
   reconnect               => boolean(),
   reconnect_time          => arterial_connection:reconnect_time(),
   default_timeout_ms      => pos_integer(),
@@ -118,7 +196,7 @@ Options accepted by `start_link/2`.
   throttle                => undefined | throttle_opts()
 }.
 
--export_type([name/0, options/0, throttle_opts/0]).
+-export_type([name/0, options/0, throttle_opts/0, sockopt/0, tlsopt/0]).
 
 -define(POOL_OPT_KEYS, [
   size, codec, default_timeout_ms, sweep_interval_ms,
@@ -197,18 +275,25 @@ init([Name, Opts]) ->
     {read_concurrency, true}, {write_concurrency, true}
   ]),
 
-  persistent_term:put(pool_key(Name), PoolRef),
-  persistent_term:put(codec_key(Name), Codec),
-  persistent_term:put(size_key(Name), Size),
+  persistent_term:put(pool_key(Name),    PoolRef),
+  persistent_term:put(codec_key(Name),   Codec),
+  persistent_term:put(size_key(Name),    Size),
   persistent_term:put(timeout_key(Name), DefaultTimeoutMs),
 
   % Configure throttling in the NIF if enabled
   ThrottleState = case Throttle of
     undefined ->
       undefined;
-    #{rate := Rate, burst := Burst} when is_integer(Rate), Rate > 0, is_integer(Burst), Burst > 0 ->
-      ok = arterial_nif:configure_throttle(PoolRef, Rate, Burst),
-      {Rate, Burst}
+    % New format with rate_per_sec and window_msec
+    #{rate_per_sec := RPS, window_msec := WinMS}
+        when is_integer(RPS), RPS > 0, is_integer(WinMS), WinMS > 0 ->
+      ok   = arterial_nif:configure_throttle(PoolRef, RPS, WinMS),
+      {RPS, WinMS};
+    % New format with rate_per_sec only (default window)
+    #{rate_per_sec := RPS} when is_integer(RPS), RPS > 0 ->
+      WinMS = 1000,
+      ok    = arterial_nif:configure_throttle(PoolRef, RPS, WinMS),
+      {RPS, WinMS}
   end,
   persistent_term:put(throttle_key(Name), ThrottleState),
   %% All connections start unavailable (no socket yet); each
@@ -278,7 +363,7 @@ size(Name) -> get_pt(size_key(Name), Name).
 -spec default_timeout_ms(name()) -> pos_integer().
 default_timeout_ms(Name) -> get_pt(timeout_key(Name), Name).
 
--doc "`Name`'s throttle state, or `undefined` if throttling is disabled.".
+-doc "`Name`'s throttle state, or `undefined` if throttling is disabled. Returns `{RatePerSec, WindowMsec}`.".
 -spec throttle(name()) -> undefined | {pos_integer(), pos_integer()}.
 throttle(Name) -> get_pt(throttle_key(Name), Name).
 
@@ -308,6 +393,76 @@ set_unavailable(Name, ConnID) ->
 -spec is_available(name(), non_neg_integer()) -> boolean().
 is_available(Name, ConnID) ->
   atomics:get(avail_ref(Name), ConnID + 1) =:= 1.
+
+-doc """
+Block until `all` connections or the first `N` connections in pool `Name` are available.
+
+This function polls the pool's availability bitmap and blocks until the required
+number of connections are established and ready for use. Useful for testing and
+scenarios where you need to ensure connections are ready before proceeding.
+
+The first argument can be either:
+- `all` - wait for all connections in the pool to be available
+- `N` (integer) - wait for the first N connections (0 through N-1) to be available
+
+Defaults to a 5-second timeout with 20ms polling intervals.
+
+## Examples
+
+```erlang
+%% Wait for all connections to be ready
+ok = arterial_pool:wait_connected(my_pool, all).
+
+%% Wait for the first 3 connections to be ready
+ok = arterial_pool:wait_connected(my_pool, 3).
+
+%% Wait for 2 connections with custom timeout
+ok = arterial_pool:wait_connected(my_pool, 2, 10000).
+```
+""".
+-spec wait_connected(name(), all | non_neg_integer()) -> ok | {error, timeout}.
+wait_connected(Name, Connections) ->
+  wait_connected(Name, Connections, 5000).
+
+-doc "Like `wait_connected/2` but with a custom timeout in milliseconds.".
+-spec wait_connected(name(), all | non_neg_integer(), timeout()) -> ok | {error, timeout}.
+wait_connected(Name, all, TimeoutMs) ->
+  try
+    PoolSize = ?MODULE:size(Name),
+    wait_connected(Name, PoolSize, TimeoutMs)
+  catch
+    error:{unknown_pool, _} -> {error, timeout}
+  end;
+wait_connected(Name, N, TimeoutMs) when is_integer(N), N >= 0 ->
+  wait_connected_loop(Name, N, TimeoutMs, erlang:monotonic_time(millisecond)).
+
+%% Internal function to implement the polling loop
+wait_connected_loop(Name, N, TimeoutMs, StartTime) ->
+  case check_connections_available(Name, N) of
+    true ->
+      ok;
+    false ->
+      Now = erlang:monotonic_time(millisecond),
+      ElapsedMs = Now - StartTime,
+      if
+        ElapsedMs >= TimeoutMs ->
+          {error, timeout};
+        true ->
+          timer:sleep(20),  % 20ms polling interval, same as existing tests
+          wait_connected_loop(Name, N, TimeoutMs, StartTime)
+      end
+  end.
+
+%% Check if the first N connections are available
+check_connections_available(Name, N) ->
+  try
+    lists:all(fun(ConnID) ->
+      is_available(Name, ConnID)
+    end, lists:seq(0, N - 1))
+  catch
+    error:badarg -> false;  % Pool might not exist yet
+    error:{unknown_pool, _} -> false  % Pool doesn't exist
+  end.
 
 %%%-----------------------------------------------------------------------------
 %%% Internal functions

@@ -52,7 +52,7 @@ test:
 # loopback TCP -- not part of `test`/eunit (no _test exports), so it
 # needs its own target. Pass options either as a plain comma-separated
 # `key=value` list:
-#   make bench BENCH_OPTS='pool_size=16 duration_s=10'
+#   make bench BENCH_OPTS='pool_size=16 duration=10'
 #   make bench BENCH_OPTS='mode=sync'
 # or, if you need a non-trivial value (e.g. a binary), as a full Erlang
 # map literal -- detected by a leading '#{' and passed through as-is:
@@ -65,19 +65,34 @@ BENCH_OPTS_MAP := $(HASH){}
 else ifneq ($(findstring $(HASH){,$(BENCH_OPTS)),)
 BENCH_OPTS_MAP := $(BENCH_OPTS)
 else
-BENCH_OPTS_MAP := $(HASH){$(shell echo '$(BENCH_OPTS)' | tr -s ' ' '\n' | \
+BENCH_OPTS_MAP := $(HASH){$(shell echo '$(BENCH_OPTS)' | \
+  sed -E 's/([a-zA-Z_][a-zA-Z0-9_]*=[^[:space:],]+)[[:space:]]+/\1,/g' | \
+  tr ',' '\n' | \
   sed -E 's/([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*=[[:space:]]*(.+)/\1 => \2/' | \
   paste -sd, -)}
 endif
 
-bench: bench-arterial
-bench-help: bench-arterial-help
+bench: bench-compare
+bench-help: bench-compare-help
+bench-plot: bench-compare-plot
+
+bench-compare bench-compare-help:
+	@$(REBAR) as test compile
+	erl -noshell -noinput -pa _build/test/lib/*/ebin \
+	  -pa _build/test/lib/arterial/test \
+	  -eval "bench_compare:$(subst -,_,$(subst bench-compare,bench,$@))($(BENCH_OPTS_MAP)), halt()."
+
+bench-compare-plot:
+	@$(REBAR) as test compile
+	erl -noshell -noinput -pa _build/test/lib/*/ebin \
+	  -pa _build/test/lib/arterial/test \
+	  -eval "bench_compare:plot_scaling($(BENCH_OPTS_MAP)), halt()."
 
 bench-arterial bench-arterial-help:
 	@$(REBAR) as test compile
 	erl -noshell -noinput -pa _build/test/lib/arterial/ebin \
 	  -pa _build/test/lib/arterial/test \
-	  -eval "arterial_bench:$(subst -,_,$(subst bench-arterial,bench,$@))($(BENCH_OPTS_MAP)), halt()."
+	  -eval "bench_arterial:$(subst -,_,$(subst bench-arterial,bench,$@))($(BENCH_OPTS_MAP)), halt()."
 
 # Runs test/arterial_bench2.erl -- same workload shape as `bench` above,
 # but against arterial_pool2/arterial_client2 (the NIF-resident-I/O
@@ -102,7 +117,7 @@ bench-shackle bench-shackle-help:
 	@$(REBAR) as test compile
 	@erl -noshell -noinput -pa _build/test/lib/*/ebin \
 	  -pa _build/test/lib/arterial/test \
-	  -eval "shackle_bench:$(subst -,_,$(subst bench-shackle,bench,$@))($(BENCH_OPTS_MAP)), halt()."
+	  -eval "bench_shackle:$(subst -,_,$(subst bench-shackle,bench,$@))($(BENCH_OPTS_MAP)), halt()."
 
 # Runs test/poolboy_bench.erl -- the same workload shape/wire framing as
 # `bench` above, but driven through https://github.com/devinus/poolboy
@@ -114,7 +129,7 @@ bench-poolboy bench-poolboy-help:
 	@$(REBAR) as test compile
 	@erl -noshell -noinput -pa _build/test/lib/*/ebin \
 	  -pa _build/test/lib/arterial/test \
-	  -eval "poolboy_bench:$(subst -,_,$(subst bench-poolboy,bench,$@))($(BENCH_OPTS_MAP)), halt()."
+	  -eval "bench_poolboy:$(subst -,_,$(subst bench-poolboy,bench,$@))($(BENCH_OPTS_MAP)), halt()."
 
 clean:
 	$(MAKE) -C c_src $@

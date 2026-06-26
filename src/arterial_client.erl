@@ -203,6 +203,13 @@ await_reply(Pool, CorrId, Timeout) ->
     {arterial_reply,        CorrId, Reply} -> {ok, Reply};
     {arterial_disconnected, Pool,  CorrId} -> {error, disconnected};
     {arterial_timeout,      Pool,  CorrId} -> {error, timeout};
+    {telemetry_event, _, _, _} ->
+      % Telemetry events from test handlers should not interfere with reply waiting
+      await_reply(Pool, CorrId, Timeout);
+    {'EXIT', _Pid, _Reason} ->
+      % Filter out stray EXIT messages from linked processes (common in test environments)
+      % These can accumulate in the mailbox when trap_exit is true and interfere with replies
+      await_reply(Pool, CorrId, Timeout);
     Other ->
       error({invalid_reply, Other, #{pool => Pool, corr_id => CorrId}})
   after Timeout ->

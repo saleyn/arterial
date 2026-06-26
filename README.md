@@ -283,39 +283,124 @@ wait-list in FIFO order (oldest queued caller first):
 
 ## Protocol
 
-It is the responsibility of the user to provide a module for encoding and decoding messages over the selected socket transport. Which configuration to use depends entirely on what the wire protocol's messages look like. There are 6 supported modes:
+It is the responsibility of the user to provide a module for encoding and
+decoding messages over the selected socket transport. Which configuration to
+use depends entirely on what the wire protocol's messages look like. There
+are 6 supported modes:
 
-1. **Native request ID.** Each wire-level message contains a 32-bit (or 64-bit) request ID, and replies are not required to arrive in FIFO order. Use `RandomAccessBackLog` (`fifo => false`), any `backlog` value below 65,536 (the 16-bit internal index cap — see [Backlog modes](#backlog-modes)). Requests can be sent asynchronously, with up to 64k in-flight per connection.
+1. **Native request ID.** Each wire-level message contains a 32-bit (or
+   64-bit) request ID, and replies are not required to arrive in FIFO order.
+   Use `RandomAccessBackLog` (`fifo => false`), any `backlog` value below
+   65,536 (the 16-bit internal index cap — see [Backlog modes](#backlog-modes)).
+   Requests can be sent asynchronously, with up to 64k in-flight per
+   connection.
 
-2. **Surrogate request ID.** Same as above, but for protocols that don't define a "request ID" concept of their own and instead expose *some* extensible/free-form field your `encode_request/3` can repurpose as one (a correlation tag, an unused header word, an opaque client cookie the server is required to echo back unmodified). `arterial` doesn't care whether the ID is one the protocol natively defines or one you synthesize and inject yourself — `RandomAccessBackLog` matches replies purely by the bits in `ext_req_id`, with no notion of which side "owns" the ID's meaning. Same `fifo => false` configuration as mode 1; see [Client Implementation Guide's "Surrogate request IDs"](docs/client-guide.md#surrogate-request-ids) for a worked example.
+2. **Surrogate request ID.** Same as above, but for protocols that don't
+   define a "request ID" concept of their own and instead expose *some*
+   extensible/free-form field your `encode_request/3` can repurpose as one
+   (a correlation tag, an unused header word, an opaque client cookie the
+   server is required to echo back unmodified). `arterial` doesn't care
+   whether the ID is one the protocol natively defines or one you synthesize
+   and inject yourself — `RandomAccessBackLog` matches replies purely by the
+   bits in `ext_req_id`, with no notion of which side "owns" the ID's meaning.
+   Same `fifo => false` configuration as mode 1; see [Client Implementation
+   Guide's "Surrogate request IDs"](docs/client-guide.md#surrogate-request-ids)
+   for a worked example.
 
-3. **FIFO, backlog = 1 (synchronous reservation).** Wire-level messages don't encode a request ID (and no field can be repurposed as one), so replies are matched purely by FIFO send order. A client reserves the connection for the lifetime of one request and awaits the response synchronously — no concurrent in-flight requests, so no backlog capacity is needed beyond the default of 1.
+3. **FIFO, backlog = 1 (synchronous reservation).** Wire-level messages
+   don't encode a request ID (and no field can be repurposed as one), so
+   replies are matched purely by FIFO send order. A client reserves the
+   connection for the lifetime of one request and awaits the response
+   synchronously — no concurrent in-flight requests, so no backlog capacity
+   is needed beyond the default of 1.
 
-4. **FIFO, backlog > 1 (asynchronous multiplexing).** Same FIFO-order matching as mode 3, but with `backlog > 1, fifo => true` so several requests can be outstanding on one connection at once. **This depends on a guarantee `arterial` cannot verify**: the server must actually preserve send order in its replies. `FIFOBackLog::CheckIn` always releases the oldest outstanding slot — it has no way to detect a server that violates this (e.g. by replying out of order once), and a single violation silently misattributes every reply after it with no error raised anywhere. Prefer mode 1 or 2 whenever the protocol allows it; reserve this mode for protocols that truly have no ID-capable field, and consider pairing it with a short `fixed_timeout_us` so a confused backlog at least self-heals via the sweeper instead of wedging indefinitely.
+4. **FIFO, backlog > 1 (asynchronous multiplexing).** Same FIFO-order
+   matching as mode 3, but with `backlog > 1, fifo => true` so several
+   requests can be outstanding on one connection at once. **This depends on
+   a guarantee `arterial` cannot verify**: the server must actually preserve
+   send order in its replies. `FIFOBackLog::CheckIn` always releases the
+   oldest outstanding slot — it has no way to detect a server that violates
+   this (e.g. by replying out of order once), and a single violation silently
+   misattributes every reply after it with no error raised anywhere. Prefer
+   mode 1 or 2 whenever the protocol allows it; reserve this mode for
+   protocols that truly have no ID-capable field, and consider pairing it
+   with a short `fixed_timeout_us` so a confused backlog at least self-heals
+   via the sweeper instead of wedging indefinitely.
 
-   To actually multiplex several outstanding requests on **one** connection, reserve them all in a single call: `arterial_nif:checkout_connection/3` and `arterial_nif:checkout_async/4` take a `Samples` argument that reserves that many backlog slots on one connection at once, returning that many `req_ids`. This is required, not just convenient: a connection is removed from the pool's available set on its first successful checkout and isn't returned until something checks it back in, so repeated single-sample (`Samples = 1`, the `/2`/`/3`-arity default) checkouts against an idle connection never land on the same connection twice in a row — they get a different connection or, if none are free, queue/fail. See `arterial_nif:checkout_connection/3`'s and `checkout_async/4`'s docs for the full contract, and `test/arterial_nif_tests.erl`'s `fifo_backlog_multiplexing_test/0`/`fifo_backlog_multiplexing_async_test/0` for worked examples.
+   To actually multiplex several outstanding requests on **one** connection,
+   reserve them all in a single call: `arterial_nif:checkout_connection/3`
+   and `arterial_nif:checkout_async/4` take a `Samples` argument that
+   reserves that many backlog slots on one connection at once, returning
+   that many `req_ids`. This is required, not just convenient: a connection
+   is removed from the pool's available set on its first successful checkout
+   and isn't returned until something checks it back in, so repeated
+   single-sample (`Samples = 1`, the `/2`/`/3`-arity default) checkouts
+   against an idle connection never land on the same connection twice in a
+   row — they get a different connection or, if none are free, queue/fail.
+   See `arterial_nif:checkout_connection/3`'s and `checkout_async/4`'s docs
+   for the full contract, and `test/arterial_nif_tests.erl`'s
+   `fifo_backlog_multiplexing_test/0`/`fifo_backlog_multiplexing_async_test/0`
+   for worked examples.
 
-5. **Send-and-forget (no reply at all).** Use `arterial_client:cast/2` instead of `call/3` — it hands the request to `send/2` and returns as soon as the bytes are accepted by the transport, never blocking on (or even allocating a backlog slot for) a reply. Since nothing is ever in-flight, none of the backlog-mode tradeoffs above apply: `backlog`/`fifo` settings don't matter for a connection's `cast/2` traffic, and there's no `req_ids` for the caller to hold or check in later. Typical use: fire-and-forget logging/metrics.
+5. **Send-and-forget (no reply at all).** Use `arterial_client:cast/2`
+   instead of `call/3` — it hands the request to `send/2` and returns as
+   soon as the bytes are accepted by the transport, never blocking on (or
+   even allocating a backlog slot for) a reply. Since nothing is ever
+   in-flight, none of the backlog-mode tradeoffs above apply:
+   `backlog`/`fifo` settings don't matter for a connection's `cast/2` traffic,
+   and there's no `req_ids` for the caller to hold or check in later.
+   Typical use: fire-and-forget logging/metrics.
 
 6. **Acknowledgement-based protocols**, two variants:
 
-   * **Per-message ack**: the server's "reply" to a request is just an ack (carrying the id back, or not even that, as long as your framing can tell which message it closes out) rather than a real response payload. This needs nothing extra — it's the *same* matching as mode 1 or 2 (`fifo => false`); `decode_reply/2` simply returns whatever small ack term applies (even just the atom `ack`) once it recognizes the match. See [Client Implementation Guide's "Per-message acks"](docs/client-guide.md#per-message-acks) for a worked example.
-   * **Bulk/cumulative ack**: a single ack confirms several previous requests at once (e.g. a heartbeat carrying "processed through sequence N"). This is a genuinely different mechanism, using `arterial_nif:checkin_up_to/3`: it releases every outstanding FIFO slot up to and including a given `req_id` in one call, even across requests originally reserved by different callers. Only meaningful with `fifo => true` (mode 3 or 4); a no-op against a random-access backlog (mode 1/2). See [Client Implementation Guide's "Bulk/cumulative acks"](docs/client-guide.md#bulkcumulative-acks) for the full contract and `test/arterial_nif_tests.erl`'s `checkin_up_to_releases_fifo_span_test/0` for a worked example.
+   * **Per-message ack**: the server's "reply" to a request is just an ack
+     (carrying the id back, or not even that, as long as your framing can
+     tell which message it closes out) rather than a real response payload.
+     This needs nothing extra — it's the *same* matching as mode 1 or 2
+     (`fifo => false`); `decode_reply/2` simply returns whatever small ack
+     term applies (even just the atom `ack`) once it recognizes the match.
+     See [Client Implementation Guide's "Per-message acks"](docs/client-guide.md#per-message-acks)
+     for a worked example.
+   * **Bulk/cumulative ack**: a single ack confirms several previous requests
+     at once (e.g. a heartbeat carrying "processed through sequence N"). This
+     is a genuinely different mechanism, using `arterial_nif:checkin_up_to/3`:
+     it releases every outstanding FIFO slot up to and including a given
+     `req_id` in one call, even across requests originally reserved by
+     different callers. Only meaningful with `fifo => true` (mode 3 or 4);
+     a no-op against a random-access backlog (mode 1/2). See [Client
+     Implementation Guide's "Bulk/cumulative acks"](docs/client-guide.md#bulkcumulative-acks)
+     for the full contract and `test/arterial_nif_tests.erl`'s
+     `checkin_up_to_releases_fifo_span_test/0` for a worked example.
 
-**Disconnect notification** applies across modes 1–4 and 6 (anywhere a request can be genuinely in-flight): if a connection's socket dies while it still has unconfirmed asynchronous (`track_inflight/5`-registered) requests, each owning process receives `{arterial_disconnected, Pool, ReqID}` so it can resubmit or persist that request outside `arterial`. See `arterial_nif:connection_down/2`, called automatically from `arterial_connection`'s disconnect path. Not applicable to mode 5 (nothing is ever in-flight to lose).
+**Disconnect notification** applies across modes 1–4 and 6 (anywhere a request
+can be genuinely in-flight): if a connection's socket dies while it still has
+unconfirmed asynchronous (`track_inflight/5`-registered) requests, each owning
+process receives `{arterial_disconnected, Pool, ReqID}` so it can resubmit or
+persist that request outside `arterial`. See `arterial_nif:connection_down/2`,
+called automatically from `arterial_connection`'s disconnect path. Not
+applicable to mode 5 (nothing is ever in-flight to lose).
 
 ### Behaviours to implement
 
 Two behaviours decouple the wire transport from request/response encoding:
 
-* **`arterial_protocol`** ([src/arterial_protocol.erl](src/arterial_protocol.erl)) — the transport and per-request codec: `connect/3`, `close/1`, `send/2`, `recv/2`, `setopts/2`, `encode_request/3`, `decode_reply/2`.
-* **`arterial_client`** ([src/arterial_client.erl](src/arterial_client.erl)) — the connection lifecycle: `init/1`, `setup/2`, `handle_request/2`, `handle_data/2`, `handle_timeout/2` (optional), `terminate/2`. Also implements `call/3`, the synchronous request API, and `cast/2`, the send-and-forget API (see [Protocol](#protocol) mode 5) — both used by callers directly; the caller's own process owns the socket for the call's duration via `arterial_protocol`, and `arterial_connection`'s `gen_server` is not involved in either call itself.
+* **`arterial_protocol`** ([src/arterial_protocol.erl](src/arterial_protocol.erl))
+  — the transport and per-request codec: `connect/3`, `close/1`, `send/2`,
+  `recv/2`, `setopts/2`, `encode_request/3`, `decode_reply/2`.
+* **`arterial_client`** ([src/arterial_client.erl](src/arterial_client.erl))
+  — the connection lifecycle: `init/1`, `setup/2`, `handle_request/2`,
+  `handle_data/2`, `handle_timeout/2` (optional), `terminate/2`. Also
+  implements `call/3`, the synchronous request API, and `cast/2`, the
+  send-and-forget API (see [Protocol](#protocol) mode 5) — both used by
+  callers directly; the caller's own process owns the socket for the call's
+  duration via `arterial_protocol`, and `arterial_connection`'s `gen_server`
+  is not involved in either call itself.
 
 Pool/connection options (`t:arterial_client:options/0`) include `address`/`ip`
 (or `addresses`, for failover across several), `port`, `protocol` (`tcp` |
 `udp` | `ssl` — see [SSL/TLS guide](docs/ssl-guide.md) for `ssl`, which
 needs OTP 28+), `reconnect`, `reconnect_time`, `bounce_interval_ms`,
-`socket_options`, and `tls_options` (only used when `protocol => ssl`).
+`sock_opts`, and `tls_options` (only used when `protocol => ssl`).
 `t:arterial_pool:options/0` (passed to `arterial_pool:start_link/2`)
 additionally controls `size`, `backlog`, `fifo`, `fixed_timeout_us`,
 `sweep_interval_ms`, `protocol` (here, the wire codec module — not the
@@ -340,7 +425,7 @@ The backend that actually receives these events is chosen via the
 `arterial_app`'s top-level supervisor at boot:
 
 ```erlang
-{arterial, [{observability, undefined}]}              % default: no backend, span/3 just runs Fun/0
+{arterial, [{observability, undefined}]}               % default: no backend, span/3 just runs Fun/0
 {arterial, [{observability, telemetry}]}               % forwards to telemetry:execute/3
 {arterial, [{observability, prometheus}]}              % records straight into Prometheus metrics
 {arterial, [{observability, {telemetry, Opts}}]}       % built-in backend + Opts passed to its start/1
@@ -400,9 +485,9 @@ same wire protocol, payload, and workload shape (`test/arterial_bench.erl`
 drives the same workload against `arterial` itself).
 
 ```
-make bench           BENCH_OPTS='pool_size=8, duration_s=5'   # arterial
-make bench-shackle   BENCH_OPTS='pool_size=8, duration_s=5'   # shackle
-make bench-poolboy   BENCH_OPTS='pool_size=8, duration_s=5'   # poolboy
+make bench           BENCH_OPTS='pool_size=8, duration=5'   # arterial
+make bench-shackle   BENCH_OPTS='pool_size=8, duration=5'   # shackle
+make bench-poolboy   BENCH_OPTS='pool_size=8, duration=5'   # poolboy
 ```
 
 All three accept a comma-separated `key=value` list (or a literal `#{...}`

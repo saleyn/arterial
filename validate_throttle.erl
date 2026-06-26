@@ -8,7 +8,7 @@ test() ->
     % Test 1: Initialize pool with throttling
     io:format("Test 1: Initializing pool with throttling...~n"),
     {ok, PoolRef} = arterial_nif:init_pool(1, 1),
-    ok = arterial_nif:configure_throttle(PoolRef, 10, 5), % 10 req/sec, 5 burst
+    ok = arterial_nif:configure_throttle(PoolRef, 10, 500), % 10 req/sec, 500ms window
     io:format("✓ Pool initialized with throttling configured~n"),
 
     % Test 2: Verify configuration doesn't crash
