@@ -2044,6 +2044,61 @@ static ERL_NIF_TERM connect_proto_with_opts_nif(ErlNifEnv* env, int argc, const 
   return claim_slot(env, ctx, stripe, fd, owner_pid);
 }
 
+// Check if a connection slot is available (authoritative availability check)
+static ERL_NIF_TERM is_slot_available_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+  PoolContext* ctx;
+  ConnSlot* slot_ptr = resolve_slot(env, argc, argv, &ctx);
+  if (!slot_ptr) return enif_make_badarg(env);
+  ConnSlot& slot = *slot_ptr;
+
+  // Check both slot status and lease mask for authoritative availability
+  bool slot_ready = (slot.status.load(std::memory_order_acquire) == SLOT_AVAILABLE);
+
+  auto& stripe = *ctx->stripes[slot.stripe_id];
+  uint64_t current_mask = stripe.lease_mask.load(std::memory_order_acquire);
+  bool slot_unleased = !(current_mask & (1ULL << slot.slot_id));
+
+  return (slot_ready && slot_unleased) ? am_true : am_false;
+}
+
+// Mark a connection slot as available for new sends
+static ERL_NIF_TERM set_slot_available_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+  PoolContext* ctx;
+  ConnSlot* slot_ptr = resolve_slot(env, argc, argv, &ctx);
+  if (!slot_ptr) return enif_make_badarg(env);
+  ConnSlot& slot = *slot_ptr;
+
+  // Set slot status to available
+  slot.status.store(SLOT_AVAILABLE, std::memory_order_release);
+
+  // Clear lease mask bit to make slot available for send_and_release
+  auto& stripe = *ctx->stripes[slot.stripe_id];
+  stripe.lease_mask.fetch_and(~(1ULL << slot.slot_id), std::memory_order_release);
+
+  return am_ok;
+}
+
+// Mark a connection slot as unavailable for new sends
+static ERL_NIF_TERM set_slot_unavailable_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+  PoolContext* ctx;
+  ConnSlot* slot_ptr = resolve_slot(env, argc, argv, &ctx);
+  if (!slot_ptr) return enif_make_badarg(env);
+  ConnSlot& slot = *slot_ptr;
+
+  // Set lease mask bit to prevent new sends
+  auto& stripe = *ctx->stripes[slot.stripe_id];
+  stripe.lease_mask.fetch_or(1ULL << slot.slot_id, std::memory_order_release);
+
+  // Set slot status to indicate unavailability (but preserve specific states like CONNECTING)
+  uint32_t current_status = slot.status.load(std::memory_order_acquire);
+  if (current_status == SLOT_AVAILABLE) {
+    slot.status.store(SLOT_EMPTY, std::memory_order_release);
+  }
+  // If slot is CONNECTING, SSL_HANDSHAKE, etc., leave those states intact
+
+  return am_ok;
+}
+
 static ErlNifFunc nif_funcs[] = {
   {"init_pool",               2, init_pool_nif,               0},
   {"configure_throttle",      3, configure_throttle_nif,      0},
@@ -2057,7 +2112,10 @@ static ErlNifFunc nif_funcs[] = {
   {"handle_writable",         3, handle_writable_nif,         0},
   {"connect_with_opts",       8, connect_with_opts_nif,       ERL_NIF_DIRTY_JOB_IO_BOUND},
   {"connect_proto_with_opts", 9, connect_proto_with_opts_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
-  {"close_slot",              3, close_slot_nif,              0}
+  {"close_slot",              3, close_slot_nif,              0},
+  {"is_slot_available",       3, is_slot_available_nif,       0},
+  {"set_slot_available",      3, set_slot_available_nif,      0},
+  {"set_slot_unavailable",    3, set_slot_unavailable_nif,    0}
 };
 
 ERL_NIF_INIT(arterial_nif, nif_funcs, load, nullptr, nullptr, unload)

@@ -45,6 +45,7 @@ group membership management. See `connect_proto_with_opts/9`.
 -export([init_pool/2, configure_throttle/3, register_socket/4, connect/7, connect_async/6, connect_proto/8, connect_async_proto/7, send_and_release/3]).
 -export([connect_with_opts/8, connect_proto_with_opts/9]).
 -export([handle_readable/3, handle_writable/3, close_slot/3]).
+-export([is_slot_available/3, set_slot_available/3, set_slot_unavailable/3]).
 
 -on_load(init/0).
 
@@ -404,6 +405,62 @@ applicable when `Protocol` is `udp`.
   {ok, non_neg_integer()} |
   {error, socket_failed | failed_to_set_nonblocking | connect_failed | timeout | stripe_full | unsupported_protocol}.
 connect_proto_with_opts(_PoolRef, _StripeId, _IP, _Port, _TimeoutMs, _Protocol, _Nodelay, _OwnerPid, _SocketOpts) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Check if a connection slot is available for new sends. This is the authoritative
+source for connection availability, replacing the dual state tracking system.
+
+Checks both that the slot has an active connection (`SLOT_AVAILABLE` status)
+and is not currently leased for I/O operations.
+
+## Examples
+
+```
+1> arterial_nif:is_slot_available(PoolRef, 0, 0).
+true
+2> arterial_nif:is_slot_available(PoolRef, 0, 1).
+false
+```
+""".
+-spec is_slot_available(pool_ref(), non_neg_integer(), non_neg_integer()) -> boolean().
+is_slot_available(_PoolRef, _StripeId, _SlotId) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Mark a connection slot as available for new sends. Used when a connection
+completes successfully and is ready to handle requests.
+
+This updates both the slot status to `SLOT_AVAILABLE` and clears the lease mask
+bit to make the slot available for `send_and_release/3`.
+
+## Examples
+
+```
+1> arterial_nif:set_slot_available(PoolRef, 0, 0).
+ok
+```
+""".
+-spec set_slot_available(pool_ref(), non_neg_integer(), non_neg_integer()) -> ok.
+set_slot_available(_PoolRef, _StripeId, _SlotId) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Mark a connection slot as unavailable for new sends. Used when a connection
+is being bounced, is disconnected, or is otherwise not ready for new requests.
+
+This updates the slot status and sets the lease mask bit to prevent the slot
+from being used by `send_and_release/3`.
+
+## Examples
+
+```
+1> arterial_nif:set_slot_unavailable(PoolRef, 0, 0).
+ok
+```
+""".
+-spec set_slot_unavailable(pool_ref(), non_neg_integer(), non_neg_integer()) -> ok.
+set_slot_unavailable(_PoolRef, _StripeId, _SlotId) ->
   ?NOT_LOADED_ERROR.
 
 %%%-----------------------------------------------------------------------------
