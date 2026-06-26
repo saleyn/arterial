@@ -69,9 +69,16 @@ accept_loop(LSock, ListenPort, Conns) ->
       {ok, TSock} ->
         case ssl:handshake(TSock) of
           {ok, ASock} ->
-            ConnPid = spawn(fun() -> conn_recv_loop(ASock, <<>>) end),
-            ok = ssl:controlling_process(ASock, ConnPid),
-            Self ! {self(), accepted, ConnPid};
+            AcceptorPid = self(),
+            ConnPid = spawn(fun() ->
+              AcceptorPid ! {self(), ready},
+              conn_recv_loop(ASock, <<>>)
+            end),
+            receive {ConnPid, ready} -> ok end,
+            case ssl:controlling_process(ASock, ConnPid) of
+              ok -> Self ! {self(), accepted, ConnPid};
+              {error, _} -> Self ! {self(), accept_error, controlling_process_failed}
+            end;
           {error, Reason} ->
             Self ! {self(), accept_error, Reason}
         end;

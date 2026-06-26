@@ -81,10 +81,20 @@ accept_loop(LSock, ListenPort, Conns) ->
         %% process that calls accept/1 becomes ASock's owner, so it must
         %% hand ownership to the long-lived connection process *before*
         %% this one-shot acceptor exits, or ASock gets closed right away.
-        ConnPid = spawn(fun() -> conn_recv_loop(ASock, <<>>) end),
-        ok = socket:setopt(ASock, tcp, nodelay, true),
-        ok = socket:setopt(ASock, otp, controlling_process, ConnPid),
-        Self ! {self(), accepted, ConnPid};
+        AcceptorPid = self(),
+        ConnPid = spawn(fun() ->
+          AcceptorPid ! {self(), ready},
+          conn_recv_loop(ASock, <<>>)
+        end),
+        receive {ConnPid, ready} -> ok end,
+        case socket:setopt(ASock, tcp, nodelay, true) of
+          ok -> ok;
+          {error, _} -> ok  % Socket might be closed, continue anyway
+        end,
+        case socket:setopt(ASock, otp, controlling_process, ConnPid) of
+          ok -> Self ! {self(), accepted, ConnPid};
+          {error, _} -> Self ! {self(), accept_error, controlling_process_failed}
+        end;
       {error, Reason} ->
         %% loop/4 only re-arms the next acceptor upon {accepted,...} --
         %% an accept error (can happen transiently under a burst of
