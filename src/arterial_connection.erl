@@ -23,6 +23,56 @@ through this worker -- it is only ever in the read path.
 
 Protocol is selected via the `protocol` option in `arterial_pool` configuration.
 
+## DNS Resolution
+
+Enhanced DNS resolution with the following features:
+
+- **Hostname to IP resolution**: Automatically resolves hostnames to IPv4 addresses
+- **IP address passthrough**: IPv4 addresses in string or tuple format are passed through unchanged
+- **DNS caching**: Results are cached for 5 minutes to improve performance on repeated connections
+- **Error handling**: Comprehensive error reporting for resolution failures
+- **IPv6 awareness**: Detects IPv6-only hostnames and provides appropriate error messages
+
+### DNS Resolution Examples
+
+```erlang
+% Using hostnames in address configuration
+arterial_pool:start_link(my_pool, #{
+  address => "example.com",           % Hostname will be resolved to IPv4
+  port => 80,
+  protocol => tcp
+}).
+
+% Multiple addresses with hostnames
+arterial_pool:start_link(my_pool, #{
+  addresses => ["primary.example.com", "backup.example.com", "127.0.0.1"],
+  port => 80,
+  protocol => tcp
+}).
+
+% Per-entry addresses with hostnames
+arterial_pool:start_link(my_pool, #{
+  addresses => [
+    #{address => "primary.example.com", port => 80},
+    #{address => "backup.example.com", port => 8080},
+    #{address => "127.0.0.1", port => 9090}
+  ],
+  protocol => tcp
+}).
+```
+
+### DNS Caching
+
+DNS resolution results are automatically cached for 5 minutes to improve performance:
+- Successful resolutions are cached and reused
+- Cache is per-process (stored in process dictionary)
+- Failed resolutions are not cached
+- Cache automatically expires after 5 minutes
+
+### IPv6 Limitations
+
+Currently, the arterial NIF only supports IPv4 addresses. Hostnames that resolve only to IPv6 addresses will result in appropriate error messages indicating IPv6 is not yet supported.
+
 Earlier iterations of this backend connected via Erlang's `socket`
 module and handed the resulting fd to the NIF after the fact
 (`socket:getopt(Sock, otp, fd)` + `arterial_nif:register_socket/4`,
@@ -40,6 +90,21 @@ born inside the NIF and never touches Erlang's `socket` module at all.
 
 -export([start_link/3]).
 -export([bounce/2]).
+-export([resolve_address/1, resolve_k8s_service/1]). % Export for testing and external use
+
+%% Export Kubernetes detection functions for testing
+-ifdef(TEST).
+-export([
+  is_k8s_service_name/1,
+  is_fully_qualified_k8s_name/1,
+  is_external_hostname/1,
+  detect_k8s_environment/0,
+  get_current_namespace/1,
+  get_cluster_domain/0,
+  build_k8s_search_domains/2,
+  is_k8s_environment/0
+]).
+-endif.
 -export([init/1, handle_continue/2, handle_call/3, handle_cast/2, handle_info/2,
           terminate/2]).
 
@@ -236,8 +301,8 @@ try_addresses([Entry | Rest], #state{
     undefined -> SocketOpts;
     _ -> EntrySocketOpts
   end,
-  case inet:getaddrs(Address, inet) of
-    {ok, IPs} ->
+  case resolve_address(Address) of
+    {ok, IPs} when length(IPs) > 0 ->
       IP = arterial_util:random_element(IPs),
       PoolRef = arterial_pool:pool_ref(Pool),
       case arterial_observe:span([connect], #{pool => Pool, conn_id => ConnID, address => IP, port => Port, protocol => Protocol}, fun() ->
@@ -476,6 +541,131 @@ resolve_entry(Address, DefaultPort) ->
 needs_default_port(#{port := _}) -> false;
 needs_default_port(_)            -> true.
 
+%% Enhanced DNS resolution with IPv4/IPv6 support and better error handling
+resolve_address(Address) when is_binary(Address) ->
+  resolve_address(binary_to_list(Address));
+resolve_address(Address) when is_list(Address) ->
+  % First check if it's already an IP address
+  case inet:parse_address(Address) of
+    {ok, IP} ->
+      % Already an IP address, return it directly
+      {ok, [IP]};
+    {error, einval} ->
+      % Not an IP address, perform DNS resolution
+      resolve_hostname(Address)
+  end;
+resolve_address({A, B, C, D} = IP) when is_integer(A), is_integer(B), is_integer(C), is_integer(D) ->
+  % IPv4 tuple, return directly
+  {ok, [IP]};
+resolve_address({A, B, C, D, E, F, G, H} = IP)
+  when is_integer(A), is_integer(B), is_integer(C), is_integer(D),
+       is_integer(E), is_integer(F), is_integer(G), is_integer(H) ->
+  % IPv6 tuple, return directly
+  {ok, [IP]};
+resolve_address(Address) ->
+  {error, {invalid_address_format, Address}}.
+
+%% Perform hostname resolution with Kubernetes awareness and caching
+resolve_hostname(Hostname) ->
+  CacheKey = {dns_cache, Hostname},
+  CurrentTime = erlang:system_time(second),
+
+  % Determine cache TTL based on hostname type
+  CacheTTL = case is_k8s_service_name(Hostname) of
+    true -> 60;   % Shorter TTL for Kubernetes services (1 minute)
+    false -> 300  % Standard TTL for external hostnames (5 minutes)
+  end,
+
+  % Check cache first
+  case get(CacheKey) of
+    {CachedAddrs, CacheTime} when CurrentTime - CacheTime < CacheTTL ->
+      % Cache hit and not expired
+      {ok, CachedAddrs};
+    _ ->
+      % Cache miss or expired, perform actual DNS resolution
+      case resolve_hostname_uncached(Hostname) of
+        {ok, Addrs} = Result ->
+          % Cache the result
+          put(CacheKey, {Addrs, CurrentTime}),
+          Result;
+        {error, _} = Error ->
+          % Don't cache errors, return immediately
+          Error
+      end
+  end.
+
+%% Perform actual hostname resolution without caching
+%% Note: Currently only IPv4 is supported by arterial_nif, so we filter out IPv6
+resolve_hostname_uncached(Hostname) ->
+  % Check if this looks like a Kubernetes service and handle accordingly
+  case is_k8s_service_name(Hostname) of
+    true ->
+      resolve_k8s_hostname(Hostname);
+    false ->
+      resolve_standard_hostname(Hostname)
+  end.
+
+%% Resolve standard (non-Kubernetes) hostnames
+resolve_standard_hostname(Hostname) ->
+  % Try IPv4 first - this is what the NIF supports
+  case inet:getaddrs(Hostname, inet) of
+    {ok, IPv4Addrs} when length(IPv4Addrs) > 0 ->
+      % IPv4 addresses found - return them directly
+      {ok, IPv4Addrs};
+    {error, nxdomain} ->
+      % No IPv4 addresses - check if IPv6 is available but warn user
+      case inet:getaddrs(Hostname, inet6) of
+        {ok, IPv6Addrs} when length(IPv6Addrs) > 0 ->
+          % TODO: Add IPv6 support to arterial_nif
+          % For now, return an error indicating IPv6 is not supported
+          {error, {ipv6_not_supported, IPv6Addrs}};
+        {error, _} = Error ->
+          Error
+      end;
+    {error, _} = Error ->
+      % IPv4 resolution failed for other reasons
+      % Check if IPv6 would work, but still return IPv4 error since that's preferred
+      case inet:getaddrs(Hostname, inet6) of
+        {ok, IPv6Addrs} when length(IPv6Addrs) > 0 ->
+          {error, {ipv4_failed_ipv6_available, Error, IPv6Addrs}};
+        {error, _} ->
+          % Both failed, return original IPv4 error
+          Error
+      end
+  end.
+
+%% Resolve Kubernetes service names with search domain expansion
+resolve_k8s_hostname(Hostname) ->
+  case is_fully_qualified_k8s_name(Hostname) of
+    true ->
+      % Already fully qualified, resolve directly
+      resolve_standard_hostname(Hostname);
+    false ->
+      % Short name, try expansion with Kubernetes search domains
+      resolve_k8s_short_name(Hostname)
+  end.
+
+%% Try to resolve a short Kubernetes service name by expanding with search domains
+resolve_k8s_short_name(ServiceName) ->
+  K8sEnvironment = detect_k8s_environment(),
+  SearchDomains = build_k8s_search_domains(ServiceName, K8sEnvironment),
+  try_k8s_search_domains(SearchDomains, ServiceName).
+
+%% Try each search domain until one resolves
+try_k8s_search_domains([], ServiceName) ->
+  % All search domains failed, try the original name as fallback
+  case resolve_standard_hostname(ServiceName) of
+    {ok, _} = Success -> Success;
+    {error, _} -> {error, {k8s_service_not_found, ServiceName}}
+  end;
+try_k8s_search_domains([Domain | Rest], ServiceName) ->
+  FullName = ServiceName ++ "." ++ Domain,
+  case resolve_standard_hostname(FullName) of
+    {ok, _} = Success -> Success;
+    {error, nxdomain} -> try_k8s_search_domains(Rest, ServiceName);
+    {error, _} = OtherError -> OtherError
+  end.
+
 recon_state(Options) ->
   case maps:get(reconnect, Options, true) of
     true  -> #recon_state{policy = reconnect_time(Options)};
@@ -518,3 +708,137 @@ backoff_timeout(#recon_state{cur = I, policy = {backoff, _Min, Max}} = S) ->
 
 clamp(V, Lo, infinity) -> erlang:max(V, Lo);
 clamp(V, Lo, Hi)       -> erlang:max(Lo, erlang:min(V, Hi)).
+
+%%%-----------------------------------------------------------------------------
+%%% Kubernetes DNS resolution support
+%%%-----------------------------------------------------------------------------
+
+%% Detect if a hostname looks like a Kubernetes service
+is_k8s_service_name(Hostname) ->
+  % Check for Kubernetes patterns:
+  % - Contains ".svc." (fully qualified service name)
+  % - Contains ".cluster.local" (default cluster domain)
+  % - Environment suggests Kubernetes context
+  string:str(Hostname, ".svc.") > 0 orelse
+  string:str(Hostname, ".cluster.local") > 0 orelse
+  (not is_external_hostname(Hostname) andalso is_k8s_environment()).
+
+%% Check if hostname is fully qualified Kubernetes service name
+is_fully_qualified_k8s_name(Hostname) ->
+  string:str(Hostname, ".svc.") > 0.
+
+%% Check if this looks like an external hostname (has TLD)
+is_external_hostname(Hostname) ->
+  % First check if it's a Kubernetes service name - if so, it's not external
+  case string:str(Hostname, ".svc.") of
+    N when N > 0 -> false;  % Kubernetes service, not external
+    0 ->
+      % Simple heuristic: contains common TLDs or IP-like patterns
+      string:str(Hostname, ".com") > 0 orelse
+      string:str(Hostname, ".org") > 0 orelse
+      string:str(Hostname, ".net") > 0 orelse
+      string:str(Hostname, ".io") > 0 orelse
+      string:str(Hostname, ".local") > 0 orelse
+      % Check for IP address patterns
+      case string:tokens(Hostname, ".") of
+        [A, B, C, D] ->
+          lists:all(fun(Part) ->
+            try list_to_integer(Part) of
+              N when N >= 0, N =< 255 -> true;
+              _ -> false
+            catch
+              _:_ -> false
+            end
+          end, [A, B, C, D]);
+        _ -> false
+      end
+  end.
+
+%% Detect Kubernetes execution environment
+detect_k8s_environment() ->
+  case filelib:is_file("/var/run/secrets/kubernetes.io/serviceaccount/token") of
+    true ->
+      {in_cluster, read_current_namespace()};
+    false ->
+      case os:getenv("KUBERNETES_SERVICE_HOST") of
+        false -> external;
+        _ -> {external_with_k8s_env, os:getenv("KUBERNETES_NAMESPACE", "default")}
+      end
+  end.
+
+%% Read the current namespace from the service account
+read_current_namespace() ->
+  NamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace",
+  case file:read_file(NamespaceFile) of
+    {ok, NamespaceBin} ->
+      string:trim(binary_to_list(NamespaceBin));
+    {error, _} ->
+      "default"  % Fallback to default namespace
+  end.
+
+%% Build search domains for Kubernetes service resolution
+build_k8s_search_domains(_ServiceName, K8sEnvironment) ->
+  ClusterDomain = get_cluster_domain(),
+  CurrentNamespace = get_current_namespace(K8sEnvironment),
+
+  % Build search domains in order of preference:
+  % 1. Current namespace
+  % 2. Default namespace (if not current)
+  % 3. kube-system namespace (for system services)
+  SearchDomains = [
+    CurrentNamespace ++ ".svc." ++ ClusterDomain
+  ],
+
+  % Add default namespace if different from current
+  SearchDomains2 = case CurrentNamespace of
+    "default" -> SearchDomains;
+    _ -> SearchDomains ++ ["default.svc." ++ ClusterDomain]
+  end,
+
+  % Add kube-system for system services
+  SearchDomains3 = case CurrentNamespace of
+    "kube-system" -> SearchDomains2;
+    _ -> SearchDomains2 ++ ["kube-system.svc." ++ ClusterDomain]
+  end,
+
+  SearchDomains3.
+
+%% Get cluster domain (usually cluster.local)
+get_cluster_domain() ->
+  case os:getenv("CLUSTER_DOMAIN") of
+    false -> "cluster.local";
+    Domain -> Domain
+  end.
+
+%% Get current namespace based on environment
+get_current_namespace({in_cluster, Namespace}) -> Namespace;
+get_current_namespace({external_with_k8s_env, Namespace}) -> Namespace;
+get_current_namespace(external) -> "default".
+
+%% Check if running in Kubernetes environment
+is_k8s_environment() ->
+  case detect_k8s_environment() of
+    external -> false;
+    _ -> true
+  end.
+
+%% Explicit Kubernetes service resolution
+resolve_k8s_service(ServiceSpec) when is_map(ServiceSpec) ->
+  resolve_k8s_service_from_map(ServiceSpec);
+resolve_k8s_service(ServiceName) when is_binary(ServiceName) ->
+  resolve_k8s_service(binary_to_list(ServiceName));
+resolve_k8s_service(ServiceName) when is_list(ServiceName) ->
+  resolve_k8s_service_from_name(ServiceName).
+
+%% Resolve from service specification map
+resolve_k8s_service_from_map(#{name := ServiceName} = Spec) ->
+  Namespace = maps:get(namespace, Spec, get_current_namespace(detect_k8s_environment())),
+  ClusterDomain = maps:get(cluster_domain, Spec, get_cluster_domain()),
+
+  FullName = ServiceName ++ "." ++ Namespace ++ ".svc." ++ ClusterDomain,
+  resolve_address(FullName).
+
+%% Resolve from service name with automatic expansion
+resolve_k8s_service_from_name(ServiceName) ->
+  % Use the same logic as the enhanced resolve_address
+  resolve_address(ServiceName).

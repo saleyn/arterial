@@ -52,6 +52,12 @@ get a reply.
   `arterial_nif:sweep_timeouts/1`.
 * Automatic reconnect with exponential backoff per connection
   (`arterial_connection`).
+* **Smart DNS resolution with Kubernetes awareness**: Enhanced hostname
+  resolution that automatically detects and handles Kubernetes service names,
+  supports search domain expansion (`redis` → `redis.namespace.svc.cluster.local`),
+  environment-aware caching (60s TTL for K8s services, 300s for external), and
+  maintains full backwards compatibility. See [DNS Resolution](#dns-resolution)
+  and [Kubernetes](docs/kubernetes-dns.md) for details.
 * Disconnect notification for the asynchronous path: when a connection's
   socket dies, every process with a still-outstanding (`track_inflight/5`-
   registered) request on it receives `{arterial_disconnected, Pool, ReqID}`
@@ -63,11 +69,11 @@ get a reply.
   DNS/load-balancer changes for long-lived connections -- waiting for
   each connection's backlog to drain (up to `bounce_drain_timeout_ms`)
   before disconnecting and reconnecting it. Disabled by default.
-* Six supported request/reply matching modes covering native or
-  surrogate wire-level request IDs, FIFO-ordered backlogs (single- or
-  multi-request-in-flight), send-and-forget, and per-message or
-  bulk/cumulative acknowledgement-based protocols -- see
-  [Protocol](#protocol).
+* **Six supported request/reply matching modes** covering all common
+  wire protocol patterns: native/surrogate request IDs with random-access
+  backlogs, FIFO-ordered matching (single or multi-request), send-and-forget,
+  and acknowledgement-based protocols. See [Operating Modes](#operating-modes)
+  and [Protocol](#protocol) for detailed descriptions.
 * Pluggable observability: `call`/`cast`/`checkout`/`connect` spans plus
   `disconnect`/`sweep` events through a generic facade
   (`arterial_observe`), with built-in `telemetry` and `prometheus`
@@ -93,6 +99,108 @@ def deps do
   ]
 end
 ```
+
+## Operating Modes
+
+Arterial supports six distinct request/reply matching modes to accommodate different wire protocol patterns. Choose the mode that best fits your protocol's message structure and reply ordering guarantees:
+
+### 1. Native Request ID (Random Access) ✅ **IMPLEMENTED**
+**Best for:** Protocols with built-in request/correlation IDs (32-bit or 64-bit)
+
+Wire messages contain a native request ID field. Replies can arrive out-of-order and are matched by ID. Supports up to 64k concurrent requests per connection.
+
+- **Configuration:** `fifo => false`, `backlog` up to 65,536
+- **Use case:** HTTP/2, gRPC, custom protocols with correlation IDs
+- **Performance:** Highest throughput with full async multiplexing
+- **Implementation:** `arterial_client:call/3` + `arterial_codec` behavior
+
+### 2. Surrogate Request ID (Random Access) ✅ **IMPLEMENTED**
+**Best for:** Protocols without native request IDs but with repurposable fields
+
+Similar to mode 1, but your `encode_request/3` injects a synthetic ID into an extensible field (header, tag, cookie) that the server echoes back. Same random-access matching and performance characteristics.
+
+- **Configuration:** `fifo => false`, `backlog` up to 65,536
+- **Use case:** Protocols with opaque fields, custom headers, or client cookies
+- **Performance:** Same as mode 1 - full async multiplexing
+- **Implementation:** `arterial_client:call/3` + custom `encode_request/3`
+
+### 3. FIFO Single Request (Synchronous) ❌ **NOT IMPLEMENTED**
+**Best for:** Simple protocols without request IDs, one request at a time
+
+No request ID available. Client reserves connection for one request, sends synchronously, awaits reply in FIFO order. Connection is owned for the entire request duration.
+
+- **Configuration:** `fifo => true`, `backlog => 1`
+- **Use case:** Simple TCP protocols, legacy systems, debugging
+- **Performance:** Lower throughput due to connection monopolization
+- **Status:** Requires FIFO backlog implementation in NIF layer
+
+### 4. FIFO Multi-Request (Pipelined) ❌ **NOT IMPLEMENTED**
+**Best for:** Protocols without IDs but with guaranteed FIFO reply ordering
+
+Multiple requests can be outstanding on one connection, matched purely by send order. **Requires server guarantee** of FIFO reply ordering - violations silently corrupt the backlog.
+
+- **Configuration:** `fifo => true`, `backlog > 1`
+- **Use case:** Redis pipeline, protocols with strict ordering guarantees
+- **Performance:** Good throughput but depends on server FIFO compliance
+- **Status:** Requires FIFO backlog implementation + connection reservation
+- **⚠️ Warning:** Single out-of-order reply breaks all subsequent matches
+
+### 5. Send-and-Forget (No Reply) ✅ **IMPLEMENTED**
+**Best for:** Fire-and-forget operations like logging, metrics, notifications
+
+Uses `arterial_client:cast/2` instead of `call/3`. Returns immediately after transport accepts the bytes - no backlog slot allocated, no reply expected.
+
+- **Configuration:** Backlog/FIFO settings irrelevant
+- **Use case:** Logging, metrics, notifications, pub/sub publishing
+- **Performance:** Highest throughput - no reply processing overhead
+- **Implementation:** `arterial_client:cast/2`
+
+### 6. Acknowledgement-Based Protocols ⚠️ **PARTIALLY IMPLEMENTED**
+**Best for:** Protocols using acknowledgements instead of data replies
+
+Two variants with different implementation status:
+
+**Per-message ACK** ✅ **IMPLEMENTED:** Server replies with simple acknowledgement (with or without ID). Uses same matching as modes 1/2 - your `decode_reply/2` returns `ack` or similar term.
+
+**Bulk/Cumulative ACK** ❌ **NOT IMPLEMENTED:** Single acknowledgement confirms multiple previous requests (e.g., "processed through sequence N"). Would use `arterial_nif:checkin_up_to/3` to release multiple FIFO slots at once.
+
+- **Configuration:** Per-message: `fifo => false`; Bulk: `fifo => true`
+- **Use case:** Message queues, streaming protocols, batch processing
+- **Performance:** Reduced reply traffic, efficient for high-volume streams
+- **Status:** Per-message ACK works via modes 1/2; bulk ACK needs FIFO implementation
+
+### Implementation Status Summary
+
+**✅ Currently Available (3/6 modes):**
+- **Mode 1:** Native Request ID - Full async multiplexing
+- **Mode 2:** Surrogate Request ID - Full async multiplexing
+- **Mode 5:** Send-and-Forget - No reply needed
+
+**❌ Requires Implementation (2.5/6 modes):**
+- **Mode 3:** FIFO Single Request - Needs FIFO backlog + connection reservation
+- **Mode 4:** FIFO Multi-Request - Needs FIFO backlog + pipelining support
+- **Mode 6 (partial):** Bulk/Cumulative ACK - Needs `checkin_up_to/3` + FIFO support
+
+### Current Architecture Limitation
+
+The existing `arterial_pool` backend (NIF-based) explicitly supports only **random-access protocols with correlation IDs** (modes 1/2/5). To implement the missing FIFO modes (3/4/6-bulk), arterial would need:
+
+1. **FIFO backlog data structures** in the C++ NIF layer
+2. **Connection reservation mechanisms** for single-request ownership
+3. **Order-preserved request/reply matching** for pipelined protocols
+4. **Batch checkin operations** for cumulative acknowledgements
+
+### Choosing the Right Mode (Available Now)
+
+- **Have native request IDs?** → ✅ Use Mode 1
+- **Can inject synthetic IDs?** → ✅ Use Mode 2
+- **No replies needed?** → ✅ Use Mode 5
+- **Simple ACKs with IDs?** → ✅ Use Mode 6 (per-message variant)
+- **No IDs, simple protocol?** → ❌ Mode 3 (planned)
+- **No IDs, need pipelining?** → ❌ Mode 4 (planned)
+- **Bulk acknowledgements?** → ❌ Mode 6-bulk (planned)
+
+For complete implementation details, configuration examples, and advanced features, see the [Protocol](#protocol) section.
 
 ## Architecture
 
@@ -474,6 +582,86 @@ definitions and the events that feed them.
 Writing your own backend means implementing the `arterial_observe`
 behaviour: `start/1`, `stop/0`, and `event/3` — see that module's
 moduledoc's "Writing your own backend" section for the exact contract.
+
+## DNS Resolution
+
+Arterial provides enhanced DNS resolution with automatic Kubernetes service discovery, making it seamless to connect to services whether running in-cluster, externally, or in development environments.
+
+### Key Features
+
+- **Smart Service Detection**: Automatically recognizes Kubernetes service patterns (`.svc.` domains)
+- **Search Domain Expansion**: Short names like `"redis"` auto-expand to `"redis.namespace.svc.cluster.local"`
+- **Environment Awareness**: Detects in-cluster vs external execution using service account tokens (`/var/run/secrets/kubernetes.io/serviceaccount/token`) and environment variables
+- **Optimized Caching**: 60-second TTL for Kubernetes services, 300 seconds for external hostnames
+- **Backwards Compatible**: Existing IP addresses and hostnames work unchanged
+- **Headless Service Support**: Returns multiple IPs for StatefulSets and headless services
+
+### Basic Usage
+
+```erlang
+% Works in any environment - automatically detects service type
+{ok, _Pool} = arterial_pool:start_link(redis_pool, #{
+  size     => 5,
+  address  => "redis.production",     % Auto-expands in K8s environments
+  port     => 6379,
+  protocol => tcp
+}).
+
+% IP addresses and external hostnames work as before
+{ok, _Pool} = arterial_pool:start_link(external_pool, #{
+  address => "api.example.com",     % External hostname
+  % or "192.168.1.100"              % IP address
+  port    => 8080
+}).
+
+% Direct DNS resolution API
+{ok, IPs} = arterial_connection:resolve_address("localhost").
+{ok, IPs} = arterial_connection:resolve_address("redis.default.svc.cluster.local").
+```
+
+### Kubernetes-Specific Features
+
+```erlang
+% Explicit Kubernetes service resolution
+{ok, IPs} = arterial_connection:resolve_k8s_service(#{
+  name           => "cassandra",
+  namespace      => "database",
+  cluster_domain => "cluster.local",
+  headless       => true             % Returns multiple pod IPs
+}).
+
+% Multi-address pools with mixed service types
+{ok, _Pool} = arterial_pool:start_link(multi_pool, #{
+  addresses => [
+    "redis.cache",                   % K8s service (short name)
+    "postgres.db.svc.cluster.local", % K8s service (FQDN)
+    "192.168.1.50"                   % IP address
+  ],
+  port => 6379
+}).
+```
+
+### Environment Detection
+
+Arterial automatically detects the execution environment:
+
+- **In-Cluster**: Reads current namespace from service account, uses K8s-optimized DNS settings
+- **External with K8s Access**: Uses `$KUBERNETES_NAMESPACE` or defaults to `"default"`
+- **Development/External**: Falls back to standard DNS resolution
+
+### Performance
+
+- **IP Addresses**: ~2μs (no DNS lookup)
+- **Cached Hostnames**: ~100μs (cache hit)
+- **Fresh DNS Lookups**: ~50-500μs (depends on resolver)
+- **Service Detection**: ~5μs overhead for pattern matching
+
+### Documentation
+
+For complete documentation, examples, and advanced configuration:
+
+- **[DNS_RESOLUTION.md](DNS_RESOLUTION.md)**: Complete DNS resolution guide including standard features, caching behavior, and backwards compatibility
+- **[KUBERNETES_DNS.md](KUBERNETES_DNS.md)**: Kubernetes-specific DNS features, service discovery, environment detection, and advanced usage patterns
 
 ## Benchmarking
 

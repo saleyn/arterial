@@ -17,6 +17,9 @@
 /test/test_pool.so
 /test/test_pool
 /test/*.beam
+/test/*.dump
+/examples/*.beam
+/examples/*.dump
 
 # If the VM crashes, it generates a dump, let's ignore it too.
 erl_crash.dump
