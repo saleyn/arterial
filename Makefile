@@ -135,6 +135,23 @@ bench-poolboy bench-poolboy-help:
 	  -pa _build/test/lib/arterial/test \
 	  -eval "bench_poolboy:$(subst -,_,$(subst bench-poolboy,bench,$@))($(BENCH_OPTS_MAP)), halt()."
 
+# Runs test/bench_arterial_fifo.erl -- benchmarks FIFO Mode 3 performance
+# against arterial existing modes, shackle, and poolboy for comparison.
+# Tests connection reservation overhead and throughput characteristics
+# of the FIFO request/reply matching implementation.
+bench-fifo bench-fifo-help:
+	@$(REBAR) as test compile
+	@erl -noshell -noinput -pa _build/test/lib/*/ebin \
+	  -pa _build/test/lib/arterial/test \
+	  -eval "bench_arterial_fifo:$(subst -,_,$(subst bench-fifo,bench,$@))($(BENCH_OPTS_MAP)), halt()."
+
+# Comprehensive benchmark comparing all available pool implementations
+bench-fifo-all:
+	@$(REBAR) as test compile
+	@erl -noshell -noinput -pa _build/test/lib/*/ebin \
+	  -pa _build/test/lib/arterial/test \
+	  -eval "bench_arterial_fifo:bench_all(), halt()."
+
 clean:
 	$(MAKE) -C c_src $@
 	rebar3 clean

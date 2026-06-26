@@ -97,6 +97,41 @@ struct alignas(64) ConnSlot {
   SSL* ssl{nullptr};
   ProtocolType protocol{PROTO_TCP};
 #endif
+
+  //---------------------------------------------------------------------------
+  // FIFO Mode 3 support (integrated directly - zero overhead when unused)
+  //---------------------------------------------------------------------------
+  std::atomic<bool>     fifo_mode_enabled{false};
+  ErlNifPid             fifo_requester_pid{};
+  std::atomic<uint64_t> fifo_total_requests{0};
+  std::atomic<uint64_t> fifo_total_timeouts{0};
+  std::atomic<bool>     fifo_request_active{false};
+  uint64_t              fifo_reservation_id{0};
+
+  // FIFO helper methods
+  void enable_fifo_mode() {
+    fifo_mode_enabled.store(true, std::memory_order_release);
+  }
+
+  bool is_fifo_enabled() const {
+    return fifo_mode_enabled.load(std::memory_order_acquire);
+  }
+
+  bool set_fifo_request(ErlNifPid pid, uint64_t res_id) {
+    if (fifo_request_active.load(std::memory_order_acquire))
+      return false;
+    fifo_requester_pid = pid;
+    fifo_reservation_id = res_id;
+    fifo_request_active.store(true, std::memory_order_release);
+    fifo_total_requests.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+
+  void clear_fifo_request() {
+    fifo_request_active.store(false, std::memory_order_release);
+    fifo_reservation_id = 0;
+    fifo_requester_pid = {};
+  }
 };
 
 // Fixed-size: ConnSlot/PoolStripe hold std::atomic members, so they're
@@ -158,6 +193,19 @@ NIFPP_ADD_KNOWN_ATOM(am_socket_option_failed);
 NIFPP_ADD_KNOWN_ATOM(am_ssl_not_supported);
 NIFPP_ADD_KNOWN_ATOM(am_multicast_join_failed);
 NIFPP_ADD_KNOWN_ATOM(am_multicast_leave_failed);
+NIFPP_ADD_KNOWN_ATOM(am_not_implemented);
+
+// FIFO Mode atoms
+NIFPP_ADD_KNOWN_ATOM(am_fifo_reserved);
+NIFPP_ADD_KNOWN_ATOM(am_fifo_request_sent);
+NIFPP_ADD_KNOWN_ATOM(am_invalid_reservation);
+NIFPP_ADD_KNOWN_ATOM(am_fifo_not_enabled);
+NIFPP_ADD_KNOWN_ATOM(am_fifo_slot_busy);
+NIFPP_ADD_KNOWN_ATOM(am_not_fifo);
+NIFPP_ADD_KNOWN_ATOM(am_fifo_disabled);
+NIFPP_ADD_KNOWN_ATOM(am_fifo_draining);
+NIFPP_ADD_KNOWN_ATOM(am_unknown);
+NIFPP_ADD_KNOWN_ATOM(am_arterial_fifo_reply);
 
 #ifdef HAVE_OPENSSL
 // Global SSL context - initialized once
@@ -2100,6 +2148,15 @@ static ERL_NIF_TERM set_slot_unavailable_nif(ErlNifEnv* env, int argc, const ERL
   return am_ok;
 }
 
+//===========================================================================
+// FIFO Mode 3 function declarations (stub implementations for now)
+//===========================================================================
+static ERL_NIF_TERM reserve_fifo_connection_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM send_fifo_request_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM release_fifo_connection_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM fifo_connection_status_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM handle_fifo_reply_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
 static ErlNifFunc nif_funcs[] = {
   {"init_pool",               2, init_pool_nif,               0},
   {"configure_throttle",      3, configure_throttle_nif,      0},
@@ -2116,7 +2173,293 @@ static ErlNifFunc nif_funcs[] = {
   {"close_slot",              3, close_slot_nif,              0},
   {"is_slot_available",       3, is_slot_available_nif,       0},
   {"set_slot_available",      3, set_slot_available_nif,      0},
-  {"set_slot_unavailable",    3, set_slot_unavailable_nif,    0}
+  {"set_slot_unavailable",    3, set_slot_unavailable_nif,    0},
+
+  // FIFO Mode 3 functions (stub implementations)
+  {"reserve_fifo_connection", 3, reserve_fifo_connection_nif, 0},
+  {"send_fifo_request",       6, send_fifo_request_nif,       0},
+  {"release_fifo_connection", 4, release_fifo_connection_nif, 0},
+  {"fifo_connection_status",  3, fifo_connection_status_nif,  0},
+  {"handle_fifo_reply",       4, handle_fifo_reply_nif,       0}
 };
+
+//===========================================================================
+// FIFO Mode 3 structures and implementations
+//===========================================================================
+
+// FIFO slot states (extend existing enum without conflicts)
+enum : uint32_t {
+  SLOT_FIFO_RESERVED     = 100,  // Mode 3: Connection reserved for single request
+  SLOT_FIFO_REQUEST_SENT = 101,  // Mode 3: Request sent, awaiting reply
+  SLOT_FIFO_DRAINING     = 102   // Mode 3: Processing reply, about to release
+};
+
+// Simple FIFO extension structure
+
+static ERL_NIF_TERM reserve_fifo_connection_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+  if (argc != 3)
+    return enif_make_badarg(env);
+
+  PoolContext* ctx;
+  unsigned int stripe_id, timeout_ms;
+
+  if (!get(env, argv[0], ctx)       ||
+      !get(env, argv[1], stripe_id) ||
+      !get(env, argv[2], timeout_ms))
+    return enif_make_badarg(env);
+
+  if (stripe_id >= ctx->stripe_count)
+    return enif_make_badarg(env);
+
+  auto& stripe = *ctx->stripes[stripe_id];
+  uint64_t current_mask = stripe.lease_mask.load(std::memory_order_relaxed);
+
+  // Find an available slot using the same CAS mechanism as existing code
+  while (true) {
+    int slot_id = std::countr_zero(~current_mask);
+    if (static_cast<size_t>(slot_id) >= stripe.capacity)
+      return make(env, std::make_tuple(am_error, am_no_connections_available));
+
+    uint64_t target_bit = (1ULL << slot_id);
+    uint64_t new_mask = current_mask | target_bit;
+
+    if (stripe.lease_mask.compare_exchange_weak(
+          current_mask, new_mask,
+          std::memory_order_acquire,
+          std::memory_order_relaxed)) {
+
+      auto& slot = stripe.slots[slot_id];
+
+      // Check if slot is available
+      if (slot.status.load(std::memory_order_acquire) != SLOT_AVAILABLE) {
+        stripe.lease_mask.fetch_and(~target_bit, std::memory_order_release);
+        current_mask = stripe.lease_mask.load(std::memory_order_relaxed);
+        continue;
+      }
+
+      // Enable FIFO mode and set reservation
+      slot.enable_fifo_mode();
+
+      // Set slot status to FIFO reserved
+      slot.status.store(SLOT_FIFO_RESERVED, std::memory_order_release);
+
+      // Generate reservation ID
+      static std::atomic<uint64_t> reservation_counter{1};
+      uint64_t reservation_id = reservation_counter.fetch_add(1, std::memory_order_relaxed);
+
+      // Set up the FIFO request
+      ErlNifPid caller_pid;
+      enif_self(env, &caller_pid);
+      slot.set_fifo_request(caller_pid, reservation_id);
+
+      return make(env, std::make_tuple(
+        am_ok, am_fifo_reserved,
+        stripe_id, static_cast<unsigned int>(slot_id), reservation_id
+      ));
+    }
+  }
+}
+
+static ERL_NIF_TERM send_fifo_request_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+  if (argc != 6) return enif_make_badarg(env);
+
+  PoolContext* ctx;
+  unsigned int stripe_id, slot_id, timeout_ms;
+  uint64_t reservation_id;
+
+  if (!get(env, argv[0], ctx) ||
+      !get(env, argv[1], stripe_id) ||
+      !get(env, argv[2], slot_id) ||
+      !get(env, argv[3], reservation_id) ||
+      !enif_is_list(env, argv[4]) ||
+      !get(env, argv[5], timeout_ms)) {
+    return enif_make_badarg(env);
+  }
+
+  if (stripe_id >= ctx->stripe_count) return enif_make_badarg(env);
+  auto& stripe = *ctx->stripes[stripe_id];
+  if (slot_id >= stripe.capacity) return enif_make_badarg(env);
+
+  auto& slot = stripe.slots[slot_id];
+
+  // Verify the reservation
+  if (slot.status.load(std::memory_order_acquire) != SLOT_FIFO_RESERVED) {
+    return make(env, std::make_tuple(am_error, am_invalid_reservation));
+  }
+
+  if (!slot.is_fifo_enabled()) {
+    return make(env, std::make_tuple(am_error, am_fifo_not_enabled));
+  }
+
+  // Verify reservation ID matches
+  if (slot.fifo_reservation_id != reservation_id) {
+    return make(env, std::make_tuple(am_error, am_invalid_reservation));
+  }
+
+  // Send the data using the same mechanism as send_and_release
+  auto request_data = argv[4];
+  unsigned int list_len = 0;
+  enif_get_list_length(env, request_data, &list_len);
+
+  constexpr size_t s_inline_iov_size = 8;
+  std::array<struct iovec, s_inline_iov_size> inline_iov;
+  std::vector<struct iovec> heap_iov;
+  struct iovec* iov;
+
+  if (list_len <= s_inline_iov_size) {
+    iov = inline_iov.data();
+  } else {
+    heap_iov.resize(list_len);
+    iov = heap_iov.data();
+  }
+
+  ERL_NIF_TERM head, tail = request_data;
+  for (unsigned int i = 0; i < list_len && enif_get_list_cell(env, tail, &head, &tail); ++i) {
+    ErlNifBinary bin;
+    if (!enif_inspect_binary(env, head, &bin)) {
+      slot.clear_fifo_request();
+      return enif_make_badarg(env);
+    }
+    iov[i].iov_base = bin.data;
+    iov[i].iov_len = bin.size;
+  }
+
+  // Write data to socket
+  ssize_t bytes_written = writev(slot.fd, iov, list_len);
+
+  if (bytes_written == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+    slot.clear_fifo_request();
+    return make(env, std::make_tuple(am_error, am_write_failed));
+  }
+
+  // Update slot status to indicate request sent
+  slot.status.store(SLOT_FIFO_REQUEST_SENT, std::memory_order_release);
+
+  return make(env, std::make_tuple(am_ok, am_fifo_request_sent));
+}
+
+static ERL_NIF_TERM release_fifo_connection_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+  if (argc != 4) return enif_make_badarg(env);
+
+  PoolContext* ctx;
+  unsigned int stripe_id, slot_id;
+  uint64_t reservation_id;
+
+  if (!get(env, argv[0], ctx) ||
+      !get(env, argv[1], stripe_id) ||
+      !get(env, argv[2], slot_id) ||
+      !get(env, argv[3], reservation_id)) {
+    return enif_make_badarg(env);
+  }
+
+  if (stripe_id >= ctx->stripe_count) return enif_make_badarg(env);
+  auto& stripe = *ctx->stripes[stripe_id];
+  if (slot_id >= stripe.capacity) return enif_make_badarg(env);
+
+  auto& slot = stripe.slots[slot_id];
+
+  // Verify reservation ID
+  if (slot.fifo_reservation_id != reservation_id) {
+    return make(env, std::make_tuple(am_error, am_invalid_reservation));
+  }
+
+  // Clean up FIFO state
+  slot.clear_fifo_request();
+
+  // Return slot to available state
+  slot.status.store(SLOT_AVAILABLE, std::memory_order_release);
+  stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
+
+  return am_ok;
+}
+
+static ERL_NIF_TERM fifo_connection_status_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+  if (argc != 3) return enif_make_badarg(env);
+
+  PoolContext* ctx;
+  unsigned int stripe_id, slot_id;
+
+  if (!get(env, argv[0], ctx) ||
+      !get(env, argv[1], stripe_id) ||
+      !get(env, argv[2], slot_id)) {
+    return enif_make_badarg(env);
+  }
+
+  if (stripe_id >= ctx->stripe_count) return enif_make_badarg(env);
+  auto& stripe = *ctx->stripes[stripe_id];
+  if (slot_id >= stripe.capacity) return enif_make_badarg(env);
+
+  auto& slot = stripe.slots[slot_id];
+  uint32_t status = slot.status.load(std::memory_order_acquire);
+
+  // Check if this is a FIFO slot
+  if (!slot.is_fifo_enabled()) {
+    return make(env, std::make_tuple(am_ok, am_fifo_disabled, 0U, 0U));
+  }
+
+  // Return detailed FIFO status
+  ERL_NIF_TERM status_atom;
+  switch (status) {
+    case SLOT_FIFO_RESERVED:
+      status_atom = am_fifo_reserved;
+      break;
+    case SLOT_FIFO_REQUEST_SENT:
+      status_atom = am_fifo_request_sent;
+      break;
+    case SLOT_FIFO_DRAINING:
+      status_atom = am_fifo_draining;
+      break;
+    default:
+      status_atom = am_unknown;
+  }
+
+  uint64_t total_requests = slot.fifo_total_requests.load(std::memory_order_relaxed);
+  uint64_t total_timeouts = slot.fifo_total_timeouts.load(std::memory_order_relaxed);
+
+  return make(env, std::make_tuple(am_ok, status_atom, total_requests, total_timeouts));
+}
+
+static ERL_NIF_TERM handle_fifo_reply_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+  if (argc != 4) return enif_make_badarg(env);
+
+  PoolContext* ctx;
+  unsigned int stripe_id, slot_id;
+
+  if (!get(env, argv[0], ctx)       ||
+      !get(env, argv[1], stripe_id) ||
+      !get(env, argv[2], slot_id))
+    return enif_make_badarg(env);
+
+  if (stripe_id >= ctx->stripe_count) return enif_make_badarg(env);
+  auto& stripe = *ctx->stripes[stripe_id];
+  if (slot_id >= stripe.capacity) return enif_make_badarg(env);
+
+  auto& slot = stripe.slots[slot_id];
+
+  if (!slot.is_fifo_enabled()) {
+    return make(env, std::make_tuple(am_error, am_fifo_not_enabled));
+  }
+
+  // Send reply message to the original requester
+  nifpp::msg_env msg_env;
+  auto reply_msg = make(msg_env, std::make_tuple(
+    am_arterial_fifo_reply,
+    stripe_id, slot_id, argv[3]
+  ));
+
+  enif_send(env, &slot.fifo_requester_pid, msg_env, reply_msg);
+
+  // Clean up the FIFO request
+  slot.clear_fifo_request();
+
+  // Set slot to draining state, then back to available
+  slot.status.store(SLOT_FIFO_DRAINING, std::memory_order_release);
+  slot.status.store(SLOT_AVAILABLE, std::memory_order_release);
+
+  // Release the slot lease
+  stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
+
+  return am_ok;
+}
 
 ERL_NIF_INIT(arterial_nif, nif_funcs, load, nullptr, nullptr, unload)
