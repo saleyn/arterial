@@ -46,7 +46,7 @@ doc docs:
 
 test:
 	$(MAKE) --no-print-directory -C c_src test
-	rebar3 eunit
+	rebar3 as test eunit
 
 test-ssl:
 	$(MAKE) --no-print-directory -C c_src test

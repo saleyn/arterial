@@ -85,7 +85,7 @@ theoretically create more connections by increasing slots per stripe.
 -export([init/1]).
 -export([sup_name/1]).
 -export([pool_ref/1, codec/1, size/1, default_timeout_ms/1, throttle/1, corr_table/1]).
--export([avail_ref/1, set_available/2, set_unavailable/2, is_available/2, wait_connected/2, wait_connected/3]).
+-export([set_available/2, set_unavailable/2, is_available/2, wait_connected/2, wait_connected/3]).
 
 -doc "The atom identifying a pool; shared with `arterial_nif:pool_ref/0`'s owner.".
 -type name() :: atom().
@@ -296,7 +296,7 @@ stop(Name) ->
   end,
   lists:foreach(fun(Key) -> persistent_term:erase(Key) end, [
     pool_key(Name), codec_key(Name), size_key(Name),
-    timeout_key(Name), throttle_key(Name), avail_key(Name)
+    timeout_key(Name), throttle_key(Name)
   ]),
   ok.
 
@@ -356,9 +356,7 @@ init([Name, Opts]) ->
       {RPS, WinMS}
   end,
   persistent_term:put(throttle_key(Name), ThrottleState),
-  %% All connections start unavailable (no socket yet); each
-  %% arterial_connection worker flips its own bit once registered.
-  persistent_term:put(avail_key(Name), atomics:new(Size, [{signed, false}])),
+  %% Connection availability is now managed entirely by the NIF layer
 
   ConnOpts = maps:without(?POOL_OPT_KEYS, Opts),
   ConnChildren = [
@@ -431,28 +429,26 @@ throttle(Name) -> get_pt(throttle_key(Name), Name).
 -spec corr_table(name()) -> atom().
 corr_table(Name) -> list_to_atom("arterial2_corr_" ++ atom_to_list(Name)).
 
--doc """
-`Name`'s availability bitmap (`atomics`, one cell per `ConnID`, `1` =
-available for new sends, `0` = no socket yet / disconnected / draining
-for a bounce). Checked by `arterial_client` before picking a stripe.
-""".
--spec avail_ref(name()) -> atomics:atomics_ref().
-avail_ref(Name) -> get_pt(avail_key(Name), Name).
-
 -doc "Mark connection `ConnID` of `Name` available for new sends.".
 -spec set_available(name(), non_neg_integer()) -> ok.
 set_available(Name, ConnID) ->
-  atomics:put(avail_ref(Name), ConnID + 1, 1).
+  StripeId = ConnID,  % ConnID maps directly to StripeId for single connection per stripe
+  PoolRef = pool_ref(Name),
+  ok = arterial_nif:set_slot_available(PoolRef, StripeId, 0).
 
 -doc "Mark connection `ConnID` of `Name` unavailable for new sends.".
 -spec set_unavailable(name(), non_neg_integer()) -> ok.
 set_unavailable(Name, ConnID) ->
-  atomics:put(avail_ref(Name), ConnID + 1, 0).
+  StripeId = ConnID,  % ConnID maps directly to StripeId for single connection per stripe
+  PoolRef = pool_ref(Name),
+  ok = arterial_nif:set_slot_unavailable(PoolRef, StripeId, 0).
 
 -doc "Whether connection `ConnID` of `Name` is currently available for new sends.".
 -spec is_available(name(), non_neg_integer()) -> boolean().
 is_available(Name, ConnID) ->
-  atomics:get(avail_ref(Name), ConnID + 1) =:= 1.
+  StripeId = ConnID,  % ConnID maps directly to StripeId for single connection per stripe
+  PoolRef = pool_ref(Name),
+  arterial_nif:is_slot_available(PoolRef, StripeId, 0).
 
 -doc """
 Block until `all` connections or the first `N` connections in pool `Name` are available.
@@ -516,9 +512,7 @@ wait_connected_loop(Name, N, TimeoutMs, StartTime) ->
 %% Check if the first N connections are available
 check_connections_available(Name, N) ->
   try
-    lists:all(fun(ConnID) ->
-      is_available(Name, ConnID)
-    end, lists:seq(0, N - 1))
+    lists:all(fun(ConnID) -> is_available(Name, ConnID) end, lists:seq(0, N - 1))
   catch
     error:badarg -> false;  % Pool might not exist yet
     error:{unknown_pool, _} -> false  % Pool doesn't exist
@@ -534,8 +528,8 @@ check_connections_available(Name, N) ->
 %% (guaranteed never to be a real stored value, see throttle/1's own
 %% legitimate `undefined`) plus a case is the correct lazy-default idiom.
 get_pt(Key, Name) ->
-  case persistent_term:get(Key, '$arterial_pool_undefined') of
-    '$arterial_pool_undefined' -> error({unknown_pool, Name});
+  case persistent_term:get(Key, nil) of
+    nil   -> error({unknown_pool, Name});
     Value -> Value
   end.
 
@@ -546,4 +540,3 @@ codec_key(Name)    -> {?MODULE, Name, codec}.
 size_key(Name)     -> {?MODULE, Name, size}.
 timeout_key(Name)  -> {?MODULE, Name, default_timeout_ms}.
 throttle_key(Name) -> {?MODULE, Name, throttle}.
-avail_key(Name)    -> {?MODULE, Name, avail_ref}.
