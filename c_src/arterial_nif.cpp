@@ -136,25 +136,27 @@ struct PoolContext {
 // Custom atoms (initialized once in load(); see nifpp::initialize_known_atoms
 // for am_ok/am_error, shared with arterial.cpp)
 //==========================================================================
-static atom am_arterial_event;
-static atom am_read;
-static atom am_write;
-static atom am_closed;
-static atom am_stop;
-static atom am_connect_result;
-static atom am_connecting;
-static atom am_stripe_full;
-static atom am_max_slots_exceeded_64;
-static atom am_failed_to_set_nonblocking;
-static atom am_socket_failed;
-static atom am_connect_failed;
-static atom am_timeout;
-static atom am_no_connections_available;
-static atom am_write_failed;
-static atom am_alloc_failed;
-static atom am_unsupported_protocol;
-static atom am_socket_option_failed;
-static atom am_ssl_not_supported;
+NIFPP_ADD_KNOWN_ATOM(am_arterial_event);
+NIFPP_ADD_KNOWN_ATOM(am_read);
+NIFPP_ADD_KNOWN_ATOM(am_write);
+NIFPP_ADD_KNOWN_ATOM(am_closed);
+NIFPP_ADD_KNOWN_ATOM(am_stop);
+NIFPP_ADD_KNOWN_ATOM(am_connect_result);
+NIFPP_ADD_KNOWN_ATOM(am_connecting);
+NIFPP_ADD_KNOWN_ATOM(am_stripe_full);
+NIFPP_ADD_KNOWN_ATOM(am_max_slots_exceeded_64);
+NIFPP_ADD_KNOWN_ATOM(am_failed_to_set_nonblocking);
+NIFPP_ADD_KNOWN_ATOM(am_socket_failed);
+NIFPP_ADD_KNOWN_ATOM(am_connect_failed);
+NIFPP_ADD_KNOWN_ATOM(am_timeout);
+NIFPP_ADD_KNOWN_ATOM(am_no_connections_available);
+NIFPP_ADD_KNOWN_ATOM(am_write_failed);
+NIFPP_ADD_KNOWN_ATOM(am_alloc_failed);
+NIFPP_ADD_KNOWN_ATOM(am_unsupported_protocol);
+NIFPP_ADD_KNOWN_ATOM(am_socket_option_failed);
+NIFPP_ADD_KNOWN_ATOM(am_ssl_not_supported);
+NIFPP_ADD_KNOWN_ATOM(am_multicast_join_failed);
+NIFPP_ADD_KNOWN_ATOM(am_multicast_leave_failed);
 
 #ifdef HAVE_OPENSSL
 // Global SSL context - initialized once
@@ -1247,6 +1249,16 @@ static bool apply_sock_opts(int fd, ErlNifEnv* env, ERL_NIF_TERM options_list) {
             // TCP_KEEPCNT: number of keepalive probes before giving up
             if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &opt_value, sizeof(opt_value)) != 0)
               return false;
+          } else if (strcmp(opt_name, "multicast_ttl") == 0) {
+            // IP_MULTICAST_TTL: multicast time-to-live (UDP only)
+            unsigned char ttl = (unsigned char)opt_value;
+            if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl)) != 0)
+              return false;
+          } else if (strcmp(opt_name, "multicast_loop") == 0) {
+            // IP_MULTICAST_LOOP: multicast loopback (UDP only)
+            unsigned char loop = opt_value ? 1 : 0;
+            if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop)) != 0)
+              return false;
           }
         } else if (enif_get_atom(env, tuple_elements[0], opt_name, sizeof(opt_name), ERL_NIF_LATIN1) &&
                    strcmp(opt_name, "linger") == 0) {
@@ -1261,6 +1273,51 @@ static bool apply_sock_opts(int fd, ErlNifEnv* env, ERL_NIF_TERM options_list) {
               l.l_onoff = on_off ? 1 : 0;
               l.l_linger = linger_time; // seconds
               if (setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l)) != 0)
+                return false;
+            }
+          }
+        } else if (enif_get_atom(env, tuple_elements[0], opt_name, sizeof(opt_name), ERL_NIF_LATIN1) &&
+                   strcmp(opt_name, "multicast_if") == 0) {
+          // Handle {multicast_if, {A, B, C, D}} format for interface address
+          std::tuple<unsigned int, unsigned int, unsigned int, unsigned int> ip_octets;
+          if (get(env, tuple_elements[1], ip_octets)) {
+            auto [o0, o1, o2, o3] = ip_octets;
+            struct in_addr interface_addr;
+            interface_addr.s_addr = htonl((o0 << 24) | (o1 << 16) | (o2 << 8) | o3);
+            if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &interface_addr, sizeof(interface_addr)) != 0)
+              return false;
+          }
+        } else if (enif_get_atom(env, tuple_elements[0], opt_name, sizeof(opt_name), ERL_NIF_LATIN1) &&
+                   strcmp(opt_name, "add_membership") == 0) {
+          // Handle {add_membership, {{A,B,C,D}, {E,F,G,H}}} format
+          const ERL_NIF_TERM* membership_tuple;
+          int membership_arity;
+          if (enif_get_tuple(env, tuple_elements[1], &membership_arity, &membership_tuple) && membership_arity == 2) {
+            std::tuple<unsigned int, unsigned int, unsigned int, unsigned int> mcast_addr, if_addr;
+            if (get(env, membership_tuple[0], mcast_addr) && get(env, membership_tuple[1], if_addr)) {
+              struct ip_mreq mreq;
+              auto [m0, m1, m2, m3] = mcast_addr;
+              auto [i0, i1, i2, i3] = if_addr;
+              mreq.imr_multiaddr.s_addr = htonl((m0 << 24) | (m1 << 16) | (m2 << 8) | m3);
+              mreq.imr_interface.s_addr = htonl((i0 << 24) | (i1 << 16) | (i2 << 8) | i3);
+              if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) != 0)
+                return false;
+            }
+          }
+        } else if (enif_get_atom(env, tuple_elements[0], opt_name, sizeof(opt_name), ERL_NIF_LATIN1) &&
+                   strcmp(opt_name, "drop_membership") == 0) {
+          // Handle {drop_membership, {{A,B,C,D}, {E,F,G,H}}} format
+          const ERL_NIF_TERM* membership_tuple;
+          int membership_arity;
+          if (enif_get_tuple(env, tuple_elements[1], &membership_arity, &membership_tuple) && membership_arity == 2) {
+            std::tuple<unsigned int, unsigned int, unsigned int, unsigned int> mcast_addr, if_addr;
+            if (get(env, membership_tuple[0], mcast_addr) && get(env, membership_tuple[1], if_addr)) {
+              struct ip_mreq mreq;
+              auto [m0, m1, m2, m3] = mcast_addr;
+              auto [i0, i1, i2, i3] = if_addr;
+              mreq.imr_multiaddr.s_addr = htonl((m0 << 24) | (m1 << 16) | (m2 << 8) | m3);
+              mreq.imr_interface.s_addr = htonl((i0 << 24) | (i1 << 16) | (i2 << 8) | i3);
+              if (setsockopt(fd, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq)) != 0)
                 return false;
             }
           }
@@ -1408,13 +1465,13 @@ static ERL_NIF_TERM connect_proto_nif(ErlNifEnv* env, int argc, const ERL_NIF_TE
   unsigned int timeout_ms;
   bool nodelay;
   ErlNifPid owner_pid;
-  if (argc != 8                     ||
-      !get(env, argv[0], ctx)       ||
-      !get(env, argv[1], stripe_id) ||
-      !get(env, argv[2], octets)    ||
-      !get(env, argv[3], port)      || port < 0 || port > 65535 ||
-      !get(env, argv[4], timeout_ms)||
-      !get(env, argv[6], nodelay)   ||
+  if (argc != 8                          ||
+      !get(env, argv[0], ctx)            ||
+      !get(env, argv[1], stripe_id)      ||
+      !get(env, argv[2], octets)         ||
+      !get(env, argv[3], port, 0, 65535) ||
+      !get(env, argv[4], timeout_ms)     ||
+      !get(env, argv[6], nodelay)        ||
       !get(env, argv[7], owner_pid)) {
     return enif_make_badarg(env);
   }
@@ -1447,8 +1504,8 @@ static ERL_NIF_TERM connect_proto_nif(ErlNifEnv* env, int argc, const ERL_NIF_TE
   auto [o0, o1, o2, o3] = octets;
   struct sockaddr_in server_addr{};
   server_addr.sin_family = AF_INET;
-  server_addr.sin_port = htons(static_cast<uint16_t>(port));
-  uint32_t ip_host = (o0 << 24) | (o1 << 16) | (o2 << 8) | o3;
+  server_addr.sin_port   = htons(static_cast<uint16_t>(port));
+  uint32_t ip_host       = (o0 << 24) | (o1 << 16) | (o2 << 8) | o3;
   server_addr.sin_addr.s_addr = htonl(ip_host);
 
   // For UDP, "connecting" just sets the default destination
@@ -1804,26 +1861,6 @@ static int load(ErlNifEnv* env,
   if (!init_ssl_context())
     return 1;
   #endif
-
-  am_alloc_failed              = atom(env, "alloc_failed");
-  am_arterial_event                = atom(env, "arterial_event");
-  am_closed                    = atom(env, "closed");
-  am_connect_failed            = atom(env, "connect_failed");
-  am_connect_result            = atom(env, "connect_result");
-  am_connecting                = atom(env, "connecting");
-  am_failed_to_set_nonblocking = atom(env, "failed_to_set_nonblocking");
-  am_max_slots_exceeded_64     = atom(env, "max_slots_exceeded_64");
-  am_no_connections_available  = atom(env, "no_connections_available");
-  am_read                      = atom(env, "read");
-  am_socket_failed             = atom(env, "socket_failed");
-  am_stop                      = atom(env, "stop");
-  am_stripe_full               = atom(env, "stripe_full");
-  am_timeout                   = atom(env, "timeout");
-  am_unsupported_protocol      = atom(env, "unsupported_protocol");
-  am_write                     = atom(env, "write");
-  am_write_failed              = atom(env, "write_failed");
-  am_socket_option_failed      = atom(env, "socket_option_failed");
-  am_ssl_not_supported         = atom(env, "ssl_not_supported");
 
   return register_resource<PoolContext>(env, "arterial_pool_context") ? 0 : 1;
 }

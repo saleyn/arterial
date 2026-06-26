@@ -46,6 +46,37 @@ across slots in the first place, and `ConnID`, `StripeId`, and the slot's
 Multiple slots per stripe remains fully supported by the NIF for
 whoever wants to build a different pool layout on top of it later (e.g.
 several replica sockets behind one logical connection).
+
+### Concrete Example: Pool Size 4 with 12 Schedulers
+
+With `#{size => 4}` and 12 Erlang schedulers:
+
+- **Stripes created**: 4 (equals pool size)
+- **Slots per stripe**: 1 (hardcoded)
+- **Total connections**: 4 (one per slot)
+
+**Scheduler-to-stripe mapping**: Schedulers distribute round-robin across
+stripes using `erlang:system_info(scheduler_id) rem Size`:
+
+```
+Scheduler  1 → Stripe 1    Scheduler  7 → Stripe 3
+Scheduler  2 → Stripe 2    Scheduler  8 → Stripe 0
+Scheduler  3 → Stripe 3    Scheduler  9 → Stripe 1
+Scheduler  4 → Stripe 0    Scheduler 10 → Stripe 2
+Scheduler  5 → Stripe 1    Scheduler 11 → Stripe 3
+Scheduler  6 → Stripe 2    Scheduler 12 → Stripe 0
+```
+
+This creates natural load distribution where multiple schedulers can
+share connections without coordination, each stripe's atomic lease mask
+handling contention lock-free within that stripe.
+
+**Theoretical maximum connections**: Since each stripe can hold up to 64
+slots (limited by the `uint64` lease bitmask), the absolute maximum
+number of connections in a pool is `pool_size × 64`. However,
+`arterial_pool` always uses 1 slot per stripe, so the practical maximum
+equals the configured pool size. Custom pool implementations could
+theoretically create more connections by increasing slots per stripe.
 """.
 
 -behaviour(supervisor).
@@ -64,7 +95,7 @@ Socket options supported by arterial's NIF layer for TCP/UDP connections.
 These are a subset of standard socket options that can be efficiently
 processed by the NIF, formatted as atoms or `{atom(), term()}` tuples.
 
-Supported options include:
+**Basic options:**
 * `keepalive` - Enable TCP keep-alive (equivalent to `{keepalive, true}`)
 * `{keepalive, boolean()}` - Enable or disable TCP keep-alive
 * `{sndbuf, pos_integer()}` - Send buffer size in bytes
@@ -73,18 +104,47 @@ Supported options include:
 * `{tos, non_neg_integer()}` - Type of Service bits
 * `{linger, {boolean(), non_neg_integer()}}` - Linger behavior on close
 
+**Multicast options (UDP only):**
+* `{multicast_ttl, 0..255}` - Multicast TTL (time-to-live) hop limit
+* `{multicast_loop, boolean()}` - Enable/disable multicast loopback
+* `{multicast_if, inet:ip4_address()}` - Interface for outgoing multicast packets
+* `{add_membership, {inet:ip4_address(), inet:ip4_address()}}` - Join multicast group `{MulticastAddr, InterfaceAddr}`
+* `{drop_membership, {inet:ip4_address(), inet:ip4_address()}}` - Leave multicast group `{MulticastAddr, InterfaceAddr}`
+
+**Example multicast configuration:**
+```erlang
+PoolOpts = #{
+  size => 4,
+  codec => arterial_codec_default,
+  address => "239.1.1.1",    % Multicast address
+  port => 12345,
+  protocol => udp,
+  sock_opts => [
+    {multicast_ttl, 16},
+    {multicast_loop, false},
+    {multicast_if, {192, 168, 1, 100}},
+    {add_membership, {{239, 1, 1, 1}, {0, 0, 0, 0}}}
+  ]
+}.
+```
+
 These options are passed to `arterial_nif:connect_with_opts/8` and
 `arterial_nif:connect_proto_with_opts/9` for socket configuration during
 connection establishment.
 """.
 -type sockopt() ::
-    keepalive |
-    {keepalive, boolean()} |
-    {sndbuf,    pos_integer()} |
-    {recvbuf,   pos_integer()} |
-    {priority,  0..6} |
-    {tos,       non_neg_integer()} |
-    {linger,    {boolean(), non_neg_integer()}}.
+    keepalive                                                   |
+    {keepalive,       boolean()}                                |
+    {sndbuf,          pos_integer()}                            |
+    {recvbuf,         pos_integer()}                            |
+    {priority,        0..6}                                     |
+    {tos,             non_neg_integer()}                        |
+    {linger,          {boolean(), non_neg_integer()}}           |
+    {multicast_ttl,   0..255}                                   |
+    {multicast_loop,  boolean()}                                |
+    {multicast_if,    inet:ip4_address()}                       |
+    {add_membership,  {inet:ip4_address(), inet:ip4_address()}} |
+    {drop_membership, {inet:ip4_address(), inet:ip4_address()}}.
 
 -doc """
 TLS options supported by arterial's NIF layer for SSL connections.

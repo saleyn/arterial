@@ -28,6 +28,17 @@ the slot's owner pid, which must then call `handle_readable/3` or
 `handle_writable/3` to actually do the I/O and re-arm the next
 notification. `closed` needs no further NIF call; the fd is already
 gone by the time it's delivered.
+
+## Protocol Support
+
+This NIF supports three socket protocols via `connect_proto/8` family:
+- **TCP** - Reliable stream protocol with optional TLS/SSL
+- **UDP** - Unreliable datagram protocol with multicast support
+- **SSL** - TLS/SSL over TCP (requires OpenSSL)
+
+**Multicast support:** UDP sockets can be configured with multicast
+options including TTL, loopback control, interface selection, and
+group membership management. See `connect_proto_with_opts/9`.
 """.
 
 -export([init/0]).
@@ -338,14 +349,25 @@ close_slot(_PoolRef, _StripeId, _SlotId) ->
 Enhanced `connect/7` with socket options support. Like `connect/7` but accepts
 an additional list of socket options to apply to the socket before connecting.
 
-Socket options can be:
+**Basic socket options:**
 - Atoms: `keepalive`, `nodelay`, `reuseaddr`
-- Tuples: `{keepalive, true}`, `{sndbuf, 8192}`, `{rcvbuf, 8192}`, etc.
+- Tuples: `{keepalive, true}`, `{sndbuf, 8192}`, `{rcvbuf, 8192}`, `{priority, 0..6}`, `{tos, integer()}`, `{linger, {boolean(), integer()}}`
+
+**Multicast options (UDP protocol only):**
+- `{multicast_ttl, 0..255}` - Multicast TTL (time-to-live) hop limit
+- `{multicast_loop, boolean()}` - Enable/disable multicast loopback
+- `{multicast_if, {A,B,C,D}}` - Interface address for outgoing multicast packets
+- `{add_membership, {{MA,MB,MC,MD}, {IA,IB,IC,ID}}}` - Join multicast group (multicast addr, interface addr)
+- `{drop_membership, {{MA,MB,MC,MD}, {IA,IB,IC,ID}}}` - Leave multicast group (multicast addr, interface addr)
 
 ## Examples
 
 ```
 1> arterial_nif:connect_with_opts(PoolRef, 0, {127,0,0,1}, 9000, 5000, true, self(), [keepalive, {sndbuf, 16384}]).
+{ok, SlotId}
+2> % UDP multicast example
+2> arterial_nif:connect_proto_with_opts(PoolRef, 0, {239,1,1,1}, 12345, 5000, udp, false, self(),
+2>   [{multicast_ttl, 16}, {add_membership, {{239,1,1,1}, {0,0,0,0}}}]).
 {ok, SlotId}
 ```
 """.
@@ -359,12 +381,20 @@ connect_with_opts(_PoolRef, _StripeId, _IP, _Port, _TimeoutMs, _Nodelay, _OwnerP
 
 -doc """
 Enhanced `connect_proto/8` with socket options support. Like `connect_proto/8`
-but accepts an additional list of socket options.
+but accepts an additional list of socket options. Supports all protocols (tcp, udp, ssl)
+with protocol-specific options.
+
+**Socket options:** Same as `connect_with_opts/8`. Multicast options are only
+applicable when `Protocol` is `udp`.
 
 ## Examples
 
 ```
 1> arterial_nif:connect_proto_with_opts(PoolRef, 0, {127,0,0,1}, 9000, 5000, tcp, true, self(), [keepalive]).
+{ok, SlotId}
+2> % UDP multicast receiver
+2> arterial_nif:connect_proto_with_opts(PoolRef, 1, {239,1,1,1}, 12345, 5000, udp, false, self(),
+2>   [{multicast_ttl, 1}, {multicast_loop, false}, {add_membership, {{239,1,1,1}, {192,168,1,100}}}]).
 {ok, SlotId}
 ```
 """.
