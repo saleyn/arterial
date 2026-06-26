@@ -1408,7 +1408,6 @@ static ERL_NIF_TERM connect_proto_nif(ErlNifEnv* env, int argc, const ERL_NIF_TE
   unsigned int timeout_ms;
   bool nodelay;
   ErlNifPid owner_pid;
-
   if (argc != 8                     ||
       !get(env, argv[0], ctx)       ||
       !get(env, argv[1], stripe_id) ||
