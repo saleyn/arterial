@@ -63,9 +63,12 @@ bench(Opts) ->
       io:format("~n=== Connection Pool Performance Comparison ===~n"),
       io:format("Configuration: ~p~n~n", [FinalOpts]),
 
-      % Run benchmarks and collect results
-      % Remove plotting-specific options that individual benchmarks don't understand
-      BenchOpts = maps:without([plot], FinalOpts),
+      % Run benchmarks and collect results.
+      % Strip keys that individual benchmarks don't understand, including
+      % pool_sizes (triggers bench_scaling path which uses a different
+      % output format that parse_benchmark_output can't parse).
+      BenchOpts = maps:without(
+        [plot, pool_sizes, restart_server, wait_between], FinalOpts),
       WaitBetweenS = maps:get(wait_between, FinalOpts, 1),
 
       ArterialResult = run_benchmark(arterial, bench_arterial, BenchOpts),
@@ -257,7 +260,7 @@ run_benchmark(Name, Module, Opts) ->
 capture_benchmark_output(Module, Opts) ->
   % Create a temporary file to capture benchmark output
   TempFile = "/tmp/bench_output_" ++ integer_to_list(rand:uniform(1000000)),
-  {ok, Device} = file:open(TempFile, [write]),
+  {ok, Device} = file:open(TempFile, [write, {encoding, utf8}]),
 
   % Redirect stdout to the temporary file
   OldGroupLeader = group_leader(),
@@ -281,9 +284,9 @@ parse_benchmark_output(Name, Output) ->
     nomatch -> 0.0
   end,
 
-  % Parse latency percentiles
+  % Parse latency percentiles - use a more flexible pattern that doesn't rely on the µ character
   {P50, P95, P99, Max} = case re:run(Output,
-      "latency \\(µs\\): p50=([0-9]+) p95=([0-9]+) p99=([0-9]+) max=([0-9]+)",
+      "latency \\([^)]+\\):\\s+p50=([0-9]+)\\s+p95=([0-9]+)\\s+p99=([0-9]+)\\s+max=([0-9]+)",
       [{capture, [1,2,3,4], list}]) of
     {match, [P50Str, P95Str, P99Str, MaxStr]} ->
       {list_to_integer(P50Str), list_to_integer(P95Str),
