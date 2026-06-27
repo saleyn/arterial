@@ -145,6 +145,14 @@ bench-fifo bench-fifo-help:
 	  -pa _build/test/lib/arterial/test \
 	  -eval "bench_arterial_fifo:$(subst -,_,$(subst bench-fifo,bench,$@))($(BENCH_OPTS_MAP)), halt()."
 
+# Shackle in FIFO Mode 3 equivalent configuration:
+# backlog_size=1, one worker per connection — direct comparison to bench-fifo.
+bench-fifo-shackle bench-fifo-shackle-help:
+	@$(REBAR) as test compile
+	@erl -noshell -noinput -pa _build/test/lib/*/ebin \
+	  -pa _build/test/lib/arterial/test \
+	  -eval "bench_fifo_shackle:$(subst -,_,$(subst bench-fifo-shackle,bench,$@))($(BENCH_OPTS_MAP)), halt()."
+
 # Comprehensive benchmark comparing all available pool implementations
 bench-fifo-all:
 	@$(REBAR) as test compile

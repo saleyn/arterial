@@ -18,7 +18,11 @@ test fixtures.
 init(_Options) ->
   {ok, #st{}}.
 
-setup(_Socket, State) ->
+setup(Socket, State) ->
+  % shackle_server resets the socket to {active,true} without binary,
+  % reverting to list mode delivery.  Re-apply binary here to ensure
+  % shackle_telemetry:recv/2 receives a binary (it calls size/1).
+  inet:setopts(Socket, [binary]),
   {ok, State}.
 
 handle_request(Request, #st{next_id = ReqID} = State) ->
