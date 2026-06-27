@@ -374,12 +374,12 @@ setup(PoolSize, PoolStrategy, MaxRetries, BacklogSize, ExternalServer) ->
     {address, "127.0.0.1"},
     {port, Port},
     {reconnect, true},
-    %% shackle's own sock_opts default is [] -- gen_tcp then
+    %% shackle's own socket_options default is [] -- gen_tcp then
     %% defaults to list-mode {active,true} delivery, but
     %% shackle_server:handle_msg_data/4 (and this client's handle_data/2)
     %% expect a binary. Without this, every reply crashes the connection
     %% worker with badarg in erlang:size/1.
-    {sock_opts, [{mode, binary}, {active, true}, {packet, 0}]}
+    {socket_options, [{mode, binary}, {active, true}, {packet, 0}]}
   ], [
     {pool_size, PoolSize},
     {pool_strategy, PoolStrategy},

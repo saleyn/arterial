@@ -156,6 +156,9 @@ bench(Opts) ->
     PoolName = init_pool(Mode, MergedOpts),
 
     try
+      % Wait for pool connections to establish before warmup
+      wait_pool_connected(PoolName, Mode, MergedOpts),
+
       % Warmup phase
       warmup_pool(PoolName, Mode, MergedOpts),
 
@@ -226,7 +229,7 @@ opts() ->
     mode => fifo,               % Default to FIFO Mode 3
 
     % FIFO-specific
-    stripe_selection => scheduler_id,
+    stripe_selection => round_robin,
     reservation_timeout_ms => 10000,
     request_timeout_ms => 5000,
 
@@ -250,7 +253,7 @@ fifo_opts() ->
     mode => fifo,
     workers => 16,              % FIFO is synchronous - fewer concurrent workers
     requests => 2000,           % 32K total requests maintained
-    stripe_selection => scheduler_id,  % Optimal stripe selection for FIFO
+    stripe_selection => round_robin,  % Each worker gets its own stripe
     reservation_timeout_ms => 15000,   % Longer timeout for reservations
     request_timeout_ms => 10000        % Longer per-request timeout
   }.
@@ -320,6 +323,28 @@ cleanup_pool(PoolName, shackle) ->
   shackle_pool:stop(PoolName);
 cleanup_pool(_PoolName, poolboy) ->
   ok.
+
+%% Wait for pool connections before warmup
+wait_pool_connected(PoolName, Mode, _Opts)
+    when Mode =:= fifo; Mode =:= existing ->
+  PoolSize = arterial_pool:size(PoolName),
+  % Poll manually so we can log progress and not block indefinitely
+  wait_pool_loop(PoolName, PoolSize, 60, 500);
+wait_pool_connected(_PoolName, _Mode, _Opts) -> ok.
+
+wait_pool_loop(_PoolName, _PoolSize, 0, _Interval) ->
+  io:format("ERROR: connections never established~n");
+wait_pool_loop(PoolName, PoolSize, Retries, Interval) ->
+  States = [arterial_pool:is_available(PoolName, I) || I <- lists:seq(0, PoolSize - 1)],
+  Connected = length([1 || true <- States]),
+  if Connected =:= PoolSize ->
+    io:format("All ~p connections established~n", [PoolSize]);
+  true ->
+    io:format("~p/~p connections ready, waiting (~p retries left)...~n",
+              [Connected, PoolSize, Retries - 1]),
+    timer:sleep(Interval),
+    wait_pool_loop(PoolName, PoolSize, Retries - 1, Interval)
+  end.
 
 %% Warmup phase to stabilize performance
 warmup_pool(PoolName, Mode, Opts) ->
@@ -621,10 +646,10 @@ print_results(Result) ->
     min_us := Min, max_us := Max} = maps:get(timing_stats, Result),
 
   io:format("Latency (μs):~n", []),
-  io:format("  Mean:            ~.1f~n", [Mean]),
-  io:format("  Median:          ~.1f~n", [Median]),
-  io:format("  95th percentile: ~.1f~n", [P95]),
-  io:format("  99th percentile: ~.1f~n", [P99]),
+  io:format("  Mean:            ~.1f~n", [float(Mean)]),
+  io:format("  Median:          ~.1f~n", [float(Median)]),
+  io:format("  95th percentile: ~.1f~n", [float(P95)]),
+  io:format("  99th percentile: ~.1f~n", [float(P99)]),
   io:format("  Min:             ~p~n", [Min]),
   io:format("  Max:             ~p~n", [Max]),
 
