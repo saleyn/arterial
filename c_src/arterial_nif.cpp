@@ -129,8 +129,9 @@ struct alignas(64) ConnSlot {
 
   void clear_fifo_request() {
     fifo_request_active.store(false, std::memory_order_release);
-    fifo_reservation_id = 0;
     fifo_requester_pid = {};
+    // fifo_reservation_id is preserved so release_fifo_connection_nif
+    // can still verify and release the slot after the reply is delivered.
   }
 };
 
@@ -889,9 +890,18 @@ static ERL_NIF_TERM handle_readable_nif(ErlNifEnv* env, int argc, const ERL_NIF_
 
   if (slot.fd == -1) return am_closed;
 
+  // Stale read event from a previous connection on this slot: ignore.
+  // This can happen when the slot is reused before pool_resource_stop
+  // deregisters the old fd's enif_select.
+  uint32_t current_status = slot.status.load(std::memory_order_acquire);
+  if (current_status == SLOT_CONNECTING || current_status == SLOT_EMPTY) {
+    ErlNifBinary empty;
+    enif_alloc_binary(0, &empty);
+    return make(env, std::make_tuple(am_ok, TERM(enif_make_binary(env, &empty))));
+  }
+
 #ifdef HAVE_OPENSSL
   // Handle ongoing SSL handshake
-  uint32_t current_status = slot.status.load(std::memory_order_acquire);
   if (current_status == SLOT_SSL_HANDSHAKE) {
     if (slot.protocol == PROTO_SSL && slot.ssl) {
       int handshake_result = ssl_handshake_blocking(slot, 5000);
@@ -1864,7 +1874,8 @@ static ERL_NIF_TERM connect_async_proto_nif(ErlNifEnv* env, int argc, const ERL_
       }
 
       auto& slot = stripe.slots[slot_id];
-      if (slot.status.load(std::memory_order_acquire) != SLOT_EMPTY) {
+      uint32_t s = slot.status.load(std::memory_order_acquire);
+      if (s != SLOT_EMPTY) {
         current_mask |= (1ULL << slot_id);
         continue;
       }
@@ -1910,18 +1921,18 @@ static ERL_NIF_TERM close_slot_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
   if (!slot_ptr) return enif_make_badarg(env);
   ConnSlot& slot = *slot_ptr;
 
+  // Always clear the lease bit and status, even if fd==-1 (pool_resource_stop
+  // may have already closed it). This is the authoritative cleanup point called
+  // by arterial_connection after set_slot_unavailable sets the bit.
+  slot.status.store(SLOT_EMPTY, std::memory_order_release);
+  auto& stripe = *ctx->stripes[slot.stripe_id];
+  stripe.lease_mask.fetch_and(~(1ULL << slot.slot_id), std::memory_order_release);
+
   if (slot.fd == -1) return am_ok;
 
 #ifdef HAVE_OPENSSL
   cleanup_slot_ssl(slot);
 #endif
-
-  // Clear lease bit and set status to SLOT_EMPTY immediately so
-  // claim_slot (which checks status, not fd) can reuse this slot before
-  // the async pool_resource_stop callback fires and calls close(fd).
-  slot.status.store(SLOT_EMPTY, std::memory_order_release);
-  auto& stripe = *ctx->stripes[slot.stripe_id];
-  stripe.lease_mask.fetch_and(~(1ULL << slot.slot_id), std::memory_order_release);
 
   enif_select(env, slot.fd, ERL_NIF_SELECT_STOP, ctx, nullptr, am_stop);
   return am_ok;
@@ -2163,7 +2174,8 @@ static ERL_NIF_TERM set_slot_unavailable_nif(ErlNifEnv* env, int argc, const ERL
 
   // Set lease mask bit to prevent new sends
   auto& stripe = *ctx->stripes[slot.stripe_id];
-  stripe.lease_mask.fetch_or(1ULL << slot.slot_id, std::memory_order_release);
+  uint64_t prev2 = stripe.lease_mask.fetch_or(1ULL << slot.slot_id,
+                                               std::memory_order_release);
 
   // Set slot status to indicate unavailability (but preserve specific states like CONNECTING)
   uint32_t current_status = slot.status.load(std::memory_order_acquire);

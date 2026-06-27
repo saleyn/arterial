@@ -334,7 +334,6 @@ try_addresses([Entry | Rest], #state{
           arterial_pool:set_available(Pool, ConnID),
           {noreply, reset_backoff(State#state{connected = true})};
         {ok, connecting, _SlotId} ->
-          % Connection in progress, wait for completion message
           ?LOG_DEBUG("~s connecting asynchronously to ~s:~p", [Pfx, inet:ntoa(IP), Port]),
           {noreply, State};
         {error, Reason} ->
