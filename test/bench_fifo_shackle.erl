@@ -145,7 +145,7 @@ bench(Opts) ->
 
 ensure_shackle_started() ->
   case application:ensure_all_started(shackle) of
-    {ok, _} -> ok;
+    {ok,         _} -> ok;
     {error, Reason} -> error({shackle_start_failed, Reason})
   end.
 

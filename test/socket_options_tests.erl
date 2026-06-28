@@ -14,11 +14,11 @@ basic_tcp_socket_options_test() ->
 
   BasicOptions = [
     keepalive,
-    {keepalive, true},
-    {sndbuf, 32768},
-    {recvbuf, 32768},
-    {priority, 3},
-    {tos, 16},
+    {keepalive,    true},
+    {sndbuf,      32768},
+    {recvbuf,     32768},
+    {priority,        3},
+    {tos,            16},
     {linger, {true, 30}}
   ],
 

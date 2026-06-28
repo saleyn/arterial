@@ -234,12 +234,12 @@ handle_call({bounce, DrainTimeoutMs}, From, #state{pool = Pool, conn_id = ConnID
   {noreply, State#state{bounce = #bounce_state{from = From, deadline = Deadline}}};
 
 handle_call(Msg, _From, #state{pfx = Pfx} = State) ->
-  ?LOG_WARNING("~s got unexpected call: ~p", [Pfx, Msg]),
+  ?LOG_NOTICE("~s got unexpected call: ~p", [Pfx, Msg]),
   {reply, {error, unexpected_call}, State}.
 
 -doc false.
 handle_cast(Msg, #state{pfx = Pfx} = State) ->
-  ?LOG_WARNING("~s got unexpected cast: ~p", [Pfx, Msg]),
+  ?LOG_NOTICE("~s got unexpected cast: ~p", [Pfx, Msg]),
   {noreply, State}.
 
 -doc false.
@@ -273,7 +273,7 @@ handle_info({arterial_event, ConnID, 0, connect_result, Result}, #state{conn_id 
   handle_connect_result(Result, State);
 
 handle_info(Msg, #state{pfx = Pfx} = State) ->
-  ?LOG_WARNING("~s got unexpected msg: ~p", [Pfx, Msg]),
+  ?LOG_NOTICE("~s got unexpected msg: ~p", [Pfx, Msg]),
   {noreply, State}.
 
 -doc false.
@@ -285,7 +285,9 @@ terminate(Reason, State) ->
 %%% Internal functions: connect/reconnect
 %%%-----------------------------------------------------------------------------
 
-reconnect(#state{addresses = Addresses} = State) ->
+reconnect(#state{addresses = Addresses, pool = Pool, conn_id = ConnID} = State) ->
+  % Emit reconnect event for observability
+  arterial_observe:event([reconnect, attempt], #{pool => Pool, conn_id => ConnID}),
   try_addresses(Addresses, State).
 
 try_addresses([], State) ->
@@ -332,6 +334,7 @@ try_addresses([Entry | Rest], #state{
         {ok, _SlotId} ->
           % Connection completed immediately
           arterial_pool:set_available(Pool, ConnID),
+          arterial_observe:event([reconnect, success], #{pool => Pool, conn_id => ConnID}),
           {noreply, reset_backoff(State#state{connected = true})};
         {ok, connecting, _SlotId} ->
           ?LOG_DEBUG("~s connecting asynchronously to ~s:~p", [Pfx, inet:ntoa(IP), Port]),
@@ -341,7 +344,7 @@ try_addresses([Entry | Rest], #state{
           try_addresses(Rest, State)
       end;
     {error, Reason} ->
-      ?LOG_WARNING("~s failed to resolve host ~p: ~p", [Pfx, Address, Reason]),
+      ?LOG_NOTICE("~s failed to resolve host ~p: ~p", [Pfx, Address, Reason]),
       try_addresses(Rest, State)
   end.
 
@@ -350,12 +353,13 @@ try_addresses([Entry | Rest], #state{
 %%%-----------------------------------------------------------------------------
 
 handle_connect_result(ok, #state{pfx = Pfx, pool = Pool, conn_id = ConnID} = State) ->
-  ?LOG_INFO("~s async connect completed successfully", [Pfx]),
+  ?LOG_NOTICE("~s async connect completed successfully", [Pfx]),
   arterial_pool:set_available(Pool, ConnID),
+  arterial_observe:event([reconnect, success], #{pool => Pool, conn_id => ConnID}),
   {noreply, reset_backoff(State#state{connected = true})};
 
 handle_connect_result(Error, #state{pfx = Pfx} = State) ->
-  ?LOG_WARNING("~s async connect failed: ~p", [Pfx, Error]),
+  ?LOG_NOTICE("~s async connect failed: ~p", [Pfx, Error]),
   disconnect({connect_failed, Error}, State).
 
 %%%-----------------------------------------------------------------------------
@@ -390,7 +394,7 @@ append_and_decode(Bin, #state{pfx = Pfx, pool = Pool, codec = Codec, buffer = Bu
   try decode_loop(Codec, NewBuffer, CorrTable) of
     Rest -> {noreply, State#state{buffer = Rest}}
   catch error:{codec_decode_error, Reason} ->
-    ?LOG_WARNING("~s codec decode error, dropping connection: ~p", [Pfx, Reason]),
+    ?LOG_NOTICE("~s codec decode error, dropping connection: ~p", [Pfx, Reason]),
     disconnect({codec_error, Reason}, State#state{buffer = <<>>})
   end.
 

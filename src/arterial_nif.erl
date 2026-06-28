@@ -47,6 +47,7 @@ group membership management. See `connect_proto_with_opts/9`.
 -export([handle_readable/3, handle_writable/3, close_slot/3]).
 -export([is_slot_available/3, set_slot_available/3, set_slot_unavailable/3]).
 -export([reserve_fifo_connection/3, send_fifo_request/6, release_fifo_connection/4, fifo_connection_status/3, handle_fifo_reply/4]).
+-export([reserve_send_fifo_request/5]). % New combined function (#3)
 
 -on_load(init/0).
 
@@ -527,6 +528,39 @@ the reply to the appropriate waiting process.
                        binary()) ->
   ok | {error, term()}.
 handle_fifo_reply(_PoolRef, _StripeId, _SlotId, _ReplyData) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Combined reserve and send FIFO request operation (#3 - NIF call optimization).
+
+This function combines connection reservation and request sending into a single
+NIF call to reduce overhead. It reserves a connection (with queuing/waiting if
+necessary), sends the request, and returns the reservation info for later release.
+
+This is a performance optimization that reduces the Reserve -> Send pattern
+from 2 NIF calls to 1, while maintaining the ability to release separately
+for error handling flexibility.
+
+## Parameters
+
+- `PoolRef`: Pool context reference
+- `StripeId`: Which stripe to reserve from (0-based)
+- `RequestData`: List of binaries containing request data to send
+- `ReservationTimeoutMs`: Timeout for connection reservation
+- `RequestTimeoutMs`: Timeout for sending the request
+
+## Returns
+
+- `{ok, fifo_request_sent, StripeId, SlotId, ReservationId}`: Success
+- `{error, no_connections_available}`: All connections busy (after waiting)
+- `{error, write_failed}`: Failed to write to socket
+- `{error, timeout}`: Timeout during reservation or send
+""".
+-spec reserve_send_fifo_request(pool_ref(), non_neg_integer(), [binary()],
+                               non_neg_integer(), non_neg_integer()) ->
+  {ok, fifo_request_sent, non_neg_integer(), non_neg_integer(), non_neg_integer()} |
+  {error, atom()}.
+reserve_send_fifo_request(_PoolRef, _StripeId, _RequestData, _ReservationTimeoutMs, _RequestTimeoutMs) ->
   ?NOT_LOADED_ERROR.
 
 %%%-----------------------------------------------------------------------------

@@ -13,9 +13,9 @@ opts_test() ->
 %% Test that FIFO-specific options are included
 fifo_opts_test() ->
   FIFOOpts = bench_arterial_fifo:fifo_opts(),
-  ?assertMatch(#{stripe_selection := scheduler_id,
-                 reservation_timeout_ms := _,
-                 request_timeout_ms := _}, FIFOOpts).
+  ?assertMatch(#{stripe_pick    := scheduler_id,
+                 reserv_timeout := _,
+                 req_timeout    := _}, FIFOOpts).
 
 %% Test internal helper functions
 percentile_test() ->

@@ -30,7 +30,9 @@ from the Erlang side.
   send_fifo_request/6,
   release_fifo_connection/4,
   fifo_connection_status/3,
-  handle_fifo_reply/4
+  handle_fifo_reply/4,
+  % Combined operations for performance (#3)
+  reserve_send_fifo_request/5
 ]).
 
 -on_load(init/0).
@@ -154,3 +156,32 @@ appropriate waiting process.
   ok | {error, atom()}.
 handle_fifo_reply(PoolRef, StripeId, SlotId, ReplyData) ->
   arterial_nif:handle_fifo_reply(PoolRef, StripeId, SlotId, ReplyData).
+
+-doc """
+Combined reserve and send FIFO request operation (NIF call optimization).
+
+This is a performance optimization that combines connection reservation and
+request sending into a single NIF call, reducing the overhead from the
+Reserve -> Send pattern. It includes intelligent connection queuing/waiting.
+
+## Arguments
+
+- `PoolRef`: Pool context reference
+- `StripeId`: Which stripe to reserve from (0-based)
+- `RequestData`: List of binaries containing request data to send
+- `ReservationTimeoutMs`: Timeout for connection reservation (with queuing)
+- `RequestTimeoutMs`: Timeout for sending the request
+
+## Returns
+
+- `{ok, fifo_request_sent, StripeId, SlotId, ReservationId}`: Success
+- `{error, no_connections_available}`: All connections busy after timeout
+- `{error, write_failed}`: Failed to write to socket
+- `{error, timeout}`: Timeout during reservation or send
+""".
+-spec reserve_send_fifo_request(reference(), non_neg_integer(), [binary()],
+                               non_neg_integer(), non_neg_integer()) ->
+  {ok, fifo_request_sent, non_neg_integer(), non_neg_integer(), non_neg_integer()} |
+  {error, atom()}.
+reserve_send_fifo_request(PoolRef, StripeId, RequestData, ReservationTimeoutMs, RequestTimeoutMs) ->
+  arterial_nif:reserve_send_fifo_request(PoolRef, StripeId, RequestData, ReservationTimeoutMs, RequestTimeoutMs).

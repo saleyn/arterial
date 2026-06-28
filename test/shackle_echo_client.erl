@@ -32,7 +32,7 @@ handle_request(Request, #st{next_id = ReqID} = State) ->
 handle_data(Data, #st{buf = Buf} = State) ->
   %% OTP 29 compatibility: ensure Data is binary
   DataBin = case is_binary(Data) of
-    true -> Data;
+    true  -> Data;
     false -> iolist_to_binary(Data)
   end,
   decode_all(<<Buf/binary, DataBin/binary>>, [], State).

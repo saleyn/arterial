@@ -81,6 +81,12 @@ pool name, `t:arterial_pool:name/0`) is always present in metadata.
 * `[arterial, disconnect]` -- emitted whenever
   `arterial_connection:disconnect/2` runs (planned bounce or
   unplanned/error-triggered). Metadata: `pool`, `conn_id`, `reason`.
+* `[arterial, reconnect, attempt]` -- emitted when `arterial_connection`
+  begins a reconnection attempt after a disconnect or connection failure.
+  Metadata: `pool`, `conn_id`.
+* `[arterial, reconnect, success]` -- emitted when a reconnection attempt
+  succeeds and the connection becomes available for requests.
+  Metadata: `pool`, `conn_id`.
 * `[arterial, sweep, stop]` -- one event per `sweep_timeouts/1` call.
   Measurements: `expired_count` (how many in-flight requests timed out
   this sweep). Metadata: `pool`.
