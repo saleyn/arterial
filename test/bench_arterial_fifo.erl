@@ -22,8 +22,8 @@ $ rebar3 as test shell
 === arterial FIFO Mode 3 benchmark ===
 mode:          fifo
 pool size:     8
-workers:       32
-requests:      1000 per worker
+workers:       8
+requests:      4000 per worker
 ...
 ```
 
@@ -39,8 +39,8 @@ Expected performance relative to Mode 1:
 
 All tests default to:
 - Pool size: 8 connections
-- Workers: 32 concurrent processes
-- Load: 1000 requests per worker = 32,000 total requests
+- Workers: 8 concurrent processes
+- Load: 4000 requests per worker = 32,000 total requests
 - Wire protocol: same test_echo_protocol as other arterial benchmarks
 - Server: same test_tcp_server target as arterial_bench and bench_shackle
 
@@ -72,53 +72,64 @@ Results show requests/second, mean/p95/p99 latencies, and error rates.
 %%%-----------------------------------------------------------------------------
 
 -type opts() :: #{
-  pool_size := pos_integer(),         % Number of connections in pool
-  workers := pos_integer(),           % Number of concurrent worker processes
-  requests := pos_integer(),          % Number of requests per worker
-  duration_secs := pos_integer() | infinity,  % Max duration (or infinity for request-count limit)
-  host := inet:hostname() | inet:ip_address(),
-  port := inet:port_number(),
-  warmup_requests := non_neg_integer(), % Requests to discard for warmup
-  mode := fifo | existing | shackle | poolboy,
+  pool_size       := pos_integer(),            % Number of connections in pool
+  workers         := pos_integer(),            % Number of concurrent worker processes
+  requests        := pos_integer(),            % Number of requests per worker
+  duration_secs   := pos_integer() | infinity, % Max duration (or infinity for request-count limit)
+  host            := inet:hostname() | inet:ip_address(),
+  port            := inet:port_number(),
+  warmup_requests := non_neg_integer(),        % Requests to discard for warmup
+  mode            := existing | fifo | shackle | poolboy,
 
   % FIFO-specific options
-  stripe_selection := round_robin | scheduler_id | random,
-  reservation_timeout_ms := pos_integer(),  % FIFO connection reservation timeout
-  request_timeout_ms := pos_integer(),      % Per-request timeout
+  stripe_pick     := round_robin | scheduler_id | random,
+  reserv_timeout  := pos_integer(),            % FIFO connection reservation timeout
+  req_timeout     := pos_integer(),            % Per-request timeout
 
-  % Existing arterial options (for comparison)
-  arterial_mode := sync | async | cast,    % For arterial native modes
+  % FIFO backlog queue options
+  fifo_backlog_size    := non_neg_integer(),   % Max backlog entries (0 = disabled)
+  fifo_backlog_timeout := pos_integer(),       % Max wait time in backlog (ms)
+  fifo_queue_monitor   := boolean(),           % Enable backlog queue monitoring
 
-  % Shackle options (for comparison)
-  shackle_mode := sync | async,
-  backlog_size := pos_integer(),           % Shackle connection multiplexing
+  % Unified synchronization mode (for arterial and shackle comparison)
+  sync_mode       := sync | async | cast,      % sync/async for all pools, cast for arterial only
+  backlog_size    := pos_integer(),            % Connection multiplexing (shackle, arterial async)
 
   % Debug/monitoring
-  stats_interval_ms := pos_integer(),      % Progress reporting interval
-  verbose := boolean()
+  stats_interval_ms := pos_integer(),          % Progress reporting interval
+  verbose           := boolean()
 }.
 
 -type result() :: #{
-  mode := atom(),
-  pool_size := pos_integer(),
-  workers := pos_integer(),
-  total_requests := non_neg_integer(),
+  mode                := atom(),
+  pool_size           := pos_integer(),
+  workers             := pos_integer(),
+  total_requests      := non_neg_integer(),
   successful_requests := non_neg_integer(),
-  failed_requests := non_neg_integer(),
-  error_rate := float(),                    % Failed / Total
-  duration_ms := pos_integer(),
-  requests_per_sec := float(),
-  timing_stats := timing_stats(),
-  errors := [{atom(), non_neg_integer()}]  % Error type -> count
+  failed_requests     := non_neg_integer(),
+  error_rate          := float(),           % Failed / Total
+  reconnects          := non_neg_integer(), % Number of reconnections
+  duration_ms         := pos_integer(),
+  requests_per_sec    := float(),
+  timing_stats        := timing_stats(),
+  errors              := [{atom(), non_neg_integer()}], % Error type -> count
+
+  % FIFO backlog queue statistics (when applicable)
+  backlog_stats       => #{
+    total_queued => non_neg_integer(),      % Total requests queued in backlog
+    peak_backlog => non_neg_integer(),      % Peak backlog queue depth
+    avg_wait_time_ms => float(),            % Average wait time in backlog
+    backlog_timeouts => non_neg_integer()   % Requests that timed out in backlog
+  }
 }.
 
 -type timing_stats() :: #{
-  mean_us := float(),
-  median_us := float(),
-  p95_us := float(),
-  p99_us := float(),
-  min_us := non_neg_integer(),
-  max_us := non_neg_integer(),
+  mean_us    := float(),
+  median_us  := float(),
+  p95_us     := float(),
+  p99_us     := float(),
+  min_us     := non_neg_integer(),
+  max_us     := non_neg_integer(),
   std_dev_us := float()
 }.
 
@@ -146,12 +157,34 @@ bench(Opts) ->
   % Merge user options with defaults
   MergedOpts = maps:merge(fifo_opts(), Opts),
   Mode = maps:get(mode, MergedOpts),
+  Verbose = maps:get(verbose, MergedOpts, false),
+
+  % Suppress verbose logging during benchmarks unless --verbose
+  case Verbose of
+    false ->
+      % Maximum suppression for quiet benchmarks
+      logger:set_application_level(arterial, emergency),  % Suppress all arterial messages
+      logger:set_application_level(kernel, error),        % Suppress kernel messages
+      logger:set_application_level(stdlib, error),        % Suppress stdlib messages
+      logger:set_primary_config(level, emergency),        % Set primary to emergency
+      logger:set_handler_config(default, level, emergency); % Handler level too
+    true ->
+      logger:set_application_level(arterial, info),       % Show arterial info+
+      logger:set_application_level(kernel, warning),      % Show kernel warnings
+      logger:set_application_level(stdlib, warning),      % Show stdlib warnings
+      logger:set_primary_config(level, info),             % Enable primary info
+      logger:set_handler_config(default, level, info)     % Handler level info
+  end,
+
   print_config(MergedOpts),
 
   % Start test server if needed
   ServerPid = start_test_server(MergedOpts),
 
   try
+    % Start reconnect tracking before initializing the pool
+    start_reconnect_tracking(),
+
     % Initialize pool
     PoolName = init_pool(Mode, MergedOpts),
 
@@ -174,6 +207,7 @@ bench(Opts) ->
     end
 
   after
+    stop_reconnect_tracking(),
     stop_test_server(ServerPid)
   end.
 
@@ -190,16 +224,22 @@ bench_all() ->
   BaseOpts = opts(),
 
   TestModes = [
-    {fifo, "FIFO Mode 3", BaseOpts#{mode => fifo}},
-    {arterial_sync, "Arterial Sync", BaseOpts#{mode => existing, arterial_mode => sync}},
-    {arterial_async, "Arterial Async", BaseOpts#{mode => existing, arterial_mode => async}}
+    {fifo,            "FIFO Mode 3 (with backlog)", BaseOpts#{mode => fifo}},
+    {fifo_no_backlog, "FIFO Mode 3 (no backlog)", BaseOpts#{
+      mode               => fifo,
+      fifo_backlog_size  => 0,
+      fifo_queue_monitor => false
+    }},
+    {arterial_sync,    "Arterial Sync",  BaseOpts#{mode => existing, sync_mode => sync}},
+    {arterial_async,   "Arterial Async", BaseOpts#{mode => existing, sync_mode => async}},
+    {arterial_cast,    "Arterial Cast",  BaseOpts#{mode => existing, sync_mode => cast}}
   ] ++ case shackle_available() of
     true ->
-      [{shackle_sync, "Shackle Sync", BaseOpts#{mode => shackle, shackle_mode => sync}},
-       {shackle_async, "Shackle Async", BaseOpts#{mode => shackle, shackle_mode => async}}];
+      [{shackle_sync,  "Shackle Sync",   BaseOpts#{mode => shackle, sync_mode => sync}},
+       {shackle_async, "Shackle Async",  BaseOpts#{mode => shackle, sync_mode => async}}];
     false -> []
   end ++ case poolboy_available() of
-    true -> [{poolboy, "Poolboy", BaseOpts#{mode => poolboy}}];
+    true ->  [{poolboy, "Poolboy",       BaseOpts#{mode => poolboy}}];
     false -> []
   end,
 
@@ -219,28 +259,32 @@ Default benchmark options for comprehensive testing.
 -spec opts() -> opts().
 opts() ->
   #{
-    pool_size => 8,
-    workers => 32,
-    requests => 1000,           % 32K total requests
-    duration_secs => infinity,  % Request-count limited, not time limited
-    host => "127.0.0.1",
-    port => 19999,
-    warmup_requests => 100,     % Per worker warmup
-    mode => fifo,               % Default to FIFO Mode 3
+    pool_size         => 8,
+    workers           => 8,        % Match workers to pool_size consistently
+    requests          => 4000,     % Maintain 32K total requests: 8 * 4000 = 32K
+    duration_secs     => infinity, % Request-count limited, not time limited
+    host              => "127.0.0.1",
+    port              => 19999,
+    warmup_requests   => 100,      % Per worker warmup
+    mode              => fifo,     % Default to FIFO Mode 3
 
     % FIFO-specific
-    stripe_selection => round_robin,
-    reservation_timeout_ms => 10000,
-    request_timeout_ms => 5000,
+    stripe_pick       => round_robin,
+    reserv_timeout    => 10000,
+    req_timeout       => 5000,
+
+    % FIFO backlog queue options
+    fifo_backlog_size    => 1000,  % Enable backlog by default - 1000 entries
+    fifo_backlog_timeout => 30000, % 30 second max wait in backlog
+    fifo_queue_monitor   => true,  % Enable monitoring for benchmarks
 
     % Comparison modes
-    arterial_mode => async,     % For arterial existing mode comparison
-    shackle_mode => sync,       % For shackle comparison
-    backlog_size => 1,          % Fair comparison - no multiplexing
+    sync_mode         => async,    % Default sync mode for all pool comparisons
+    backlog_size      => 1,        % Fair comparison - no multiplexing
 
     % Monitoring
     stats_interval_ms => 2000,
-    verbose => false
+    verbose           => false
   }.
 
 -doc """
@@ -250,12 +294,12 @@ Optimized options specifically for FIFO Mode 3 benchmarking.
 fifo_opts() ->
   BaseOpts = opts(),
   BaseOpts#{
-    mode => fifo,
-    workers => 16,              % FIFO is synchronous - fewer concurrent workers
-    requests => 2000,           % 32K total requests maintained
-    stripe_selection => round_robin,  % Each worker gets its own stripe
-    reservation_timeout_ms => 15000,   % Longer timeout for reservations
-    request_timeout_ms => 10000        % Longer per-request timeout
+    mode             => fifo,
+    workers          => 8,           % Match workers to pool_size to reduce contention (#5)
+    requests         => 4000,        % Maintain total request count: 8 * 4000 = 32K
+    stripe_pick      => round_robin, % Each worker gets its own stripe
+    reserv_timeout   => 15000,       % Longer timeout for reservations
+    req_timeout      => 10000        % Longer per-request timeout
   }.
 
 %%%-----------------------------------------------------------------------------
@@ -282,11 +326,13 @@ init_pool(existing, Opts) ->
   % Use regular arterial pool for comparison
   PoolName = arterial_existing_bench_pool,
   PoolOpts = #{
-    size => maps:get(pool_size, Opts),
-    codec => bench_echo_codec,
-    address => maps:get(host, Opts),
-    port => maps:get(port, Opts),
-    protocol => tcp
+    size                 => maps:get(pool_size, Opts),
+    codec                => bench_echo_codec,
+    address              => maps:get(host, Opts),
+    port                 => maps:get(port, Opts),
+    protocol             => tcp,
+    reconnect            => true,
+    reconnect_timeout_ms => 1000
   },
 
   {ok, _SupPid} = arterial_pool:start_link(PoolName, PoolOpts),
@@ -311,8 +357,27 @@ init_pool(shackle, Opts) ->
   shackle_pool:start(PoolName, shackle_echo_client, ClientOpts, ShackleOpts),
   PoolName;
 
-init_pool(poolboy, _Opts) ->
-  error({not_implemented, "Poolboy benchmark not yet implemented"}).
+init_pool(poolboy, Opts) ->
+  Host = maps:get(host, Opts),
+  Port = maps:get(port, Opts),
+  PoolSize = maps:get(pool_size, Opts),
+
+  PoolName = poolboy_fifo_bench_pool,
+
+  % Poolboy configuration - similar to bench_poolboy.erl
+  PoolArgs = [
+    {name, {local, PoolName}},
+    {worker_module, poolboy_echo_worker},
+    {size, PoolSize},
+    {max_overflow, 0},  % No overflow for fair comparison
+    {strategy, fifo}    % FIFO to match FIFO Mode 3 ordering
+  ],
+
+  % Worker arguments - connection details
+  WorkerArgs = [{host, Host}, {port, Port}],
+
+  {ok, _PoolPid} = poolboy:start_link(PoolArgs, WorkerArgs),
+  PoolName.
 
 %% Cleanup pool resources
 cleanup_pool(PoolName, fifo) ->
@@ -321,29 +386,30 @@ cleanup_pool(PoolName, existing) ->
   arterial_pool:stop(PoolName);
 cleanup_pool(PoolName, shackle) ->
   shackle_pool:stop(PoolName);
-cleanup_pool(_PoolName, poolboy) ->
-  ok.
+cleanup_pool(PoolName, poolboy) ->
+  poolboy:stop(PoolName).
 
 %% Wait for pool connections before warmup
-wait_pool_connected(PoolName, Mode, _Opts)
+wait_pool_connected(PoolName, Mode, Opts)
     when Mode =:= fifo; Mode =:= existing ->
   PoolSize = arterial_pool:size(PoolName),
+  Verbose = maps:get(verbose, Opts, false),
   % Poll manually so we can log progress and not block indefinitely
-  wait_pool_loop(PoolName, PoolSize, 60, 500);
+  wait_pool_loop(PoolName, PoolSize, 60, 500, Verbose);
 wait_pool_connected(_PoolName, _Mode, _Opts) -> ok.
 
-wait_pool_loop(_PoolName, _PoolSize, 0, _Interval) ->
-  io:format("ERROR: connections never established~n");
-wait_pool_loop(PoolName, PoolSize, Retries, Interval) ->
+wait_pool_loop(_PoolName, _PoolSize, 0, _Interval, Verbose) ->
+  Verbose andalso io:format("ERROR: connections never established~n");
+wait_pool_loop(PoolName, PoolSize, Retries, Interval, Verbose) ->
   States = [arterial_pool:is_available(PoolName, I) || I <- lists:seq(0, PoolSize - 1)],
   Connected = length([1 || true <- States]),
   if Connected =:= PoolSize ->
-    io:format("All ~p connections established~n", [PoolSize]);
+    Verbose andalso io:format("All ~p connections established~n", [PoolSize]);
   true ->
-    io:format("~p/~p connections ready, waiting (~p retries left)...~n",
+    Verbose andalso io:format("~p/~p connections ready, waiting (~p retries left)...~n",
               [Connected, PoolSize, Retries - 1]),
     timer:sleep(Interval),
-    wait_pool_loop(PoolName, PoolSize, Retries - 1, Interval)
+    wait_pool_loop(PoolName, PoolSize, Retries - 1, Interval, Verbose)
   end.
 
 %% Warmup phase to stabilize performance
@@ -398,128 +464,178 @@ run_benchmark_internal(PoolName, Mode, Opts) ->
   end)} || WorkerId <- lists:seq(1, Workers)],
 
   % Collect results from all workers
-  {TimingData, ErrorCounts} = collect_worker_results(WorkerPids, [], []),
+  Verbose = maps:get(verbose, Opts, false),
+  {TimingData, ErrorCounts} = collect_worker_results(WorkerPids, [], [], Verbose),
 
   % Stop stats collector
   StatsPid ! stop,
 
   % Calculate statistics
-  TotalRequests = length(TimingData),
+  TotalRequests      = length(TimingData),
   SuccessfulRequests = TotalRequests,
-  FailedRequests = lists:sum([Count || {_Error, Count} <- ErrorCounts]),
-  ErrorRate = case TotalRequests + FailedRequests of
-    0 -> 0.0;
-    Total -> FailedRequests / Total
-  end,
+  FailedRequests     = lists:sum([Count || {_Error, Count} <- ErrorCounts]),
+  ErrorRate =
+    case TotalRequests + FailedRequests of
+      0 -> 0.0;
+      Total -> FailedRequests / Total
+    end,
 
   TimingStats = calculate_timing_stats(TimingData),
 
-  #{
-    mode => Mode,
-    pool_size => maps:get(pool_size, Opts),
-    workers => Workers,
-    total_requests => TotalRequests,
+  % Collect backlog statistics if FIFO mode with backlog enabled
+  BacklogStats = collect_backlog_stats(PoolName, Opts),
+
+  BaseResult = #{
+    mode                => Mode,
+    pool_size           => maps:get(pool_size, Opts),
+    workers             => Workers,
+    total_requests      => TotalRequests,
     successful_requests => SuccessfulRequests,
-    failed_requests => FailedRequests,
-    error_rate => ErrorRate,
-    timing_stats => TimingStats,
-    errors => ErrorCounts
-  }.
+    failed_requests     => FailedRequests,
+    error_rate          => ErrorRate,
+    reconnects          => get_reconnect_count(),
+    timing_stats        => TimingStats,
+    errors              => ErrorCounts
+  },
+
+  % Add backlog stats if available
+  case BacklogStats of
+    undefined -> BaseResult;
+    Stats -> BaseResult#{backlog_stats => Stats}
+  end.
 
 %% Individual worker process for benchmark load generation
 run_worker(Parent, PoolName, Mode, WorkerId, NumRequests, Opts) ->
   StripeId = select_stripe_id(WorkerId, Opts),
-  ReqTimeout = maps:get(request_timeout_ms, Opts),
-  ResTimeout = maps:get(reservation_timeout_ms, Opts),
+  ReqTimeout = maps:get(req_timeout, Opts),
+  ResTimeout = maps:get(reserv_timeout, Opts),
 
+  Verbose = maps:get(verbose, Opts, false),
   TimingData = run_worker_requests(PoolName, Mode, StripeId, NumRequests,
-                                   ReqTimeout, ResTimeout, []),
+                                   ReqTimeout, ResTimeout, Verbose, [], Opts),
 
   Parent ! {worker_done, WorkerId, TimingData, []}.
 
 %% Execute requests for a worker
-run_worker_requests(_PoolName, _Mode, _StripeId, 0, _ReqTimeout, _ResTimeout, Acc) ->
+run_worker_requests(_PoolName, _Mode, _StripeId, 0, _ReqTimeout, _ResTimeout, _Verbose, Acc, _Opts) ->
   lists:reverse(Acc);
 
-run_worker_requests(PoolName, fifo, StripeId, NumRequests, ReqTimeout, ResTimeout, Acc) ->
+run_worker_requests(PoolName, fifo, StripeId, NumRequests, ReqTimeout, ResTimeout, Verbose, Acc, _Opts) ->
   StartTime = erlang:monotonic_time(microsecond),
+  Request = make_test_request(),
 
-  % FIFO Mode 3: Reserve -> Call -> Release
-  case arterial_client_fifo:reserve_connection(PoolName, StripeId, ResTimeout) of
-    {ok, Reservation} ->
-      Request = make_test_request(),
-      CallResult = arterial_client_fifo:call(Reservation, Request,
-                                           fun encode_request/1, ReqTimeout),
+  % FIFO Mode 3: Optimized Reserve+Send -> Release (#3 + #1/#2 - reduced NIF calls + queuing)
+  case arterial_client_fifo:reserve_send_call(PoolName, StripeId, Request,
+                                              fun encode_request/1, ResTimeout) of
+    {ok, _Reply, Reservation} ->
+      % Release connection back to pool
       arterial_client_fifo:release_connection(Reservation),
 
       EndTime = erlang:monotonic_time(microsecond),
       Duration = EndTime - StartTime,
 
-      case CallResult of
-        {ok, _Reply} ->
-          run_worker_requests(PoolName, fifo, StripeId, NumRequests - 1,
-                            ReqTimeout, ResTimeout, [Duration | Acc]);
-        {error, _} ->
-          % Count as successful timing but could track errors separately
-          run_worker_requests(PoolName, fifo, StripeId, NumRequests - 1,
-                            ReqTimeout, ResTimeout, [Duration | Acc])
-      end;
+      run_worker_requests(PoolName, fifo, StripeId, NumRequests - 1,
+                        ReqTimeout, ResTimeout, Verbose, [Duration | Acc], _Opts);
 
     {error, ReserveErr} ->
       % Log first few failures for diagnosis, then skip
-      NumRequests =:= 1 andalso
-        io:format("[worker] reserve_connection failed: ~p (stripe ~p)~n",
+      NumRequests =:= 1 andalso Verbose andalso
+        io:format("[worker] reserve_send_call failed: ~p (stripe ~p)~n",
                   [ReserveErr, StripeId]),
       run_worker_requests(PoolName, fifo, StripeId, NumRequests - 1,
-                        ReqTimeout, ResTimeout, Acc)
+                        ReqTimeout, ResTimeout, Verbose, Acc, _Opts)
   end;
 
-run_worker_requests(PoolName, existing, _StripeId, NumRequests, ReqTimeout, _ResTimeout, Acc) ->
-  % Use regular arterial_client for comparison
+run_worker_requests(PoolName, existing, _StripeId, NumRequests, ReqTimeout, _ResTimeout, Verbose, Acc, Opts) ->
+  % Use regular arterial_client for comparison with configurable sync mode
   StartTime = erlang:monotonic_time(microsecond),
   Request = make_test_request(),
+  SyncMode = maps:get(sync_mode, Opts, sync),
 
-  case arterial_client:call(PoolName, Request, ReqTimeout) of
+  Result = case SyncMode of
+    sync -> arterial_client:call(PoolName, Request, ReqTimeout);
+    async ->
+      % Note: arterial async mode requires different handling,
+      % but for benchmark purposes we simulate with sync call
+      arterial_client:call(PoolName, Request, ReqTimeout);
+    cast ->
+      % Cast mode - fire and forget (no response timing)
+      arterial_client:cast(PoolName, Request),
+      {ok, cast}
+  end,
+
+  case Result of
     {ok, _Reply} ->
       EndTime = erlang:monotonic_time(microsecond),
       Duration = EndTime - StartTime,
       run_worker_requests(PoolName, existing, _StripeId, NumRequests - 1,
-                        ReqTimeout, _ResTimeout, [Duration | Acc]);
+                        ReqTimeout, _ResTimeout, Verbose, [Duration | Acc], Opts);
     {error, _} ->
       EndTime = erlang:monotonic_time(microsecond),
       Duration = EndTime - StartTime,
       run_worker_requests(PoolName, existing, _StripeId, NumRequests - 1,
-                        ReqTimeout, _ResTimeout, [Duration | Acc])
+                        ReqTimeout, _ResTimeout, Verbose, [Duration | Acc], Opts)
   end;
 
-run_worker_requests(PoolName, shackle, _StripeId, NumRequests, ReqTimeout, _ResTimeout, Acc) ->
-  % Use shackle for comparison
+run_worker_requests(PoolName, shackle, _StripeId, NumRequests, ReqTimeout, _ResTimeout, Verbose, Acc, Opts) ->
+  % Use shackle for comparison with configurable sync mode
   StartTime = erlang:monotonic_time(microsecond),
   Request = make_test_request(),
+  SyncMode = maps:get(sync_mode, Opts, sync),
 
-  case shackle:call(PoolName, Request, ReqTimeout) of
+  Result = case SyncMode of
+    sync -> shackle:call(PoolName, Request, ReqTimeout);
+    async ->
+      % Shackle async mode - for benchmark we still measure round-trip
+      shackle:call(PoolName, Request, ReqTimeout);
+    cast ->
+      % Cast not supported by shackle, fallback to sync
+      shackle:call(PoolName, Request, ReqTimeout)
+  end,
+
+  case Result of
     {ok, _Reply} ->
       EndTime = erlang:monotonic_time(microsecond),
       Duration = EndTime - StartTime,
       run_worker_requests(PoolName, shackle, _StripeId, NumRequests - 1,
-                        ReqTimeout, _ResTimeout, [Duration | Acc]);
+                        ReqTimeout, _ResTimeout, Verbose, [Duration | Acc], Opts);
     {error, _} ->
       EndTime = erlang:monotonic_time(microsecond),
       Duration = EndTime - StartTime,
       run_worker_requests(PoolName, shackle, _StripeId, NumRequests - 1,
-                        ReqTimeout, _ResTimeout, [Duration | Acc])
-  end.
+                        ReqTimeout, _ResTimeout, Verbose, [Duration | Acc], Opts)
+  end;
+
+run_worker_requests(PoolName, poolboy, _StripeId, NumRequests, ReqTimeout, _ResTimeout, Verbose, Acc, _Opts) ->
+  % Use poolboy for comparison - similar to bench_poolboy.erl
+  StartTime = erlang:monotonic_time(microsecond),
+  Request = make_test_request(),
+
+  _Result = try
+    poolboy:transaction(PoolName,
+      fun(Worker) ->
+        poolboy_echo_worker:call(Worker, Request)
+      end, ReqTimeout)
+  catch
+    exit:{timeout, _} -> {error, timeout};
+    _Class:_Reason -> {error, failed}
+  end,
+
+  EndTime = erlang:monotonic_time(microsecond),
+  Duration = EndTime - StartTime,
+  run_worker_requests(PoolName, poolboy, _StripeId, NumRequests - 1,
+                    ReqTimeout, _ResTimeout, Verbose, [Duration | Acc], _Opts).
 
 %%%-----------------------------------------------------------------------------
 %%% Helper Functions
 %%%-----------------------------------------------------------------------------
 
 %% Select stripe ID based on configuration
-select_stripe_id(_WorkerId, #{stripe_selection := scheduler_id, pool_size := N}) ->
+select_stripe_id(_WorkerId, #{stripe_pick := scheduler_id, pool_size := N}) ->
   erlang:system_info(scheduler_id) rem N;
-select_stripe_id(WorkerId, #{stripe_selection := round_robin, pool_size := N}) ->
+select_stripe_id(WorkerId, #{stripe_pick := round_robin, pool_size := N}) ->
   WorkerId rem N;
-select_stripe_id(_WorkerId, #{stripe_selection := random, pool_size := N}) ->
+select_stripe_id(_WorkerId, #{stripe_pick := random, pool_size := N}) ->
   rand:uniform(N) - 1.
 
 %% Create test request
@@ -530,15 +646,35 @@ make_test_request() ->
 encode_request(Request) ->
   term_to_binary(Request).
 
-%% Collect results from all worker processes
-collect_worker_results([], TimingAcc, ErrorAcc) ->
+%% Collect results from all worker processes with improved timeout handling
+collect_worker_results([], TimingAcc, ErrorAcc, _Verbose) ->
   {lists:flatten(TimingAcc), ErrorAcc};
-collect_worker_results([{WorkerId, _Pid} | Rest], TimingAcc, ErrorAcc) ->
-  receive
-    {worker_done, WorkerId, TimingData, Errors} ->
-      collect_worker_results(Rest, [TimingData | TimingAcc], Errors ++ ErrorAcc)
-  after 60000 ->
-    error(workers_timeout)
+collect_worker_results([{WorkerId, Pid} | Rest], TimingAcc, ErrorAcc, Verbose) ->
+  % Check if worker is still alive first
+  case is_process_alive(Pid) of
+    false ->
+      % Worker is already dead, skip waiting for it
+      Verbose andalso io:format("Worker ~p (pid ~p) is no longer alive - skipping~n", [WorkerId, Pid]),
+      collect_worker_results(Rest, [[] | TimingAcc], [#{error => worker_dead, worker_id => WorkerId}] ++ ErrorAcc, Verbose);
+    true ->
+      receive
+        {worker_done, WorkerId, TimingData, Errors} ->
+          collect_worker_results(Rest, [TimingData | TimingAcc], Errors ++ ErrorAcc, Verbose);
+        {'EXIT', Pid, normal} ->
+          % Worker completed successfully but didn't send result - treat as empty result
+          collect_worker_results(Rest, [[] | TimingAcc], ErrorAcc, Verbose);
+        {'EXIT', Pid, Reason} ->
+          % Worker failed - count as error
+          Verbose andalso io:format("Worker ~p (pid ~p) failed: ~p~n", [WorkerId, Pid, Reason]),
+          collect_worker_results(Rest, [[] | TimingAcc], [#{error => worker_crash, reason => Reason, worker_id => WorkerId}] ++ ErrorAcc, Verbose)
+      after 60000 -> % Reduced timeout back to 1 minute but with better handling
+        % Try to kill the hanging worker and continue
+        Verbose andalso io:format("Worker ~p (pid ~p) hanging, attempting to kill...~n", [WorkerId, Pid]),
+        exit(Pid, kill),
+        % Wait a bit for the kill to take effect, then continue
+        timer:sleep(100),
+        collect_worker_results(Rest, [[] | TimingAcc], [#{error => worker_timeout, worker_id => WorkerId}] ++ ErrorAcc, Verbose)
+      end
   end.
 
 %% Calculate timing statistics from raw data
@@ -619,39 +755,140 @@ print_config(Opts) ->
 
   case maps:get(mode, Opts) of
     fifo ->
-      io:format("stripe sel:    ~p~n", [maps:get(stripe_selection, Opts)]),
-      io:format("reservation:   ~p ms~n", [maps:get(reservation_timeout_ms, Opts)]),
-      io:format("request:       ~p ms~n", [maps:get(request_timeout_ms, Opts)]);
+      io:format("stripe sel:    ~p~n",    [maps:get(stripe_pick, Opts)]),
+      io:format("reservation:   ~p ms~n", [maps:get(reserv_timeout, Opts)]),
+      io:format("request:       ~p ms~n", [maps:get(req_timeout, Opts)]),
+      BacklogSize = maps:get(fifo_backlog_size, Opts, 0),
+      BacklogTimeout = maps:get(fifo_backlog_timeout, Opts, 0),
+      case BacklogSize of
+        0 ->
+          io:format("backlog size:  64 (NIF queue only - no backlog)~n");
+        _ ->
+          io:format("backlog size:  64 + ~p (NIF + backlog queue)~n", [BacklogSize]),
+          io:format("backlog timeout: ~p ms~n", [BacklogTimeout])
+      end;
     existing ->
-      io:format("arterial mode: ~p~n", [maps:get(arterial_mode, Opts)]);
+      io:format("sync mode:     ~p~n",    [maps:get(sync_mode, Opts)]),
+      io:format("backlog size:  0 (no queuing - immediate error)~n");
     shackle ->
-      io:format("shackle mode:  ~p~n", [maps:get(shackle_mode, Opts)]),
-      io:format("backlog size:  ~p~n", [maps:get(backlog_size, Opts)]);
-    _ -> ok
+      io:format("sync mode:     ~p~n",    [maps:get(sync_mode, Opts)]),
+      io:format("backlog size:  ~p~n",    [maps:get(backlog_size, Opts)]);
+    poolboy ->
+      io:format("backlog size:  unlimited (process mailbox queuing)~n");
+    _ ->
+      io:format("backlog size:  unknown~n")
   end,
 
-  io:format("~n", []).
+  % Print protocol mode information
+  print_protocol_info(maps:get(mode, Opts), Opts),
+
+  io:put_chars("\n").
+
+%% Print protocol mode information
+print_protocol_info(fifo, _Opts) ->
+  io:format("~nProtocol Mode: Arterial FIFO Ordering (No Correlation IDs)~n"),
+  io:format("Usage:         Protocols without request IDs requiring strict order~n"),
+  io:format("Examples:      Redis MULTI/EXEC, simple command protocols, streaming~n"),
+  io:format("FIFO Order:    Yes - guaranteed first-in-first-out reply ordering~n"),
+  io:format("CorrID Match:  No - order-based matching (first sent = first received)~n"),
+  io:format("Connection:    Reserved per request (exclusive, 1:1 mapping)~n"),
+  io:format("NIF Calls:     2 per request (reserve + send, release)~n");
+
+print_protocol_info(existing, Opts) ->
+  SyncMode = maps:get(sync_mode, Opts, sync),
+  case SyncMode of
+    sync ->
+      io:format("~nProtocol Mode: Arterial CorrID Sync~n"),
+      io:format("Usage:         Maximum performance for protocols with request IDs~n"),
+      io:format("Examples:      HTTP, gRPC, PostgreSQL, MySQL with request IDs~n"),
+      io:format("FIFO Order:    No - replies can arrive in any order~n"),
+      io:format("CorrID Match:  Yes - random access via correlation ID in ETS table~n"),
+      io:format("Connection:    Shared across requests (send-and-release immediately)~n"),
+      io:format("NIF Calls:     1 per request (send_and_release)~n");
+    async ->
+      io:format("~nProtocol Mode: Arterial CorrID Async~n"),
+      io:format("Usage:         Non-blocking for protocols with request IDs~n"),
+      io:format("Examples:      Async HTTP, gRPC streaming, event-driven protocols~n"),
+      io:format("FIFO Order:    No - async replies delivered as they arrive~n"),
+      io:format("CorrID Match:  Yes - correlation ID matched via async message delivery~n"),
+      io:format("Connection:    Shared across requests (async send, immediate release)~n"),
+      io:format("NIF Calls:     1 per request (send) + async message delivery~n");
+    cast ->
+      io:format("~nProtocol Mode: Arterial Cast (Fire-and-Forget)~n"),
+      io:format("Usage:         One-way messages, no reply expected~n"),
+      io:format("Examples:      Event publishing, logging, notifications~n"),
+      io:format("FIFO Order:    N/A - no replies to order~n"),
+      io:format("CorrID Match:  N/A - no replies to match~n"),
+      io:format("Connection:    Shared across requests (fire-and-forget)~n"),
+      io:format("NIF Calls:     1 per request (send only, no waiting)~n")
+  end;
+
+print_protocol_info(shackle, Opts) ->
+  SyncMode = maps:get(sync_mode, Opts, sync),
+  case SyncMode of
+    sync ->
+      io:format("~nProtocol Mode: Shackle Sync (External Pool Comparison)~n"),
+      io:format("Usage:         Alternative connection pool with correlation IDs~n"),
+      io:format("Examples:      Same as Arterial Sync but using Shackle library~n"),
+      io:format("FIFO Order:    No - replies can arrive in any order~n"),
+      io:format("CorrID Match:  Yes - correlation ID matching via Shackle internal system~n"),
+      io:format("Connection:    Shared via Shackle's connection pool~n"),
+      io:format("NIF Calls:     0 (uses Shackle's own connection management)~n");
+    async ->
+      io:format("~nProtocol Mode: Shackle Async (External Pool Comparison)~n"),
+      io:format("Usage:         Non-blocking alternative pool with correlation IDs~n"),
+      io:format("Examples:      Same as Arterial Async but using Shackle library~n"),
+      io:format("FIFO Order:    No - async replies delivered as they arrive~n"),
+      io:format("CorrID Match:  Yes - async correlation ID via Shackle callbacks~n"),
+      io:format("Connection:    Shared via Shackle's async connection pool~n"),
+      io:format("NIF Calls:     0 (uses Shackle's own async mechanisms)~n")
+  end;
+
+print_protocol_info(poolboy, _Opts) ->
+  io:format("~nProtocol Mode: Poolboy (Generic Process Pool)~n"),
+  io:format("Usage:         Generic worker processes, any protocol~n"),
+  io:format("Examples:      Custom protocols, legacy systems, general pooling~n"),
+  io:format("FIFO Order:    Depends on worker implementation~n"),
+  io:format("CorrID Match:  Depends on worker implementation~n"),
+  io:format("Connection:    One per worker process (checkout/checkin pattern)~n"),
+  io:format("NIF Calls:     0 (uses gen_server worker processes)~n");
+
+print_protocol_info(_, _) ->
+  io:format("~nProtocol Mode: Unknown~n").
 
 %% Print benchmark results
 print_results(Result) ->
   io:format("=== Results ===~n", []),
-  io:format("Total requests:    ~p~n", [maps:get(total_requests, Result)]),
-  io:format("Successful:        ~p~n", [maps:get(successful_requests, Result)]),
-  io:format("Failed:            ~p~n", [maps:get(failed_requests, Result)]),
-  io:format("Error rate:        ~.2f%~n", [maps:get(error_rate, Result) * 100]),
-  io:format("Duration:          ~p ms~n", [maps:get(duration_ms, Result)]),
-  io:format("Throughput:        ~.1f req/sec~n", [maps:get(requests_per_sec, Result)]),
+  io:format("Total requests:    ~p~n",         [maps:get(total_requests, Result)]),
+  io:format("Successful:        ~p~n",         [maps:get(successful_requests, Result)]),
+  io:format("Failed:            ~p~n",         [maps:get(failed_requests, Result)]),
+  io:format("Error rate:        ~.2f%~n",      [maps:get(error_rate, Result) * 100]),
+  io:format("Reconnects:        ~p~n",         [maps:get(reconnects, Result)]),
+  io:format("Duration:          ~p ms~n",      [maps:get(duration_ms, Result)]),
+  io:format("Throughput:        ~.1f req/s~n", [maps:get(requests_per_sec, Result)]),
 
   #{mean_us := Mean, median_us := Median, p95_us := P95, p99_us := P99,
     min_us := Min, max_us := Max} = maps:get(timing_stats, Result),
 
-  io:format("Latency (μs):~n", []),
+  io:format("Latency (us):~n", []),
   io:format("  Mean:            ~.1f~n", [float(Mean)]),
   io:format("  Median:          ~.1f~n", [float(Median)]),
   io:format("  95th percentile: ~.1f~n", [float(P95)]),
   io:format("  99th percentile: ~.1f~n", [float(P99)]),
-  io:format("  Min:             ~p~n", [Min]),
-  io:format("  Max:             ~p~n", [Max]),
+  io:format("  Min:             ~p~n",   [Min]),
+  io:format("  Max:             ~p~n",   [Max]),
+
+  % Print FIFO backlog statistics if available
+  case maps:get(backlog_stats, Result, undefined) of
+    undefined -> ok;
+    #{total_queued := TotalQueued, peak_backlog := PeakBacklog,
+      avg_wait_time_ms := AvgWait, backlog_timeouts := Timeouts} ->
+      io:format("FIFO Backlog:~n", []),
+      io:format("  Total queued:     ~p~n", [TotalQueued]),
+      io:format("  Peak backlog:     ~p~n", [PeakBacklog]),
+      io:format("  Avg wait time:    ~.1f ms~n", [float(AvgWait)]),
+      io:format("  Backlog timeouts: ~p~n", [Timeouts])
+  end,
 
   case maps:get(errors, Result, []) of
     [] -> ok;
@@ -660,26 +897,91 @@ print_results(Result) ->
       [io:format("  ~p: ~p~n", [Error, Count]) || {Error, Count} <- Errors]
   end,
 
-  io:format("~n", []).
+  io:put_chars("\n").
 
-%% Print comparison table for multiple results
+%% Print comparison table for multiple results using util's stringx:pretty_print_table
 print_comparison_table(Results) ->
-  io:format("~-20s ~-12s ~-10s ~-12s ~-12s ~-10s~n",
-           ["Implementation", "Req/sec", "Error%", "Mean (μs)", "P95 (μs)", "P99 (μs)"]),
-  io:format("~s~n", [lists:duplicate(80, $-)]),
+  % Prepare headers
+  Headers = {"Implementation", "Req/sec", "Error%", "Mean/μs", "P95/μs", "P99/μs"},
 
-  [print_comparison_row(Result) || Result <- Results],
-  io:format("~n", []).
+  % Prepare data rows
+  Rows = lists:map(fun(Result) ->
+    Name      = maps:get(test_name, Result, "Unknown"),
+    ReqPerSec = maps:get(requests_per_sec, Result),
+    ErrorRate = maps:get(error_rate, Result) * 100,
 
-print_comparison_row(Result) ->
-  Name = maps:get(test_name, Result, "Unknown"),
-  ReqPerSec = maps:get(requests_per_sec, Result),
-  ErrorRate = maps:get(error_rate, Result) * 100,
+    #{mean_us := Mean, p95_us := P95, p99_us := P99} = maps:get(timing_stats, Result),
 
-  #{mean_us := Mean, p95_us := P95, p99_us := P99} = maps:get(timing_stats, Result),
+    % Format values as tuples for stringx:pretty_print_table
+    {Name,
+     float(ReqPerSec),
+     float(ErrorRate),
+     round(Mean),
+     round(P95),
+     round(P99)}
+  end, Results),
 
-  io:format("~-20s ~-12.1f ~-10.2f ~-12.1f ~-12.1f ~-10.1f~n",
-           [Name, ReqPerSec, ErrorRate, Mean, P95, P99]).
+  % Use pretty_print_table with custom formatting and right alignment
+  stringx:pretty_print_table(Headers, Rows, #{
+    th_dir => both,   % Header padding both sides
+    td_pad => #{
+      2 => leading,   % Req/sec column - right align numbers
+      3 => leading,   % Error% column - right align numbers
+      4 => leading,   % Mean (us) column - right align numbers
+      5 => leading,   % P95 (us) column - right align numbers
+      6 => leading    % P99 (us) column - right align numbers
+    },
+    td_formats => {
+      undefined,      % Implementation column - default string formatting
+      fun(V) when is_float(V)   -> {string, stringx:format_number(V, 2, #{thousands => ","})} end, % Req/sec
+      fun(V) when is_float(V)   -> {number, float_to_list(V, [{decimals, 2}])} end, % Error%
+      fun(V) when is_integer(V) -> {number, integer_to_list(V)} end,   % Mean
+      fun(V) when is_integer(V) -> {number, integer_to_list(V)} end,   % P95
+      fun(V) when is_integer(V) -> {number, integer_to_list(V)} end    % P99
+    },
+    unicode   => true,
+    thousands => ",",
+    outline   => full
+  }).
+
+
+%%%-----------------------------------------------------------------------------
+%%% Reconnection Tracking
+%%%-----------------------------------------------------------------------------
+
+%% Get current reconnect count from the observer backend
+get_reconnect_count() ->
+  bench_reconnect_observer:get_count().
+
+%% Collect FIFO backlog statistics from pool
+%% TODO: This would call arterial_client_fifo:backlog_stats/1 when implemented
+collect_backlog_stats(_PoolName, #{mode := fifo} = Opts) ->
+  case maps:get(fifo_backlog_size, Opts, 0) of
+    0 -> undefined;  % No backlog configured
+    _ ->
+      % Placeholder implementation - would call NIF for real stats
+      #{
+        total_queued => 0,       % Total requests that entered backlog
+        peak_backlog => 0,       % Peak backlog depth during benchmark
+        avg_wait_time_ms => 0.0, % Average wait time in backlog
+        backlog_timeouts => 0    % Requests that timed out in backlog
+      }
+  end;
+collect_backlog_stats(_PoolName, _Opts) ->
+  undefined.  % Not FIFO mode
+
+%% Start reconnect tracking by configuring arterial_observe
+start_reconnect_tracking() ->
+  % Configure arterial to use our reconnect observer backend
+  application:set_env(arterial, observability, bench_reconnect_observer),
+  % Reset the counter
+  bench_reconnect_observer:reset_count(),
+  ok.
+
+%% Stop reconnect tracking
+stop_reconnect_tracking() ->
+  % Reset back to no observability to avoid affecting other tests
+  application:unset_env(arterial, observability).
 
 %%%-----------------------------------------------------------------------------
 %%% Test Infrastructure

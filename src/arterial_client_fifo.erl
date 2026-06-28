@@ -51,6 +51,10 @@ unaffected. FIFO modes are purely additive functionality.
   release_connection/1,
   connection_status/1,
 
+  % Performance optimized functions (#3)
+  reserve_send_call/4,
+  reserve_send_call/5,
+
   % Statistics and monitoring
   fifo_stats/1,
   is_fifo_enabled/2
@@ -328,6 +332,161 @@ connection_status(#{pool := Pool, stripe_id := StripeId, slot_id := SlotId} = _R
   end;
 connection_status(_InvalidReservation) ->
   {error, invalid_reservation}.
+
+%%%-----------------------------------------------------------------------------
+%%% Performance Optimized API (#3 - Reduced NIF Call Overhead)
+%%%-----------------------------------------------------------------------------
+
+-doc """
+Combined reserve, send, and wait operation with default reservation timeout.
+Equivalent to `reserve_send_call(Pool, StripeId, Request, EncodeRequest, 5000)`.
+""".
+-spec reserve_send_call(arterial_pool:name(), non_neg_integer(), term(), function() | module()) ->
+  {ok, term(), reservation()} | {error, fifo_error()}.
+reserve_send_call(Pool, StripeId, Request, EncodeRequest) ->
+  reserve_send_call(Pool, StripeId, Request, EncodeRequest, 5000).
+
+-doc """
+Combined reserve, send, and wait operation (performance optimized).
+
+This function combines connection reservation, request sending, and reply
+waiting into an optimized sequence with only 1 NIF call instead of 2,
+while maintaining the same error handling capabilities as the separate
+reserve/call/release sequence.
+
+The function still returns a reservation that must be released with
+`release_connection/1` after use, allowing for proper error handling
+and resource cleanup.
+
+## Parameters
+
+- `Pool`: The arterial pool name
+- `StripeId`: Which stripe to reserve from (usually scheduler ID)
+- `Request`: The request term to send
+- `EncodeRequest`: Function or module to encode the request to iodata
+- `ReservationTimeoutMs`: Timeout for connection reservation (includes queuing wait)
+
+## Returns
+
+- `{ok, Reply, Reservation}`: Successfully received reply, must release reservation
+- `{error, no_connections_available}`: All connections busy after timeout
+- `{error, write_failed}`: Failed to send request to socket
+- `{error, timeout}`: No reply received within timeout
+- `{error, fifo_init_failed}`: Failed to initialize FIFO extension
+
+## Example
+
+```erlang
+case arterial_client_fifo:reserve_send_call(pool, 0, {get, key}, Encoder, 10000) of
+  {ok, Reply, Reservation} ->
+    try
+      process_reply(Reply)
+    after
+      arterial_client_fifo:release_connection(Reservation)
+    end;
+  {error, Reason} ->
+    handle_error(Reason)
+end.
+```
+
+## Performance Benefits
+
+- Reduces NIF call overhead from 2 calls to 1 (reserve + send combined)
+- Includes intelligent connection queuing/waiting in the NIF layer
+- Maintains full error handling and resource management capabilities
+""".
+-spec reserve_send_call(arterial_pool:name(), non_neg_integer(), term(),
+                       function() | module(), non_neg_integer()) ->
+  {ok, term(), reservation()} | {error, fifo_error()}.
+reserve_send_call(Pool, StripeId, Request, EncodeRequest, ReservationTimeoutMs)
+    when is_atom(Pool), is_integer(StripeId), StripeId >= 0,
+         is_integer(ReservationTimeoutMs), ReservationTimeoutMs > 0 ->
+  % Encode the request to iodata (outside try block for fallback access)
+  RequestData = case is_function(EncodeRequest) of
+    true -> EncodeRequest(Request);
+    false -> EncodeRequest:encode_request(Request)
+  end,
+
+  % Convert iodata to list of binaries for NIF
+  RequestBinaries = iodata_to_binary_list(RequestData),
+
+  % Get pool reference
+  PoolRef = arterial_pool:pool_ref(Pool),
+
+  % Default request timeout
+  RequestTimeoutMs = 10000,
+
+  try
+    % Try combined reserve + send NIF call (with built-in queuing/waiting)
+    case arterial_nif:reserve_send_fifo_request(PoolRef, StripeId, RequestBinaries,
+                                                ReservationTimeoutMs, RequestTimeoutMs) of
+      {ok, fifo_request_sent, StripeIdReturned, SlotId, ReservationId} ->
+        % Create reservation info for later release
+        Reservation = #{
+          pool => Pool,
+          stripe_id => StripeIdReturned,
+          slot_id => SlotId,
+          reservation_id => ReservationId,
+          timeout => ReservationTimeoutMs
+        },
+
+        % Wait for reply message (same as regular call/4)
+        receive
+          {arterial_fifo_reply, StripeIdReturned, SlotId, ReplyData} ->
+            {ok, ReplyData, Reservation}
+        after RequestTimeoutMs ->
+          {error, timeout}
+        end;
+      {error, Reason} ->
+        {error, Reason}
+    end
+  catch
+    error:undef ->
+      {error, fifo_nif_not_loaded};
+    error:badarg ->
+      {error, invalid_arguments};
+    error:{not_loaded, _} ->
+      % Fallback to separate reserve + send calls when combined NIF not available
+      fallback_reserve_send_call(PoolRef, Pool, StripeId, RequestBinaries,
+                                 ReservationTimeoutMs, RequestTimeoutMs);
+    Class:ReasonVar ->
+      {error, {Class, ReasonVar}}
+  end;
+reserve_send_call(_InvalidPool, _StripeId, _Request, _EncodeRequest, _TimeoutMs) ->
+  {error, invalid_arguments}.
+
+%% Fallback implementation using separate NIF calls when combined call unavailable
+fallback_reserve_send_call(PoolRef, Pool, StripeId, RequestBinaries, ReservationTimeoutMs, RequestTimeoutMs) ->
+  % Use the original separate reserve + send approach
+  case arterial_nif:reserve_fifo_connection(PoolRef, StripeId, ReservationTimeoutMs) of
+    {ok, fifo_reserved, StripeIdReturned, SlotId, ReservationId} ->
+      % Try to send the request
+      case arterial_nif:send_fifo_request(PoolRef, StripeIdReturned, SlotId,
+                                           ReservationId, RequestBinaries, RequestTimeoutMs) of
+        {ok, fifo_request_sent} ->
+          Reservation = #{
+            pool => Pool,
+            stripe_id => StripeIdReturned,
+            slot_id => SlotId,
+            reservation_id => ReservationId,
+            timeout => ReservationTimeoutMs
+          },
+
+          % Wait for reply message
+          receive
+            {arterial_fifo_reply, StripeIdReturned, SlotId, ReplyData} ->
+              {ok, ReplyData, Reservation}
+          after RequestTimeoutMs ->
+            {error, timeout}
+          end;
+        {error, SendReason} ->
+          % Release the reservation since send failed
+          _ = arterial_nif:release_fifo_connection(PoolRef, StripeIdReturned, SlotId, ReservationId),
+          {error, SendReason}
+      end;
+    {error, ReserveReason} ->
+      {error, ReserveReason}
+  end.
 
 %%%-----------------------------------------------------------------------------
 %%% Statistics and Monitoring API
