@@ -28,6 +28,7 @@ stops).
 * `arterial_checkout_durationeconds` (histogram; labels `pool`, `mode`, `outcome`)
 * `arterial_connect_durationeconds` (histogram; labels `pool`, `result`)
 * `arterial_disconnects_total` (counter; labels `pool`, `reason`)
+* `arterial_reconnect_attempts_total` (counter; labels `pool`)
 * `arterial_sweep_expired_total` (counter; labels `pool`)
 * `arterial_exceptions_total` (counter; labels `pool`, `span`) -- incremented
   on any `[arterial, Span, exception]` event (`call`/`cast`/`checkout`/`connect`),
@@ -103,6 +104,9 @@ start(Opts) when is_map(Opts) ->
   declare_counter(arterial_disconnects_total,
     "Total number of arterial connection disconnects.",
     [pool, reason]),
+  declare_counter(arterial_reconnect_attempts_total,
+    "Total number of arterial connection reconnect attempts.",
+    [pool]),
   declare_counter(arterial_sweep_expired_total,
     "Total number of in-flight requests evicted by arterial_nif:sweep_timeouts/1.",
     [pool]),
@@ -150,12 +154,40 @@ ensure_started() ->
   end.
 
 declare_histogram(Name, Help, Labels, ExtraOpts) ->
-  _ = prometheus_histogram:declare([{name, Name}, {help, Help}, {labels, Labels} | ExtraOpts]),
-  ok.
+  %% Ensure collector is registered before declaring metrics
+  try
+    prometheus_registry:register_collector(prometheus_histogram)
+  catch
+    error:badarg -> ok  %% Already registered
+  end,
+
+  %% Declare the histogram and handle any errors
+  Result = prometheus_histogram:declare([{name, Name}, {help, Help}, {labels, Labels} | ExtraOpts]),
+  case Result of
+    ok -> ok;
+    {error, {mf_already_exists, _, _}} -> ok;  %% Already declared, that's fine
+    Other ->
+      error_logger:warning_msg("Failed to declare histogram ~p: ~p~n", [Name, Other]),
+      ok
+  end.
 
 declare_counter(Name, Help, Labels) ->
-  _ = prometheus_counter:declare([{name, Name}, {help, Help}, {labels, Labels}]),
-  ok.
+  %% Ensure collector is registered before declaring metrics
+  try
+    prometheus_registry:register_collector(prometheus_counter)
+  catch
+    error:badarg -> ok  %% Already registered
+  end,
+
+  %% Declare the counter and handle any errors
+  Result = prometheus_counter:declare([{name, Name}, {help, Help}, {labels, Labels}]),
+  case Result of
+    ok -> ok;
+    {error, {mf_already_exists, _, _}} -> ok;  %% Already declared, that's fine
+    Other ->
+      error_logger:warning_msg("Failed to declare counter ~p: ~p~n", [Name, Other]),
+      ok
+  end.
 
 %% Prometheus convention: durations are seconds (floats), not native time
 %% units -- convert once here so every histogram is in the same unit
@@ -189,6 +221,12 @@ handle_event([arterial, disconnect], _Measurements, #{pool := Pool, reason := Re
 
 handle_event([arterial, sweep, stop], #{expired_count := Count}, #{pool := Pool}) ->
   prometheus_counter:inc(arterial_sweep_expired_total, [Pool], Count);
+
+handle_event([arterial, reconnect, attempt], _Measurements, #{pool := Pool}) ->
+  prometheus_counter:inc(arterial_reconnect_attempts_total, [Pool]);
+
+handle_event([arterial, reconnect, success], _Measurements, _Metadata) ->
+  ok;
 
 %% start/stop events: this backend only records durations on specific stop/exception events.
 handle_event([arterial, _, _, stop], _Measurements, _Metadata) ->

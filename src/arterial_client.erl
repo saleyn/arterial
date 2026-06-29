@@ -63,9 +63,9 @@ call(Pool, Request, Timeout) ->
 
 do_call(Pool, Request, Timeout) ->
   CorrId = new_corr_id(),
-  Codec = arterial_pool:codec(Pool),
-  Data = iolist_to_binary(Codec:encode_request(CorrId, Request)),
-  Size = arterial_pool:size(Pool),
+  Codec  = arterial_pool:codec(Pool),
+  Data   = iolist_to_binary(Codec:encode_request(CorrId, Request)),
+  Size   = arterial_pool:size(Pool),
   case send_to_any(Pool, Size, [], CorrId, Data, Timeout) of
     ok ->
       await_reply(Pool, CorrId, Timeout);
@@ -213,6 +213,23 @@ await_reply(Pool, CorrId, Timeout) ->
     {arterial_event, _StripeId, _SlotId, _Event} ->
       % Filter out stray arterial_event messages that might be sent to wrong process
       % These should normally go to the connection process, not the client
+      await_reply(Pool, CorrId, Timeout);
+    {arterial_reply, _OtherCorrId, _Reply} ->
+      % Filter out arterial replies with mismatched correlation IDs
+      % These can happen when processes are reused or messages cross over between tests
+      await_reply(Pool, CorrId, Timeout);
+    {arterial_disconnected, _OtherPool, _OtherCorrId} ->
+      % Filter out disconnect messages from other pools/correlation IDs
+      await_reply(Pool, CorrId, Timeout);
+    {arterial_timeout, _OtherPool, _OtherCorrId} ->
+      % Filter out timeout messages from other pools/correlation IDs
+      await_reply(Pool, CorrId, Timeout);
+    {slow_result, _Result} ->
+      % Filter out messages from spawned processes in tests (like bounce tests)
+      % These are internal test communication and should not interfere
+      await_reply(Pool, CorrId, Timeout);
+    {result, _N, _Result} ->
+      % Filter out concurrent test result messages
       await_reply(Pool, CorrId, Timeout);
     Other ->
       error({invalid_reply, Other, #{pool => Pool, corr_id => CorrId}})

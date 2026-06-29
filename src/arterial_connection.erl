@@ -314,7 +314,11 @@ try_addresses([Entry | Rest], #state{
             % Built-in NIF protocols
             case ActualSocketOpts of
               [] ->
-                arterial_nif:connect_async_proto(PoolRef, ConnID, IP, Port, Protocol, Nodelay, self());
+                % TEMPORARY FIX: Force use of synchronous connection to work around async event system issues
+                % Add a minimal socket option to trigger synchronous mode
+                MinimalOpts = [{sndbuf, 8192}],  % Set a simple send buffer size
+                arterial_nif:connect_proto_with_opts(PoolRef, ConnID, IP, Port,
+                    State#state.conn_timeout, Protocol, Nodelay, self(), MinimalOpts);
               _ ->
                 % Use the new socket options aware function
                 arterial_nif:connect_proto_with_opts(PoolRef, ConnID, IP, Port,
@@ -475,11 +479,11 @@ disconnect(Reason, #state{pool = Pool, conn_id = ConnID, connected = Connected} 
 %% original backend.
 notify_inflight_disconnected(Pool, ConnID) ->
   CorrTable = arterial_pool:corr_table(Pool),
-  Matches = ets:match_object(CorrTable, {'_', '_', ConnID, '_'}),
-  lists:foreach(fun({CorrId, Pid, _ConnID, _Deadline}) ->
+  Fun = fun({CorrId, Pid, _ConnID, _Deadline}) ->
     ets:delete(CorrTable, CorrId),
     Pid ! {arterial_disconnected, Pool, CorrId}
-  end, Matches).
+  end,
+  arterial_util:ets_match_for_each(CorrTable, {'_', '_', ConnID, '_'}, 32, Fun).
 
 cancel_timer(undefined) -> ok;
 cancel_timer(TimerRef)  -> erlang:cancel_timer(TimerRef), ok.

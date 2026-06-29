@@ -98,19 +98,6 @@ bench-arterial bench-arterial-help:
 	  -pa _build/test/lib/arterial/test \
 	  -eval "bench_arterial:$(subst -,_,$(subst bench-arterial,bench,$@))($(BENCH_OPTS_MAP)), halt()."
 
-# Runs test/arterial_bench2.erl -- same workload shape as `bench` above,
-# but against arterial_pool2/arterial_client2 (the NIF-resident-I/O
-# backend, see arterial_pool2's moduledoc) instead of arterial_pool, for
-# a before/after throughput comparison between the two backends.
-bench2: bench-arterial2
-bench2-help: bench-arterial2-help
-
-bench-arterial2 bench-arterial2-help:
-	@$(REBAR) as test compile
-	erl -noshell -noinput -pa _build/test/lib/arterial/ebin \
-	  -pa _build/test/lib/arterial/test \
-	  -eval "arterial_bench2:$(subst -,_,$(subst bench-arterial2,bench,$@))($(BENCH_OPTS_MAP)), halt()."
-
 # Runs test/shackle_bench.erl -- the same workload shape/wire framing as
 # `bench` above, but driven through https://github.com/lpgauth/shackle
 # instead of arterial, for a direct throughput/latency comparison. The

@@ -15,15 +15,15 @@ unified_availability_test() ->
   {ok, PoolRef} = arterial_nif:init_pool(1, 1),
 
   % Initially, slot should not be available (no connection)
-  false = arterial_nif:is_slot_available(PoolRef, 0, 0),
+  ?assertEqual(false, arterial_nif:is_slot_available(PoolRef, 0, 0)),
 
   % Mark slot as available via NIF
   ok = arterial_nif:set_slot_available(PoolRef, 0, 0),
-  true = arterial_nif:is_slot_available(PoolRef, 0, 0),
+  ?assertEqual(true, arterial_nif:is_slot_available(PoolRef, 0, 0)),
 
   % Mark slot as unavailable via NIF
   ok = arterial_nif:set_slot_unavailable(PoolRef, 0, 0),
-  false = arterial_nif:is_slot_available(PoolRef, 0, 0).
+  ?assertEqual(false, arterial_nif:is_slot_available(PoolRef, 0, 0)).
 
 %% Test that arterial_pool functions use NIF as authority
 pool_nif_integration_test() ->
@@ -38,19 +38,23 @@ pool_nif_integration_test() ->
   }),
 
   try
-    % Initially connections should be unavailable (not connected)
-    false = arterial_pool:is_available(test_unified_pool, 0),
-    false = arterial_pool:is_available(test_unified_pool, 1),
+    % Ensure clean state by explicitly setting connections as unavailable first
+    ok = arterial_pool:set_unavailable(test_unified_pool, 0),
+    ok = arterial_pool:set_unavailable(test_unified_pool, 1),
+
+    % Now check that connections are unavailable (not connected)
+    ?assertEqual(false, arterial_pool:is_available(test_unified_pool, 0)),
+    ?assertEqual(false, arterial_pool:is_available(test_unified_pool, 1)),
 
     % Manually mark one connection as available via pool interface
     % This should call through to the NIF
     ok = arterial_pool:set_available(test_unified_pool, 0),
-    true = arterial_pool:is_available(test_unified_pool, 0),
-    false = arterial_pool:is_available(test_unified_pool, 1),
+    ?assertEqual(true, arterial_pool:is_available(test_unified_pool, 0)),
+    ?assertEqual(false, arterial_pool:is_available(test_unified_pool, 1)),
 
     % Mark it back as unavailable
     ok = arterial_pool:set_unavailable(test_unified_pool, 0),
-    false = arterial_pool:is_available(test_unified_pool, 0)
+    ?assertEqual(false, arterial_pool:is_available(test_unified_pool, 0))
   after
     arterial_pool:stop(test_unified_pool)
   end.
@@ -64,7 +68,7 @@ state_consistency_test() ->
   % Test repeated transitions - should be consistent
   lists:foreach(fun(_) ->
     ok = arterial_nif:set_slot_available(PoolRef, 0, 0),
-    true = arterial_nif:is_slot_available(PoolRef, 0, 0),
+    ?assertEqual(true, arterial_nif:is_slot_available(PoolRef, 0, 0)),
     ok = arterial_nif:set_slot_unavailable(PoolRef, 0, 0),
-    false = arterial_nif:is_slot_available(PoolRef, 0, 0)
+    ?assertEqual(false, arterial_nif:is_slot_available(PoolRef, 0, 0))
   end, lists:seq(1, 100)).
