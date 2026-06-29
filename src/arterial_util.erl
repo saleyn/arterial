@@ -7,6 +7,7 @@ the synchronous `call/3` path).
 """.
 
 -export([random_element/1, calc_timeout/1, calc_expiration/2]).
+-export([ets_match_for_each/4, ets_select_for_each/4]).
 
 -doc """
 Return a random element from non-empty list `L`. Used by
@@ -66,3 +67,30 @@ infinity
 -spec calc_expiration(integer(), integer() | infinity) -> infinity | integer().
 calc_expiration(_TS, infinity) -> infinity;
 calc_expiration( TS, Timeout)  -> TS + Timeout*1000.
+
+-doc """
+Execute `Fun` on every record matching `MatchSpec` in the given ets table.
+""".
+-spec ets_match_for_each(atom(), tuple(), pos_integer(), fun((term()) -> any())) ->
+  non_neg_integer().
+ets_match_for_each(Tab, MatchSpec, BatchSize, Fun) when is_tuple(MatchSpec) ->
+  Res = ets:match_object(Tab, MatchSpec, BatchSize),
+  continue_select(Res, Tab, match_object, Fun, 0).
+
+-doc """
+Execute `Fun` on every record selected with a `MatchSpec` in the given ets table.
+""".
+-spec ets_select_for_each(atom(), tuple(), pos_integer(), fun((term()) -> any())) ->
+  non_neg_integer().
+ets_select_for_each(Tab, MatchSpec, BatchSize, Fun) when is_list(MatchSpec) ->
+  Res = ets:select(Tab, MatchSpec, BatchSize),
+  continue_select(Res, Tab, select, Fun, 0).
+
+continue_select('$end_of_table', _Table, _F, _Fun, N) ->
+  N;
+continue_select({Objects, Continuation}, Table, F, Fun, N) ->
+  M = lists:foldl(fun(Obj, A) ->
+    Fun(Obj),
+    A+1
+  end, N, Objects),
+  continue_select(ets:F(Continuation), Table, F, Fun, M).

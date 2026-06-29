@@ -13,7 +13,7 @@ opts_test() ->
 %% Test that FIFO-specific options are included
 fifo_opts_test() ->
   FIFOOpts = bench_arterial_fifo:fifo_opts(),
-  ?assertMatch(#{stripe_pick    := scheduler_id,
+  ?assertMatch(#{stripe_pick    := round_robin,
                  reserv_timeout := _,
                  req_timeout    := _}, FIFOOpts).
 

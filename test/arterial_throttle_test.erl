@@ -9,6 +9,7 @@ Tests that throttling can be configured and integrated correctly.
 %% Test that throttling can be configured
 throttling_configuration_test() ->
   ok = test_helper:set_log_level(),
+  {ok, _} = application:ensure_all_started(arterial),
 
   % Start a pool with throttling configuration
   {ok, _SupPid} = arterial_pool:start_link(test_throttle_pool, #{
@@ -29,12 +30,14 @@ throttling_configuration_test() ->
     % send_and_release calls, but we can verify the configuration is correct
     ok
   after
-    arterial_pool:stop(test_throttle_pool)
+    arterial_pool:stop(test_throttle_pool),
+    application:stop(arterial)
   end.
 
 %% Test that pools without throttling work correctly
 no_throttling_test() ->
   ok = test_helper:set_log_level(),
+  {ok, _} = application:ensure_all_started(arterial),
 
   {ok, _SupPid} = arterial_pool:start_link(test_no_throttle_pool, #{
     size => 1,
@@ -51,5 +54,6 @@ no_throttling_test() ->
     ?assertEqual(undefined, ThrottleState),
     ok
   after
-    arterial_pool:stop(test_no_throttle_pool)
+    arterial_pool:stop(test_no_throttle_pool),
+    application:stop(arterial)
   end.

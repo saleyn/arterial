@@ -14,12 +14,14 @@ used directly by callers of the library.
 
 -behaviour(gen_server).
 
--export([start_link/2]).
+-export([start_link/1, start_link/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -record(state, {
   pool        :: arterial_pool:name(),
-  interval_ms :: pos_integer()
+  corr_table  :: atom(),
+  interval_ms :: pos_integer(),
+  batch_size  :: pos_integer()
 }).
 
 %%%-----------------------------------------------------------------------------
@@ -41,14 +43,25 @@ when the sweep beats its own `after Timeout`).
 """.
 -spec start_link(arterial_pool:name(), pos_integer()) -> {ok, pid()}.
 start_link(Pool, IntervalMs) when is_atom(Pool), is_integer(IntervalMs), IntervalMs > 0 ->
-  gen_server:start_link(?MODULE, [Pool, IntervalMs], []).
+  Opts = #{pool => Pool, interval => IntervalMs, batch_size => 32},
+  start_link(Opts).
+
+-spec start_link(#{pool => atom(), interval => pos_integer(),
+                   batch_size => pos_integer()}) -> {ok, pid()}.
+start_link(Opts) when is_map(Opts) ->
+  gen_server:start_link(?MODULE, Opts, []).
 
 %%%-----------------------------------------------------------------------------
 %%% gen_server callbacks
 %%%-----------------------------------------------------------------------------
 -doc false.
-init([Pool, IntervalMs]) ->
-  State = #state{pool = Pool, interval_ms = IntervalMs},
+init(#{pool := Pool, interval := IntervalMs} = Opts) ->
+  BatchSize = maps:get(batch_size, Opts, 32),
+  Table     = arterial_pool:corr_table(Pool),
+  State = #state{
+    pool        = Pool,       corr_table = Table,
+    interval_ms = IntervalMs, batch_size = BatchSize
+  },
   schedule(State),
   {ok, State}.
 
@@ -62,7 +75,7 @@ handle_cast(_Msg, State) ->
 
 -doc false.
 handle_info(sweep, #state{pool = Pool} = State) ->
-  Count = sweep(Pool),
+  Count = sweep(State),
   arterial_observe:event([sweep, stop], #{expired_count => Count}, #{pool => Pool}),
   schedule(State),
   {noreply, State}.
@@ -75,15 +88,14 @@ handle_info(sweep, #state{pool = Pool} = State) ->
 %% or the atom `infinity` -- `infinity < Now` is always false under
 %% Erlang's standard term order (atoms compare greater than any number),
 %% so infinity-deadline entries are naturally never selected here.
-sweep(Pool) ->
+sweep(#state{pool = Pool, corr_table = Table, batch_size = BatchSize}) ->
   Now = os:system_time(microsecond),
-  Table = arterial_pool:corr_table(Pool),
-  Expired = ets:select(Table, [{{'$1', '$2', '$3', '$4'}, [{'<', '$4', Now}], [{{'$1', '$2'}}]}]),
-  lists:foreach(fun({CorrId, Pid}) ->
+  Fun = fun({CorrId, Pid}) ->
     ets:delete(Table, CorrId),
     Pid ! {arterial_timeout, Pool, CorrId}
-  end, Expired),
-  length(Expired).
+  end,
+  MatchSpec = [{{'$1', '$2', '_', '$3'}, [{'<', '$3', Now}], [{{'$1', '$2'}}]}],
+  arterial_util:ets_select_for_each(Table, MatchSpec, BatchSize, Fun).
 
 schedule(#state{interval_ms = IntervalMs}) ->
   erlang:send_after(IntervalMs, self(), sweep).

@@ -427,7 +427,7 @@ throttle(Name) -> get_pt(throttle_key(Name), Name).
 
 -doc "The name of `Name`'s public correlation-id ETS table.".
 -spec corr_table(name()) -> atom().
-corr_table(Name) -> list_to_atom("arterial2_corr_" ++ atom_to_list(Name)).
+corr_table(Name) -> list_to_atom("arterial_corr_" ++ atom_to_list(Name)).
 
 -doc "Mark connection `ConnID` of `Name` available for new sends.".
 -spec set_available(name(), non_neg_integer()) -> ok.

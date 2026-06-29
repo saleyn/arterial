@@ -14,7 +14,7 @@ metadata:
 1. **NIF loading** — FIFO functions exported from `src/arterial_nif.erl`, stubs present
 2. **Module references** — `arterial_client_fifo` calls `arterial_nif:` (not `arterial_fifo_nif:`)
 3. **Function name** — `arterial_pool:pool_ref/1` (not `get_pool_ref/1`)
-4. **FIFOSlotExtension eliminated** — FIFO fields integrated directly into `ConnSlot` struct; no dynamic allocation
+4. **FIFOSlotExtension eliminated** — FIFO fields integrated directly into `Connection` struct; no dynamic allocation
 5. **`pool_resource_stop` lease bit** — was `fetch_or` (bug: set bit on close), fixed to `fetch_and` (clear bit)
 6. **`badarith` in benchmark** — `requests_per_sec` division now guards `Duration > 0`
 7. **Stripe selection** — `select_stripe_id` was hardcoded `rem 8`; fixed to `rem pool_size` using `Opts` map
