@@ -81,15 +81,16 @@ inline Connection* resolve_slot(
 
   assert(argc == 3);
 
-  if (!get(env, argv[0], ctx)       ||
-      !ctx                          || // NULL check for ctx
-      !get(env, argv[1], stripe_id) || stripe_id >= ctx->stripe_count ||
-      !ctx->stripes[stripe_id]      || // NULL check for stripe pointer
-      !get(env, argv[2], slot_id)) [[unlikely]]
+  if  (!get(env, argv[0], ctx)
+    || !ctx
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
+    || !ctx->stripes[stripe_id]
+    || !get(env, argv[2], slot_id)) [[unlikely]]
     return nullptr;
 
   auto& stripe = *ctx->stripes[stripe_id];
-  if (slot_id >= stripe.capacity) return nullptr;
+  if (slot_id >= stripe.capacity) [[unlikely]]
+    return nullptr;
 
   *out_ctx = ctx;
   return &stripe.slots[slot_id];
@@ -178,25 +179,23 @@ static ERL_NIF_TERM register_socket_nif(
 
   assert(argc == 4);
 
-  if (!get(env, argv[0], ctx)       ||
-      !get(env, argv[1], stripe_id) || stripe_id >= ctx->stripe_count ||
-      !get(env, argv[2], raw_fd)    || raw_fd < 0 ||
-      !get(env, argv[3], owner_pid)) {
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
+    || !get(env, argv[2], raw_fd)
+    || (raw_fd < 0)
+    || !get(env, argv[3], owner_pid)) [[unlikely]]
     return enif_make_badarg(env);
-  }
 
   auto& stripe = *ctx->stripes[stripe_id];
+  int   flags  = fcntl(raw_fd, F_GETFL, 0);
 
-  int flags = fcntl(raw_fd, F_GETFL, 0);
-  if (flags == -1 || fcntl(raw_fd, F_SETFL, flags | O_NONBLOCK) == -1)
-    return make_tuple(env, am_error, am_failed_to_set_nonblocking);
-
-  return ctx->claim_slot_term(env, stripe, raw_fd, owner_pid);
+  return UNLIKELY(flags == -1 || fcntl(raw_fd, F_SETFL, flags | O_NONBLOCK) == -1)
+       ? make_tuple(env, am_error, am_failed_to_set_nonblocking)
+       : ctx->claim_slot_term(env, stripe, raw_fd, owner_pid);
 }
 
 // Open and connect a brand-new IPv4 TCP socket entirely inside this NIF
-// (a dirty, IO-bound job -- see its ErlNifFunc entry -- since connect(2)
-// can block for the full timeout), then claim a conn for it exactly like
+// in non-blocking mode, then claim a conn for it exactly like
 // register_socket_nif. Unlike register_socket/4, the fd never has any
 // other owner (no Erlang `socket()` term, no `prim_socket` resource
 // fighting over it) -- the safer alternative to handing off an
@@ -214,13 +213,13 @@ static ERL_NIF_TERM connect_nif(
 
   assert(argc == 7);
 
-  if (!get(env, argv[0], ctx)            ||
-      !get(env, argv[1], stripe_id)      || stripe_id >= ctx->stripe_count ||
-      !get(env, argv[2], octets)         ||
-      !get(env, argv[3], port, 0, 65535) ||
-      !get(env, argv[4], timeout_ms)     ||
-      !get(env, argv[5], nodelay)        ||
-      !get(env, argv[6], owner_pid))
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
+    || !get(env, argv[2], octets)
+    || !get(env, argv[3], port, 0, 65535)
+    || !get(env, argv[4], timeout_ms)
+    || !get(env, argv[5], nodelay)
+    || !get(env, argv[6], owner_pid))
     return enif_make_badarg(env);
 
   auto& stripe = *ctx->stripes[stripe_id];
@@ -271,12 +270,12 @@ static ERL_NIF_TERM connect_async_nif(
 
   assert(argc == 6);
 
-  if (!get(env, argv[0], ctx)            ||
-      !get(env, argv[1], stripe_id)      || stripe_id >= ctx->stripe_count ||
-      !get(env, argv[2], octets)         ||
-      !get(env, argv[3], port, 0, 65535) ||
-      !get(env, argv[4], nodelay)        ||
-      !get(env, argv[5], owner_pid)) [[unlikely]]
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
+    || !get(env, argv[2], octets)
+    || !get(env, argv[3], port, 0, 65535)
+    || !get(env, argv[4], nodelay)
+    || !get(env, argv[5], owner_pid)) [[unlikely]]
     return enif_make_badarg(env);
 
   auto& stripe = *ctx->stripes[stripe_id];
@@ -349,9 +348,9 @@ static ERL_NIF_TERM send_and_release_nif(
 
   assert(argc == 3);
 
-  if (!get(env, argv[0], ctx)       ||
-      !get(env, argv[1], stripe_id) || stripe_id >= ctx->stripe_count ||
-      !enif_is_list(env, argv[2])) [[unlikely]]
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
+    || !enif_is_list(env, argv[2])) [[unlikely]]
     return enif_make_badarg(env);
 
   auto  list         = argv[2];
@@ -439,6 +438,7 @@ static ERL_NIF_TERM send_and_release_nif(
   if (conn.ssl) {
     // SSL doesn't support writev, so we need to write sequentially
     for (unsigned int j = 0; j < i && written >= 0; ++j) {
+    RETRY1:
       ssize_t n = SSL_write(conn.ssl, iov[j].iov_base, static_cast<int>(iov[j].iov_len));
       if (n > 0)
         written += n;
@@ -456,16 +456,16 @@ static ERL_NIF_TERM send_and_release_nif(
 
         if (ssl_error == SSL_ERROR_SYSCALL) {
           // Check if it's a temporary system error
-          if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+          if (errno == EINTR) [[unlikely]]
+            goto RETRY1;
+          if (errno == EAGAIN || errno == EWOULDBLOCK)
             // Temporary system error - retry
             break;
-          }
         }
 
-        if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+        if (ssl_error == SSL_ERROR_ZERO_RETURN)
           // Clean SSL shutdown from peer - treat as partial write completion
           break;
-        }
 
         // Unrecoverable SSL error
         cleanup_slot_ssl(conn);
@@ -478,14 +478,18 @@ static ERL_NIF_TERM send_and_release_nif(
         // Partial write, we need to handle this in the buffer logic below
         break;
     }
-  } else
+  }
+  else
 #endif
   {
+  RETRY2:
     written = (i > 0) ? writev(conn.fd, iov, i) : 0;
 
     if (written < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK)
         written = 0;
+      else if (errno == EINTR) [[unlikely]]
+        goto RETRY2;
       else {
         ctx->notify_and_close(env, conn);
         return make_tuple(env, am_error, am_write_failed);
@@ -536,7 +540,7 @@ static ERL_NIF_TERM handle_readable_nif(
   // deregisters the old fd's enif_select.
   uint32_t current_status = conn.status.load(std::memory_order_acquire);
   if (current_status == SLOT_CONNECTING || current_status == SLOT_EMPTY)
-    return make_tuple(env, am_ok, make_binary(env, ""));
+    return make_tuple(env, am_ok, binary{0});
 
 #ifdef HAVE_OPENSSL
   // Handle ongoing SSL handshake
@@ -554,21 +558,15 @@ static ERL_NIF_TERM handle_readable_nif(
         enif_send(env, &conn.owner_pid, msg_env, msg);
         conn.arm_read(env, ctx); // TODO: error handling?
         // Return empty data to indicate handshake completion
-        ErlNifBinary empty;
-        enif_alloc_binary(0, &empty);
-        return make_tuple(env, am_ok, TERM(enif_make_binary(env, &empty)));
+        return make_tuple(env, am_ok, binary{0});
       } else if (handshake_result == 0) {
         // Still needs READ - arm read event and return
         conn.arm_read(env, ctx); // TODO: error handling?
-        ErlNifBinary empty;
-        enif_alloc_binary(0, &empty);
-        return make_tuple(env, am_ok, TERM(enif_make_binary(env, &empty)));
+        return make_tuple(env, am_ok, binary{0});
       } else if (handshake_result == -2) {
         // Still needs WRITE - arm write event
         conn.arm_write(env, ctx); // TODO: handle errors
-        ErlNifBinary empty;
-        enif_alloc_binary(0, &empty);
-        return make_tuple(env, am_ok, TERM(enif_make_binary(env, &empty)));
+        return make_tuple(env, am_ok, binary{0});
       } else {
         // Handshake failed
         cleanup_slot_ssl(conn);
@@ -593,53 +591,49 @@ static ERL_NIF_TERM handle_readable_nif(
   ioctl(conn.fd, FIONREAD, &bytes_available);
   size_t read_size = bytes_available > 0 ? static_cast<size_t>(bytes_available) : 8192;
 
-  ErlNifBinary bin;
-  if (!enif_alloc_binary(read_size, &bin)) [[unlikely]] {
+  binary bin(read_size);
+  if (!bin) [[unlikely]]
     return make_tuple(env, am_error, am_alloc_failed);
-  }
 
   ssize_t n;
 
 #ifdef HAVE_OPENSSL
   if (conn.ssl) {
+  RETRY0:
     n = SSL_read(conn.ssl, bin.data, static_cast<int>(read_size));
     if (n <= 0) {
       int ssl_error = SSL_get_error(conn.ssl, static_cast<int>(n));
-      enif_release_binary(&bin);
 
       if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
         conn.arm_read(env, ctx); // TODO: error handling?
-        ErlNifBinary empty; enif_alloc_binary(0, &empty);
-        return make_tuple(env, am_ok, TERM(enif_make_binary(env, &empty)));
+        return make_tuple(env, am_ok, binary{0});
       }
 
       // Handle retryable SSL errors more gracefully
       if (ssl_error == SSL_ERROR_WANT_X509_LOOKUP) {
         // Retry after X.509 operations - arm read and try again
         conn.arm_read(env, ctx);
-        ErlNifBinary empty; enif_alloc_binary(0, &empty);
-        return make_tuple(env, am_ok, TERM(enif_make_binary(env, &empty)));
+        return make_tuple(env, am_ok, binary{0});
       }
 
       if (ssl_error == SSL_ERROR_SYSCALL) {
         // Check system error - only close if it's a real error
-        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        if (errno == EINTR)
+          goto RETRY0;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
           cleanup_slot_ssl(conn);
           ctx->notify_and_close(env, conn);
           return am_closed;
         }
         // Temporary system error - retry
         conn.arm_read(env, ctx);
-        ErlNifBinary empty; enif_alloc_binary(0, &empty);
-        return make_tuple(env, am_ok, TERM(enif_make_binary(env, &empty)));
+        return make_tuple(env, am_ok, binary{0});
       }
 
       if (ssl_error == SSL_ERROR_ZERO_RETURN) {
         // Clean SSL shutdown from peer - this is normal end-of-data, not an error
         // Don't force disconnect, just return empty data to signal end
-        ErlNifBinary empty;
-        enif_alloc_binary(0, &empty);
-        return make_tuple(env, am_ok, TERM(enif_make_binary(env, &empty)));
+        return make_tuple(env, am_ok, binary{0});
       }
 
       // SSL connection closed or unrecoverable error
@@ -647,25 +641,30 @@ static ERL_NIF_TERM handle_readable_nif(
       ctx->notify_and_close(env, conn);
       return am_closed;
     }
-  } else
+  }
+  else
 #endif
   {
-    while ((n = read(conn.fd, bin.data, read_size)) < 0 && errno == EINTR);
+  RETRY1:
+    n = read(conn.fd, bin.data, read_size);
 
     if (n <= 0) {
-      enif_release_binary(&bin);
+      if (errno == EINTR) [[unlikely]]
+        goto RETRY1;
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         conn.arm_read(env, ctx); // TODO: error handling?
-        ErlNifBinary empty; enif_alloc_binary(0, &empty);
-        return make_tuple(env, am_ok, TERM(enif_make_binary(env, &empty)));
+        return make_tuple(env, am_ok, binary{0});
       }
       ctx->notify_and_close(env, conn);
       return am_closed;
     }
   }
 
-  if (static_cast<size_t>(n) < bin.size) enif_realloc_binary(&bin, static_cast<size_t>(n));
-  auto bin_term = TERM(enif_make_binary(env, &bin));
+  if (static_cast<size_t>(n) < bin.size && !bin.realloc(n)) [[unlikely]] {
+    cleanup_slot_ssl(conn);
+    ctx->notify_and_close(env, conn);
+    return am_closed;
+  }
 
   conn.arm_read(env, ctx); // TODO: error handling?
 
@@ -675,31 +674,32 @@ static ERL_NIF_TERM handle_readable_nif(
     // Safety check: ensure fifo mode is actually enabled before sending message
     if (conn.is_fifo_enabled()) {
       nifpp::msg_env msg_env;
-      auto reply_msg = make(msg_env, std::make_tuple(
+      auto reply_msg = make_tuple(msg_env,
         am_arterial_fifo_reply,
         conn.stripe_id,
         conn.slot_id,
-        bin_term
-      ));
+        std::move(bin)
+      );
       enif_send(env, &conn.fifo_requester_pid, msg_env, reply_msg);
       conn.clear_fifo_request();
       // Return empty binary so arterial_connection has nothing to decode.
-      return make_tuple(env, am_ok, make_binary(env, ""));
+      return make_tuple(env, am_ok, binary{0});
     } else {
       // FIFO request was active but mode is not enabled - clear it
       conn.clear_fifo_request();
     }
   }
 
-  return make_tuple(env, am_ok, bin_term);
+  return make_tuple(env, am_ok, std::move(bin));
 }
 
 static ERL_NIF_TERM handle_writable_nif(
   ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
 {
   PoolContext* ctx;
-  Connection* pconn = resolve_slot(env, argc, argv, &ctx);
-  if (!pconn) return enif_make_badarg(env);
+  Connection*  pconn = resolve_slot(env, argc, argv, &ctx);
+  if (!pconn) [[unlikely]]
+    return enif_make_badarg(env);
   Connection& conn = *pconn;
 
   if (conn.fd == -1) [[unlikely]]
@@ -904,14 +904,14 @@ static ERL_NIF_TERM connect_proto_nif(
 
   assert(argc == 8);
 
-  if (!get(env, argv[0], ctx)                 ||
-      !get(env, argv[1], stripe_id)           || stripe_id >= ctx->stripe_count ||
-      !get(env, argv[2], octets)              ||
-      !get(env, argv[3], port, 0, 65535)      ||
-      !get(env, argv[4], timeout_ms)          ||
-      !parse_protocol(env, argv[5], protocol) ||
-      !get(env, argv[6], nodelay)             ||
-      !get(env, argv[7], owner_pid)) [[unlikely]]
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
+    || !get(env, argv[2], octets)
+    || !get(env, argv[3], port, 0, 65535)
+    || !get(env, argv[4], timeout_ms)
+    || !parse_protocol(env, argv[5], protocol)
+    || !get(env, argv[6], nodelay)
+    || !get(env, argv[7], owner_pid)) [[unlikely]]
     return enif_make_badarg(env);
 
 #ifndef HAVE_OPENSSL
@@ -948,93 +948,90 @@ static ERL_NIF_TERM connect_proto_nif(
     return make_tuple(env, am_error, am_connect_failed);
   }
 
-  // TODO: make non-blocking connect!!!
-
-  // For blocking connect on TCP/SSL, wait for completion
-  if ((protocol == PROTO_TCP || protocol == PROTO_SSL) && rc != 0) {
-    fd_set write_fds, error_fds;
-    FD_ZERO(&write_fds);
-    FD_ZERO(&error_fds);
-    FD_SET(fd, &write_fds);
-    FD_SET(fd, &error_fds);
-
-    struct timeval tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-    int select_rc = select(fd + 1, nullptr, &write_fds, &error_fds, &tv);
-    if (select_rc == 0) {
-      close(fd);
-      return make_tuple(env, am_error, am_timeout);
-    } else if (select_rc < 0 || FD_ISSET(fd, &error_fds)) {
-      close(fd);
-      return make_tuple(env, am_error, am_connect_failed);
-    }
-
-    // Check if connection actually succeeded
-    int error = 0;
-    socklen_t len = sizeof(error);
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) != 0 || error != 0) {
-      close(fd);
-      return make_tuple(env, am_error, am_connect_failed);
-    }
-
-    // For SSL connections, give the connection a moment to fully establish
-    if (protocol == PROTO_SSL) {
-      usleep(10000); // 10ms - let TCP connection stabilize
-    }
-
+  // Handle non-blocking connect like connect_async_proto_nif
+  if (rc == 0) {
+    // Connection completed immediately
 #ifdef HAVE_OPENSSL
-    // For SSL, now perform the handshake
     if (protocol == PROTO_SSL) {
       auto& stripe = *ctx->stripes[stripe_id];
+      int  slot_id = ctx->claim_slot(env, stripe, fd, owner_pid);
 
-      // We need a temporary conn to perform handshake
-      Connection temp_slot{};
-      temp_slot.fd = fd;
-
-      if (!setup_ssl_on_socket(temp_slot, fd)) {
+      if (slot_id < 0) {
         close(fd);
+        return make_tuple(env, am_error, am_stripe_full);
+      }
+
+      auto& conn = stripe.slots[slot_id];
+      conn.protocol = protocol;
+
+      if (!setup_ssl_on_socket(conn, fd)) {
+        close(fd);
+        stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
         return make_tuple(env, am_error, am_connect_failed);
       }
 
-      // Perform blocking SSL handshake with timeout
-      time_t start_time = time(nullptr);
-      time_t deadline   = start_time + (timeout_ms / 1000);
-
-      while (time(nullptr) < deadline) {
-        int handshake_result = ssl_handshake_step(temp_slot);
-        if (handshake_result == 1) {
-          // Handshake completed, now claim conn and transfer SSL context
-          int slot_id = ctx->claim_slot(env, stripe, fd, owner_pid);
-
-          // Find the claimed conn and transfer SSL context
-          if (slot_id >= 0 && slot_id < int(stripe.capacity)) {
-            auto& claimed_slot = stripe.slots[slot_id];
-            claimed_slot.ssl = temp_slot.ssl;
-            claimed_slot.protocol = PROTO_SSL;
-            temp_slot.ssl = nullptr; // Transfer ownership
-          }
-
-          cleanup_slot_ssl(temp_slot); // Clean up temp (should be nullptr now)
-          return make_tuple(env, am_ok, slot_id);
-        } else if (handshake_result == -1) {
-          cleanup_slot_ssl(temp_slot);
-          close(fd);
-          return make_tuple(env, am_error, am_connect_failed);
-        }
-
-        // TODO: remove this blocking call!
-        // Handshake needs more time, wait a bit
-        usleep(10000); // 10ms
+      // Perform non-blocking SSL handshake
+      int handshake_result = ssl_handshake_blocking(conn, 5000);
+      if (handshake_result == 1) {
+        // Handshake completed successfully
+        conn.status.store(SLOT_AVAILABLE, std::memory_order_release);
+        conn.arm_read(env, ctx);
+        return make_tuple(env, am_ok, slot_id);
+      } else if (handshake_result == 0) {
+        // Handshake needs READ - set status and arm read event
+        conn.status.store(SLOT_SSL_HANDSHAKE, std::memory_order_release);
+        conn.arm_read(env, ctx);
+        return make_tuple(env, am_ok, am_connecting, slot_id);
+      } else if (handshake_result == -2) {
+        // Handshake needs WRITE - set status and arm write event
+        conn.status.store(SLOT_SSL_HANDSHAKE, std::memory_order_release);
+        conn.arm_write(env, ctx);
+        return make_tuple(env, am_ok, am_connecting, slot_id);
+      } else {
+        // Handshake failed - clean up the claimed slot
+        cleanup_slot_ssl(conn);
+        close(fd);
+        conn.status.store(SLOT_EMPTY, std::memory_order_release);
+        stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
+        return make_tuple(env, am_error, am_connect_failed);
       }
-
-      // Timeout during SSL handshake
-      cleanup_slot_ssl(temp_slot);
-      close(fd);
-      return make_tuple(env, am_error, am_timeout);
-    }
+    } else
 #endif
+    {
+      // For TCP/UDP, proceed with immediate slot claiming
+      auto& stripe = *ctx->stripes[stripe_id];
+      return ctx->claim_slot_term(env, stripe, fd, owner_pid);
+    }
+  } else if (errno == EINPROGRESS) {
+    // Connection in progress, register and set up for async notification
+    auto& stripe = *ctx->stripes[stripe_id];
+    int slot_id = ctx->claim_slot(env, stripe, fd, owner_pid);
+
+    if (slot_id < 0) {
+      close(fd);
+      return make_tuple(env, am_error, am_stripe_full);
+    }
+
+    auto& conn = stripe.slots[slot_id];
+#ifdef HAVE_OPENSSL
+    conn.protocol = protocol;
+#endif
+    conn.status.store(SLOT_CONNECTING, std::memory_order_release);
+
+    // Check if select registration succeeds
+    if (conn.arm_connect(env, ctx) < 0) {
+      // Revert status and lease bit, then return error
+      conn.status.store(SLOT_EMPTY, std::memory_order_release);
+      stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
+      close(fd);
+      return make_tuple(env, am_error, am_select_failed);
+    }
+
+    return make_tuple(env, am_ok, am_connecting, slot_id);
+  } else {
+    // Connection failed immediately
+    close(fd);
+    return make_tuple(env, am_error, am_connect_failed);
   }
 
   auto&  stripe = *ctx->stripes[stripe_id];
@@ -1055,13 +1052,13 @@ static ERL_NIF_TERM connect_async_proto_nif(
 
   assert(argc == 7);
 
-  if (!get(env, argv[0], ctx)                 ||
-      !get(env, argv[1], stripe_id)           || stripe_id >= ctx->stripe_count ||
-      !get(env, argv[2], octets)              ||
-      !get(env, argv[3], port, 0, 65535)      ||
-      !parse_protocol(env, argv[4], protocol) ||
-      !get(env, argv[5], nodelay)             ||
-      !get(env, argv[6], owner_pid)) [[unlikely]]
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
+    || !get(env, argv[2], octets)
+    || !get(env, argv[3], port, 0, 65535)
+    || !parse_protocol(env, argv[4], protocol)
+    || !get(env, argv[5], nodelay)
+    || !get(env, argv[6], owner_pid)) [[unlikely]]
     return enif_make_badarg(env);
 
 #ifndef HAVE_OPENSSL
@@ -1248,21 +1245,14 @@ static ERL_NIF_TERM connect_with_opts_nif(
 
   assert(argc == 8);
 
-  bool ctx_ok = get(env, argv[0], ctx);
-  bool stripe_ok = get(env, argv[1], stripe_id);
-  bool stripe_range_ok = stripe_id < ctx->stripe_count;
-  bool octets_ok = get(env, argv[2], octets);
-  bool port_ok = get(env, argv[3], port, 0, 65535);
-  bool timeout_ok = get(env, argv[4], timeout_ms);
-  bool nodelay_ok = get(env, argv[5], nodelay);
-  bool pid_ok = get(env, argv[6], owner_pid);
-
-  fflush(stderr);
-
-  if (!ctx_ok || !stripe_ok || !stripe_range_ok || !octets_ok || !port_ok || !timeout_ok || !nodelay_ok || !pid_ok) {
-    fflush(stderr);
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
+    || !get(env, argv[2], octets)
+    || !get(env, argv[3], port, 0, 65535)
+    || !get(env, argv[4], timeout_ms)
+    || !get(env, argv[5], nodelay)
+    || !get(env, argv[6], owner_pid)) [[unlikely]]
     return enif_make_badarg(env);
-  }
 
   socket_opts = argv[7];
 
@@ -1335,22 +1325,15 @@ static ERL_NIF_TERM connect_proto_with_opts_nif(
 
   assert(argc == 9);
 
-  bool ctx_ok = get(env, argv[0], ctx);
-  bool stripe_ok = get(env, argv[1], stripe_id);
-  bool stripe_range_ok = stripe_id < ctx->stripe_count;
-  bool octets_ok = get(env, argv[2], octets);
-  bool port_ok = get(env, argv[3], port, 0, 65535);
-  bool timeout_ok = get(env, argv[4], timeout_ms);
-  bool protocol_ok = parse_protocol(env, argv[5], protocol);
-  bool nodelay_ok = get(env, argv[6], nodelay);
-  bool pid_ok = get(env, argv[7], owner_pid);
-
-  fflush(stderr);
-
-  if (!ctx_ok || !stripe_ok || !stripe_range_ok || !octets_ok || !port_ok || !timeout_ok || !protocol_ok || !nodelay_ok || !pid_ok) {
-    fflush(stderr);
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
+    || !get(env, argv[2], octets)
+    || !get(env, argv[3], port, 0, 65535)
+    || !get(env, argv[4], timeout_ms)
+    || !parse_protocol(env, argv[5], protocol)
+    || !get(env, argv[6], nodelay)
+    || !get(env, argv[7], owner_pid)) [[unlikely]]
     return enif_make_badarg(env);
-  }
 
   socket_opts = argv[8];
 
@@ -1402,13 +1385,11 @@ static ERL_NIF_TERM connect_proto_with_opts_nif(
   } else {
     // TCP and SSL use connect
     result = connect(fd, (struct sockaddr*)&addr, sizeof(addr));
-    if (result == -1) {
-      if (errno != EINPROGRESS) {
-        close(fd);
-        return make_tuple(env, am_error, am_connect_failed);
-      }
-      // For EINPROGRESS, connection is in progress - proceed with slot claiming
+    if (result < 0 && errno != EINPROGRESS) {
+      close(fd);
+      return make_tuple(env, am_error, am_connect_failed);
     }
+    // For EINPROGRESS, connection is in progress - proceed with slot claiming
   }
 
   // Get the stripe for claiming
@@ -1555,9 +1536,9 @@ static ERL_NIF_TERM reserve_fifo_connection_nif(
 
   assert(argc == 3);
 
-  if (!get(env, argv[0], ctx)       ||
-      !get(env, argv[1], stripe_id) || stripe_id >= ctx->stripe_count ||
-      !get(env, argv[2], timeout_ms)) [[unlikely]]
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
+    || !get(env, argv[2], timeout_ms)) [[unlikely]]
     return enif_make_badarg(env);
 
   auto& stripe = *ctx->stripes[stripe_id];
@@ -1648,18 +1629,17 @@ static ERL_NIF_TERM send_fifo_request_nif(
 
   assert(argc == 6);
 
-  if (!get(env, argv[0], ctx) ||
-      !get(env, argv[1], stripe_id) ||
-      !get(env, argv[2], slot_id) ||
-      !get(env, argv[3], reservation_id) ||
-      !enif_is_list(env, argv[4]) ||
-      !get(env, argv[5], timeout_ms)) {
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
+    || !get(env, argv[2], slot_id)
+    || !get(env, argv[3], reservation_id)
+    || !enif_is_list(env, argv[4])
+    || !get(env, argv[5], timeout_ms)) [[unlikely]]
     return enif_make_badarg(env);
-  }
 
-  if (stripe_id >= ctx->stripe_count) return enif_make_badarg(env);
   auto& stripe = *ctx->stripes[stripe_id];
-  if (slot_id >= stripe.capacity) return enif_make_badarg(env);
+  if (slot_id >= stripe.capacity) [[unlikely]]
+    return enif_make_badarg(env);
 
   auto& conn = stripe.slots[slot_id];
 
@@ -1706,12 +1686,17 @@ static ERL_NIF_TERM send_fifo_request_nif(
   ErlNifPid caller_pid;
   enif_self(env, &caller_pid);
 
+REPEAT1:
   // Write data to socket
   ssize_t bytes_written = writev(conn.fd, iov, list_len);
 
-  if (bytes_written == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-    conn.clear_fifo_request();
-    return make_tuple(env, am_error, am_write_failed);
+  if (bytes_written == -1) {
+    if (errno == EINTR) [[unlikely]]
+      goto REPEAT1;
+    else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+      conn.clear_fifo_request();
+      return make_tuple(env, am_error, am_write_failed);
+    }
   }
 
   // Record who to reply to when bytes arrive, then mark sent
@@ -1731,12 +1716,11 @@ static ERL_NIF_TERM release_fifo_connection_nif(
 
   assert(argc == 4);
 
-  if (!get(env, argv[0], ctx)       ||
-      !get(env, argv[1], stripe_id) || stripe_id >= ctx->stripe_count ||
-      !get(env, argv[2], slot_id)   ||
-      !get(env, argv[3], reservation_id)) {
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
+    || !get(env, argv[2], slot_id)
+    || !get(env, argv[3], reservation_id)) [[unlikely]]
     return enif_make_badarg(env);
-  }
 
   auto& stripe = *ctx->stripes[stripe_id];
   if (slot_id >= stripe.capacity) [[unlikely]]
@@ -1769,9 +1753,9 @@ static ERL_NIF_TERM fifo_connection_status_nif(
 
   assert(argc == 3);
 
-  if (!get(env, argv[0], ctx)       ||
-      !get(env, argv[1], stripe_id) || stripe_id >= ctx->stripe_count ||
-      !get(env, argv[2], slot_id)) [[unlikely]]
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
+    || !get(env, argv[2], slot_id)) [[unlikely]]
     return enif_make_badarg(env);
 
   auto& stripe = *ctx->stripes[stripe_id];
@@ -1815,9 +1799,9 @@ static ERL_NIF_TERM handle_fifo_reply_nif(
 
   assert(argc == 3);
 
-  if (!get(env, argv[0], ctx)       ||
-      !get(env, argv[1], stripe_id) || stripe_id >= ctx->stripe_count ||
-      !get(env, argv[2], slot_id)) [[unlikely]]
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
+    || !get(env, argv[2], slot_id)) [[unlikely]]
     return enif_make_badarg(env);
 
   auto& stripe = *ctx->stripes[stripe_id];
@@ -1862,11 +1846,11 @@ static ERL_NIF_TERM reserve_send_fifo_request_nif(
 
   assert(argc == 5);
 
-  if (!get(env, argv[0], ctx)            ||
-      !get(env, argv[1], stripe_id)      || stripe_id >= ctx->stripe_count ||
-      !enif_is_list(env, argv[2])        ||
-      !get(env, argv[3], reserv_timeout) ||
-      !get(env, argv[4], req_timeout)) [[unlikely]]
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, ctx->stripe_count-1)
+    || !enif_is_list(env, argv[2])
+    || !get(env, argv[3], reserv_timeout)
+    || !get(env, argv[4], req_timeout)) [[unlikely]]
     return enif_make_badarg(env);
 
   auto& stripe = *ctx->stripes[stripe_id];
@@ -1926,6 +1910,7 @@ static ERL_NIF_TERM reserve_send_fifo_request_nif(
       static constexpr size_t MAX_IOVECS = 32;
       iovec iovecs[MAX_IOVECS];
       size_t iovec_count = 0;
+      size_t total_bytes = 0;
 
       // Process the request data and send it
       ERL_NIF_TERM head, tail = argv[2];
@@ -1938,6 +1923,7 @@ static ERL_NIF_TERM reserve_send_fifo_request_nif(
         }
         iovecs[iovec_count].iov_base = const_cast<void*>(reinterpret_cast<const void*>(bin.data));
         iovecs[iovec_count].iov_len = bin.size;
+        total_bytes += bin.size;
         iovec_count++;
       }
 
@@ -1946,12 +1932,33 @@ static ERL_NIF_TERM reserve_send_fifo_request_nif(
         return enif_make_badarg(env);
       }
 
+    REPEAT2:
       // Perform the write
       ssize_t bytes_written = writev(conn.fd, iovecs, static_cast<int>(iovec_count));
+
       if (bytes_written < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          // Socket would block - atomic operation can't complete, caller should retry
+          conn.clear_fifo_request();
+          stripe.lease_mask.fetch_and(~target_bit, std::memory_order_release);
+          return make_tuple(env, am_error, am_partial);
+        }
+        else if (errno == EINTR) [[unlikely]]
+          goto REPEAT2;
+        else {
+          conn.clear_fifo_request();
+          stripe.lease_mask.fetch_and(~target_bit, std::memory_order_release);
+          return make_tuple(env, am_error, am_write_failed);
+        }
+      }
+
+      // Check if we wrote all the data - this is meant to be an atomic operation
+      if (static_cast<size_t>(bytes_written) < total_bytes) {
+        // Atomic operation failed - either nothing written (EAGAIN) or partial write
+        // In both cases, clear the reservation and let caller use regular two-step process
         conn.clear_fifo_request();
         stripe.lease_mask.fetch_and(~target_bit, std::memory_order_release);
-        return make_tuple(env, am_error, am_write_failed);
+        return make_tuple(env, am_error, am_partial);
       }
 
       conn.status.store(SLOT_FIFO_REQUEST_SENT, std::memory_order_release);
@@ -2001,15 +2008,15 @@ static ErlNifFunc nif_funcs[] = {
   {"init_pool",                   2, init_pool_nif,               0},
   {"configure_throttle",          3, configure_throttle_nif,      0},
   {"register_socket",             4, register_socket_nif,         0},
-  {"connect",                     7, connect_nif,                 ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"connect",                     7, connect_nif,                 0},
   {"connect_async",               6, connect_async_nif,           0},
-  {"connect_proto",               8, connect_proto_nif,           ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"connect_proto",               8, connect_proto_nif,           0},
   {"connect_async_proto",         7, connect_async_proto_nif,     0},
   {"send_and_release",            3, send_and_release_nif,        0},
   {"handle_readable",             3, handle_readable_nif,         0},
   {"handle_writable",             3, handle_writable_nif,         0},
-  {"connect_with_opts",           8, connect_with_opts_nif,       ERL_NIF_DIRTY_JOB_IO_BOUND},
-  {"connect_proto_with_opts",     9, connect_proto_with_opts_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"connect_with_opts",           8, connect_with_opts_nif,       0},
+  {"connect_proto_with_opts",     9, connect_proto_with_opts_nif, 0},
   {"close_slot",                  3, close_slot_nif,              0},
   {"is_slot_available",           3, is_slot_available_nif,       0},
   {"set_slot_available",          3, set_slot_available_nif,      0},

@@ -42,6 +42,7 @@ NIFPP_ADD_KNOWN_ATOM(am_no_connections_available);
 NIFPP_ADD_KNOWN_ATOM(am_nodelay);
 NIFPP_ADD_KNOWN_ATOM(am_not_fifo);
 NIFPP_ADD_KNOWN_ATOM(am_not_implemented);
+NIFPP_ADD_KNOWN_ATOM(am_partial);
 NIFPP_ADD_KNOWN_ATOM(am_priority);
 NIFPP_ADD_KNOWN_ATOM(am_quickack);
 NIFPP_ADD_KNOWN_ATOM(am_rcvbuf);
