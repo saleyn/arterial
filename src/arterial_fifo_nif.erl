@@ -61,7 +61,7 @@ Reserve a connection for FIFO mode operation.
 ## Returns
 
 - `{ok, fifo_reserved, StripeId, SlotId, ReservationId}`: Success
-- `{error, no_connections_available}`: All connections busy
+- `{error, pool_busy}`: All connections busy
 - `{error, fifo_init_failed}`: Failed to initialize FIFO extension
 """.
 -spec reserve_fifo_connection(reference(), non_neg_integer(), non_neg_integer()) ->
@@ -175,7 +175,7 @@ Reserve -> Send pattern. It includes intelligent connection queuing/waiting.
 ## Returns
 
 - `{ok, fifo_request_sent, StripeId, SlotId, ReservationId}`: Success
-- `{error, no_connections_available}`: All connections busy after timeout
+- `{error, pool_busy}`: All connections busy after timeout
 - `{error, write_failed}`: Failed to write to socket
 - `{error, timeout}`: Timeout during reservation or send
 """.

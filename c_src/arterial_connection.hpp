@@ -6,6 +6,7 @@
 #include <atomic>
 #include <vector>
 #include <chrono>
+#include <memory>
 
 // Forward declare FIFO types - definitions in arterial_fifo.hpp (included later)
 // NIF type handling - use real type when headers are available, placeholder otherwise
@@ -24,6 +25,7 @@ namespace arterial {
 struct PoolContext;
 struct FifoQueueEntry;
 class  FifoReservationQueue;
+class  ConnectionTimeout;
 
 using namespace nifpp;
 
@@ -74,7 +76,7 @@ struct alignas(64) Connection {
 
   // Core connection state
   StatusT             status{SLOT_AVAILABLE};
-  int                 fd{-1};
+  int                 fd{-1};  // TODO: Replace with FileDescriptor for RAII safety
   uint32_t            stripe_id{0};
   uint32_t            slot_id{0};
 
@@ -93,6 +95,9 @@ struct alignas(64) Connection {
   SSL*                ssl{nullptr};
   ProtocolType        protocol{PROTO_TCP};
 #endif
+
+  // Connection timeout management
+  std::unique_ptr<ConnectionTimeout> timer;
 
   //---------------------------------------------------------------------------
   // FIFO Mode 3 Extensions (integrated - zero overhead when unused)
@@ -115,6 +120,9 @@ struct alignas(64) Connection {
     owner_pid = {};
     pending_buffer.clear();
     bytes_written = 0;
+
+    // Cancel any active timeout - RAII cleanup
+    timer.reset();  // Destructor handles cancellation automatically
 
     // Reset FIFO state
     fifo_mode_enabled.store(false, std::memory_order_release);
@@ -230,6 +238,179 @@ struct alignas(64) Connection {
     auto msg = make_event_msg(msg_env, am_write);
     return nifpp::select_write(env, fd, ctx, &owner_pid, msg, msg_env);
   }
+
+  //===========================================================================
+  // High-level Connection Event Handlers
+  //===========================================================================
+
+  // Result types for connection event handling
+  enum class ReadResult {
+    DATA,           // Data read successfully, binary attached
+    CLOSED,         // Connection closed
+    HANDSHAKE_READ, // SSL handshake needs more reads
+    HANDSHAKE_WRITE,// SSL handshake needs writes
+    CONNECT_OK,     // Connection established successfully
+    CONNECT_FAILED, // Connection failed
+    ERROR           // Other error occurred
+  };
+
+  enum class WriteResult {
+    OK,             // Write completed successfully
+    CLOSED,         // Connection closed
+    HANDSHAKE_READ, // SSL handshake needs reads
+    HANDSHAKE_WRITE,// SSL handshake needs more writes
+    CONNECT_OK,     // Connection established successfully
+    CONNECT_FAILED, // Connection failed
+    ERROR           // Other error occurred
+  };
+
+  struct ReadResultData {
+    ReadResult result;
+    nifpp::binary data;        // For DATA result
+    bool send_connect_msg;     // Whether to send connection result message
+    TERM connect_result;       // am_ok or am_connect_failed
+
+    ReadResultData(ReadResult r) : result(r), data(0), send_connect_msg(false) {}
+    ReadResultData(ReadResult r, nifpp::binary&& d) : result(r), data(std::move(d)), send_connect_msg(false) {}
+  };
+
+  struct WriteResultData {
+    WriteResult result;
+    bool send_connect_msg;     // Whether to send connection result message
+    TERM connect_result;       // am_ok or am_connect_failed
+
+    WriteResultData(WriteResult r) : result(r), send_connect_msg(false) {}
+  };
+
+  // Handle readable events - contains all the business logic
+  ReadResultData handle_readable(ErlNifEnv* env, PoolContext* ctx);
+
+  // Handle writable events - contains all the business logic
+  WriteResultData handle_writable(ErlNifEnv* env, PoolContext* ctx);
+
+  //===========================================================================
+  // Connection Establishment Methods
+  //===========================================================================
+
+  // Result types for connection operations
+  enum class ConnectResult {
+    OK,                 // Connection established successfully, slot ready
+    CONNECTING,         // Connection in progress, slot reserved
+    FAILED,             // Connection failed
+    STRIPE_FULL,        // No available slots in stripe
+    SOCKET_FAILED,      // Socket creation failed
+    CONFIG_FAILED,      // Socket configuration failed
+    SELECT_FAILED,      // Event registration failed
+    SSL_FAILED          // SSL setup/handshake failed
+  };
+
+  struct ConnectResultData {
+    ConnectResult result;
+    int           slot_id; // Valid slot ID for successful connections
+    TERM     error_reason; // Specific error atom for failures
+
+    ConnectResultData(ConnectResult r, int slot = -1)
+      : result(r), slot_id(slot), error_reason(am_unknown) {}
+    ConnectResultData(ConnectResult r, int slot, TERM reason)
+      : result(r), slot_id(slot), error_reason(reason) {}
+  };
+
+  // Protocol-aware connection establishment
+  static ConnectResultData connect_proto(ErlNifEnv* env, PoolContext* ctx,
+                                       unsigned int stripe_id,
+                                       const IP4Tuple& octets,
+                                       int port, unsigned int timeout_ms,
+                                       ProtocolType protocol, bool nodelay,
+                                       const ErlNifPid& owner_pid);
+
+  // Protocol-aware async connection establishment
+  static ConnectResultData connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
+                                             unsigned int stripe_id,
+                                             const IP4Tuple& octets,
+                                             int port, ProtocolType protocol, bool nodelay,
+                                             const ErlNifPid& owner_pid);
+
+  //===========================================================================
+  // Send and Release Method
+  //===========================================================================
+
+  // Result types for send and release operations
+  enum class SendResult {
+    OK,                 // Data sent successfully, slot released
+    PARTIAL,            // Partial write, slot still leased for completion
+    POOL_BUSY,          // No available slots in stripe
+    WRITE_FAILED,       // Write operation failed, connection closed
+    CLOSED              // Connection closed during operation
+  };
+
+  struct SendResultData {
+    SendResult result;
+    int        slot_id; // Slot ID used for the operation
+    TERM  error_reason; // Specific error atom for failures
+
+    SendResultData(SendResult r, int slot = -1)
+      : result(r), slot_id(slot), error_reason(am_unknown) {}
+    SendResultData(SendResult r, int slot, TERM reason)
+      : result(r), slot_id(slot), error_reason(reason) {}
+  };
+
+  // Send data and release slot (with automatic retry and slot selection)
+  static SendResultData send_and_release(ErlNifEnv* env, PoolContext* ctx,
+                                        unsigned int stripe_id,
+                                        ERL_NIF_TERM data_list);
+
+  // Connection establishment with socket options
+  static ConnectResultData connect_with_opts(ErlNifEnv* env, PoolContext* ctx,
+                                            unsigned int stripe_id,
+                                            const IP4Tuple& octets,
+                                            int port, unsigned int timeout_ms,
+                                            bool nodelay, const ErlNifPid& owner_pid,
+                                            ERL_NIF_TERM socket_opts);
+
+  // Protocol-aware connection establishment with socket options
+  static ConnectResultData connect_proto_with_opts(ErlNifEnv* env, PoolContext* ctx,
+                                                  unsigned int stripe_id,
+                                                  const IP4Tuple& octets,
+                                                  int port, unsigned int timeout_ms,
+                                                  ProtocolType protocol, bool nodelay,
+                                                  const ErlNifPid& owner_pid,
+                                                  ERL_NIF_TERM socket_opts);
+
+  //===========================================================================
+  // FIFO Operations Methods
+  //===========================================================================
+
+  // Result types for FIFO operations
+  enum class FifoResult {
+    OK,                    // Operation completed successfully
+    REQUEST_SENT,          // FIFO request sent (partial or complete)
+    POOL_BUSY,            // No available slots in stripe
+    SLOT_BUSY,            // FIFO slot is already busy
+    PARTIAL,              // Partial operation, needs retry
+    WRITE_FAILED,         // Write operation failed
+    TIMEOUT,              // Operation timed out
+    INVALID_RESERVATION,  // Invalid reservation ID
+    NOT_ENABLED           // FIFO mode not enabled
+  };
+
+  struct FifoResultData {
+    FifoResult result;
+    int slot_id;                // Valid slot ID for successful operations
+    uint64_t reservation_id;    // Reservation ID for FIFO operations
+    TERM error_reason;          // Specific error atom for failures
+
+    FifoResultData(FifoResult r, int slot = -1, uint64_t res_id = 0)
+      : result(r), slot_id(slot), reservation_id(res_id), error_reason(am_unknown) {}
+    FifoResultData(FifoResult r, int slot, uint64_t res_id, TERM reason)
+      : result(r), slot_id(slot), reservation_id(res_id), error_reason(reason) {}
+  };
+
+  // Reserve slot and send FIFO request atomically (performance optimization)
+  static FifoResultData reserve_send_fifo_request(ErlNifEnv* env, PoolContext* ctx,
+                                                 unsigned int stripe_id,
+                                                 ERL_NIF_TERM data_list,
+                                                 unsigned int reserv_timeout,
+                                                 unsigned int req_timeout);
 };
 
 } // namespace arterial

@@ -37,8 +37,8 @@ pool_initialization_test() ->
                 ?assert(false); % This should not happen
             {error, _} ->
                 io:format("Good: Got expected connection error instead of stripe_full~n");
-            {ok, _} ->
-                io:format("Note: Connection succeeded (port might be reachable)~n")
+            {ok, _, _} ->
+                io:format("Note: Connection in progress (port might be reachable)~n")
         end,
 
         %% Validate that pool state is as expected

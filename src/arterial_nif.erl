@@ -44,7 +44,7 @@ group membership management. See `connect_proto_with_opts/9`.
 -export([init/0]).
 -export([init_pool/2, configure_throttle/3, register_socket/4, connect/7, connect_async/6, connect_proto/8, connect_async_proto/7, send_and_release/3]).
 -export([connect_with_opts/8, connect_proto_with_opts/9]).
--export([handle_readable/3, handle_writable/3, close_slot/3]).
+-export([handle_readable/3, handle_writable/3, close_slot/3, handle_connection_timeout/3]).
 -export([is_slot_available/3, set_slot_available/3, set_slot_unavailable/3]).
 -export([reserve_fifo_connection/3, send_fifo_request/6, release_fifo_connection/4, fifo_connection_status/3, handle_fifo_reply/4]).
 -export([reserve_send_fifo_request/5]). % New combined function (#3)
@@ -259,7 +259,7 @@ to know which physical connection carried this write (e.g. to record
 alongside a request's correlation id for later disconnect-notification
 bookkeeping, see `arterial_connection`).
 
-`{error, no_connections_available}` if every slot in `StripeId` is
+`{error, pool_busy}` if every slot in `StripeId` is
 currently unregistered or already leased (busy writing/flushing) --
 callers are expected to retry against a different `StripeId` themselves
 (see `arterial_client`); this NIF never spreads one logical request
@@ -274,7 +274,7 @@ across stripes.
 """.
 -spec send_and_release(pool_ref(), non_neg_integer(), [binary()]) ->
   {ok, non_neg_integer()} |
-  {error, no_connections_available | write_failed}.
+  {error, pool_busy | write_failed}.
 send_and_release(_PoolRef, _StripeId, _IoList) ->
   ?NOT_LOADED_ERROR.
 
@@ -346,6 +346,29 @@ ok
 """.
 -spec close_slot(pool_ref(), non_neg_integer(), non_neg_integer()) -> ok.
 close_slot(_PoolRef, _StripeId, _SlotId) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Handle connection timeout by cleaning up the connection slot and releasing resources.
+This function should be called when a connection timeout message is received.
+
+## Parameters
+- `PoolRef`: Reference to the connection pool
+- `StripeId`: Stripe identifier
+- `SlotId`: Slot identifier
+
+## Returns
+`ok` on successful cleanup.
+
+## Examples
+```
+% Called when timeout message received
+1> arterial_nif:handle_connection_timeout(PoolRef, StripeId, SlotId).
+ok
+```
+""".
+-spec handle_connection_timeout(pool_ref(), non_neg_integer(), non_neg_integer()) -> ok.
+handle_connection_timeout(_PoolRef, _StripeId, _SlotId) ->
   ?NOT_LOADED_ERROR.
 
 -doc """
@@ -552,7 +575,7 @@ for error handling flexibility.
 ## Returns
 
 - `{ok, fifo_request_sent, StripeId, SlotId, ReservationId}`: Success
-- `{error, no_connections_available}`: All connections busy (after waiting)
+- `{error, pool_busy}`: All connections busy (after waiting)
 - `{error, write_failed}`: Failed to write to socket
 - `{error, timeout}`: Timeout during reservation or send
 """.

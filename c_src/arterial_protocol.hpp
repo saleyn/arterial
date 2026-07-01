@@ -186,7 +186,7 @@ struct ProtocolHandler<PROTO_SSL> {
     }
 
     // TCP is connected, now perform SSL handshake
-    int handshake_result = ssl_handshake_blocking(slot, 5000);
+    int handshake_result = ssl_handshake_nonblocking(slot, 5000);
     if (handshake_result == 1) {
       slot.status.store(SLOT_AVAILABLE, std::memory_order_release);
       return 1; // SSL handshake completed
