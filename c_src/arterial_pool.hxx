@@ -159,22 +159,26 @@ inline PoolUtilization PoolContext::calculate_pool_utilization() {
   };
 }
 
-// Invoked by the runtime once it's safe to close a fd that was selected
+// Invoked by the runtime once it's safe to close a fd that was selected.
+// Scans slots for the fd; if already cleared by handle_connection_timeout_nif
+// (conn.fd=-1 set before SELECT_STOP), closes via the event parameter.
 void PoolContext::pool_resource_stop(PoolContext* ctx, ErlNifEnv*, ErlNifEvent fd, int) {
   for (auto& stripe_ptr : ctx->stripes) {
     auto& stripe = *stripe_ptr;
     for (auto& slot : stripe.slots) {
       if (slot.fd == fd) {
-        close(slot.fd);
         slot.fd = -1;
         slot.pending_buffer.clear();
         slot.bytes_written = 0;
         slot.status.store(SLOT_EMPTY, std::memory_order_release);
         stripe.lease_mask.fetch_and(~(1ULL << slot.slot_id), std::memory_order_release);
+        close(fd);
         return;
       }
     }
   }
+  // fd was already cleared from the slot (timeout path) — close it here.
+  close(fd);
 }
 
 // FIFO types are defined in arterial_fifo.hpp and will be available after include
@@ -226,7 +230,6 @@ int PoolContext::claim_slot(
           current_mask, new_mask,
           std::memory_order_release,
           std::memory_order_relaxed)) {
-      slot.arm_read(env, this); // TODO: handle error
       return slot_id;
     }
 
@@ -240,9 +243,11 @@ int PoolContext::claim_slot(
 inline ERL_NIF_TERM PoolContext::claim_slot_term(
   ErlNifEnv* env, PoolStripe& stripe, int fd, ErlNifPid owner_pid)
 {
-  auto   res = claim_slot(env, stripe, fd, owner_pid);
-  return res >= 0 ? make_tuple(env, am_ok,    res)
-                  : make_tuple(env, am_error, am_stripe_full);
+  auto res = claim_slot(env, stripe, fd, owner_pid);
+  if (res < 0)
+    return make_tuple(env, am_error, am_stripe_full);
+  stripe.slots[res].arm_read(env, this);
+  return make_tuple(env, am_ok, res);
 }
 
 

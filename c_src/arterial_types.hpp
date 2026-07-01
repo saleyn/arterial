@@ -2,9 +2,14 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <utility>  // for std::exchange
+#include <unistd.h> // for close()
 #include "enif.hpp"
 
 namespace arterial {
+
+using IP4Tuple =
+  std::tuple<unsigned int, unsigned int, unsigned int, unsigned int>;
 
 //=============================================================================
 // Core Types and Enumerations
@@ -28,6 +33,94 @@ enum ProtocolType : uint32_t {
   PROTO_TCP,
   PROTO_UDP,
   PROTO_SSL
+};
+
+//=============================================================================
+// RAII File Descriptor Wrapper
+//=============================================================================
+
+/// @brief RAII wrapper for POSIX file descriptors
+///
+/// Automatically closes file descriptors when the object goes out of scope.
+/// Supports move semantics and prevents accidental copying.
+///
+/// @example
+/// ```cpp
+/// auto timer_fd = FileDescriptor::create([]() {
+///   return timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+/// });
+/// if (timer_fd) {
+///   // Use timer_fd.get() with enif_select
+///   // Automatic cleanup when timer_fd goes out of scope
+/// }
+/// ```
+class FileDescriptor {
+public:
+  /// @brief Default constructor - creates invalid fd
+  FileDescriptor() noexcept = default;
+
+  /// @brief Explicit constructor from file descriptor
+  /// @param fd File descriptor to manage (must be valid)
+  explicit FileDescriptor(int fd) noexcept : m_fd(fd) {}
+
+  /// @brief Destructor - automatically closes the file descriptor
+  ~FileDescriptor() noexcept {
+    close();
+  }
+
+  /// @brief Move constructor
+  FileDescriptor(FileDescriptor&& other) noexcept
+    : m_fd(std::exchange(other.m_fd, INVALID_FD)) {}
+
+  /// @brief Move assignment operator
+  FileDescriptor& operator=(FileDescriptor&& other) noexcept {
+    if (this != &other) {
+      close();
+      m_fd = std::exchange(other.m_fd, INVALID_FD);
+    }
+    return *this;
+  }
+
+  /// @brief Copy operations are deleted to prevent double-close
+  FileDescriptor(const FileDescriptor&) = delete;
+  FileDescriptor& operator=(const FileDescriptor&) = delete;
+
+  /// @brief Factory method for safe fd creation
+  /// @param creator Function that creates the file descriptor
+  /// @return FileDescriptor wrapper, or empty wrapper if creation failed
+  template<typename Creator>
+  static FileDescriptor create(Creator&& creator) {
+    int fd = creator();
+    return (fd >= 0) ? FileDescriptor(fd) : FileDescriptor();
+  }
+
+  /// @brief Get the raw file descriptor
+  /// @return File descriptor value, or INVALID_FD if not valid
+  int get() const noexcept { return m_fd; }
+
+  explicit operator int() const { return m_fd; }
+
+  /// @brief Check if the file descriptor is valid
+  /// @return true if fd >= 0
+  bool is_valid() const noexcept { return m_fd >= 0; }
+
+  /// @brief Boolean conversion - true if valid
+  explicit operator bool() const noexcept { return is_valid(); }
+
+  /// @brief Release ownership of the file descriptor
+  /// @return The file descriptor value (caller becomes responsible for closing)
+  int release() noexcept { return std::exchange(m_fd, INVALID_FD); }
+
+  /// @brief Reset to a new file descriptor (closes current fd)
+  /// @param fd New file descriptor to manage
+  void reset(int fd = INVALID_FD) noexcept { close(); m_fd = fd; }
+
+  /// @brief Manual close (safe to call multiple times)
+  void close() noexcept { if (m_fd >= 0) reset(); }
+
+private:
+  static constexpr int INVALID_FD = -1;
+  int m_fd = INVALID_FD;
 };
 
 //=============================================================================

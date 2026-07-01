@@ -1,6 +1,7 @@
 #pragma once
 
 #include "enif.hpp"
+#include "arterial_types.hpp"
 
 namespace arterial {
 
@@ -81,8 +82,7 @@ inline bool set_addr_sockopt(
     [=](auto& tup) {
       auto& maddr = std::get<0>(tup);
       auto& iaddr = std::get<1>(tup);
-      using FourOctetsT = std::tuple<unsigned int, unsigned int, unsigned int, unsigned int>;
-      FourOctetsT mcast_addr, if_addr;
+      IP4Tuple mcast_addr, if_addr;
       if (!get(env, maddr, mcast_addr) || !get(env, iaddr, if_addr)) {
         return false;
       }
@@ -213,48 +213,55 @@ bool apply_sock_opts(int fd, ErlNifEnv* env, ERL_NIF_TERM options_list, ERL_NIF_
     int                 tuple_arity;
 
     if (enif_is_atom(env, head)) {
-      // Handle common atom-based options
-      if  (!arterial::set_atom_sockopt(head, am_keepalive, fd, SOL_SOCKET,  SO_KEEPALIVE, err)
-        && !arterial::set_atom_sockopt(head, am_nodelay,   fd, IPPROTO_TCP, TCP_NODELAY, err)
-        && !arterial::set_atom_sockopt(head, am_reuseaddr, fd, SOL_SOCKET,  SO_REUSEADDR, err)
-      )
+      // Handle common atom-based options - try each one until one matches
+      if  (arterial::set_atom_sockopt(head, am_keepalive, fd, SOL_SOCKET,  SO_KEEPALIVE, err)
+        || arterial::set_atom_sockopt(head, am_nodelay,   fd, IPPROTO_TCP, TCP_NODELAY, err)
+        || arterial::set_atom_sockopt(head, am_reuseaddr, fd, SOL_SOCKET,  SO_REUSEADDR, err)
+      ) {
+        // One of the options matched and was set successfully
+        continue;
+      } else {
+        // If none of the atom options matched, that's an error
+        err = am_invalid_option;
         return false;
+      }
     } else if (enif_get_tuple(env, head, &tuple_arity, &tuple_elements) && tuple_arity == 2 &&
                enif_is_atom(env, tuple_elements[0])) {
-      // Handle tuple-based options {Option, Value}
-      if  (!arterial::set_int_or_bool_sockopt(env, tuple_elements, am_keepalive, fd, SOL_SOCKET,  SO_KEEPALIVE, err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_nodelay,   fd, IPPROTO_TCP, TCP_NODELAY, err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_linger,
+      // Handle tuple-based options {Option, Value} - try each one until one matches
+      if  (arterial::set_int_or_bool_sockopt(env, tuple_elements, am_keepalive, fd, SOL_SOCKET,  SO_KEEPALIVE, err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_nodelay,   fd, IPPROTO_TCP, TCP_NODELAY, err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_linger,
             [fd](int v) {
               struct linger l = {.l_onoff = 1, .l_linger = v /* seconds */};
               return setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
             }, err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_reuseaddr,     fd, SOL_SOCKET,  SO_REUSEADDR,     err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_sndbuf,        fd, SOL_SOCKET,  SO_SNDBUF,        err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_rcvbuf,        fd, SOL_SOCKET,  SO_RCVBUF,        err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_priority,      fd, SOL_SOCKET,  SO_PRIORITY,      err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_tos,           fd, IPPROTO_IP,  IP_TOS,           err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_user_timeout,  fd, IPPROTO_TCP, TCP_USER_TIMEOUT, err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_cork,          fd, IPPROTO_TCP, TCP_CORK,         err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_quickack,      fd, IPPROTO_TCP, TCP_QUICKACK,     err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_rcvlowat,      fd, SOL_SOCKET,  SO_RCVLOWAT,      err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_sndlowat,      fd, SOL_SOCKET,  SO_SNDLOWAT,      err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_keepidle,      fd, IPPROTO_TCP, TCP_KEEPIDLE,     err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_keepintvl,     fd, IPPROTO_TCP, TCP_KEEPINTVL,    err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_keepcnt,       fd, IPPROTO_TCP, TCP_KEEPCNT,      err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_multicast_ttl,
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_reuseaddr,     fd, SOL_SOCKET,  SO_REUSEADDR,     err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_sndbuf,        fd, SOL_SOCKET,  SO_SNDBUF,        err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_rcvbuf,        fd, SOL_SOCKET,  SO_RCVBUF,        err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_recvbuf,       fd, SOL_SOCKET,  SO_RCVBUF,        err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_priority,      fd, SOL_SOCKET,  SO_PRIORITY,      err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_tos,           fd, IPPROTO_IP,  IP_TOS,           err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_user_timeout,  fd, IPPROTO_TCP, TCP_USER_TIMEOUT, err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_cork,          fd, IPPROTO_TCP, TCP_CORK,         err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_quickack,      fd, IPPROTO_TCP, TCP_QUICKACK,     err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_rcvlowat,      fd, SOL_SOCKET,  SO_RCVLOWAT,      err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_sndlowat,      fd, SOL_SOCKET,  SO_SNDLOWAT,      err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_keepidle,      fd, IPPROTO_TCP, TCP_KEEPIDLE,     err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_keepintvl,     fd, IPPROTO_TCP, TCP_KEEPINTVL,    err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_keepcnt,       fd, IPPROTO_TCP, TCP_KEEPCNT,      err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_multicast_ttl,
             [fd](int v) {
               unsigned char ttl = (unsigned char)v;
               return setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
             }, err)
-        && !arterial::set_int_or_bool_sockopt(env, tuple_elements, am_multicast_loop, fd, IPPROTO_IP, IP_MULTICAST_LOOP, err)
-        && !arterial::set_tuple_sockopt<std::tuple<bool, int>>(env, tuple_elements, am_linger,
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_multicast_loop, fd, IPPROTO_IP, IP_MULTICAST_LOOP, err)
+        || arterial::set_tuple_sockopt<std::tuple<bool, int>>(env, tuple_elements, am_linger,
             [fd](const std::tuple<bool, int>& tup) {
               struct linger l = {.l_onoff = std::get<0>(tup) ? 1 : 0, .l_linger = std::get<1>(tup) /* seconds */};
               return setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
             }, err)
         // Handle {multicast_if, {A, B, C, D}} format for interface address
-        && !set_tuple_sockopt<std::tuple<unsigned int, unsigned int, unsigned int, unsigned int>>
+        || set_tuple_sockopt<IP4Tuple>
             (env, tuple_elements, am_multicast_if,
             [fd](const auto& arg) {
               auto& [o0, o1, o2, o3] = arg;
@@ -263,11 +270,17 @@ bool apply_sock_opts(int fd, ErlNifEnv* env, ERL_NIF_TERM options_list, ERL_NIF_
               return setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &interface_addr, sizeof(interface_addr));
             }, err)
         // Handle {add_membership, {{A,B,C,D}, {E,F,G,H}}} format
-        && !set_addr_sockopt(env, tuple_elements, am_multicast_if, fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, err)
+        || set_addr_sockopt(env, tuple_elements, am_add_membership, fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, err)
         // Handle {drop_membership, {{A,B,C,D}, {E,F,G,H}}} format
-        && !set_addr_sockopt(env, tuple_elements, am_multicast_if, fd, IPPROTO_IP, IP_DROP_MEMBERSHIP, err)
-      )
+        || set_addr_sockopt(env, tuple_elements, am_drop_membership, fd, IPPROTO_IP, IP_DROP_MEMBERSHIP, err)
+      ) {
+        // One of the options matched and was set successfully
+        continue;
+      } else {
+        // If none of the tuple options matched, that's an error
+        err = am_invalid_option;
         return false;
+      }
     } else {
       return false;
     }

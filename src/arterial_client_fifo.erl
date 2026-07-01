@@ -79,7 +79,7 @@ unaffected. FIFO modes are purely additive functionality.
 }.
 
 -type fifo_error() ::
-  no_connections_available |
+  pool_busy |
   fifo_init_failed |
   invalid_reservation |
   fifo_not_enabled |
@@ -122,7 +122,7 @@ is called or the reservation times out.
 ## Returns
 
 - `{ok, Reservation}`: Successfully reserved connection
-- `{error, no_connections_available}`: All connections busy
+- `{error, pool_busy}`: All connections busy
 - `{error, fifo_init_failed}`: Failed to initialize FIFO extension
 
 ## Example
@@ -369,7 +369,7 @@ and resource cleanup.
 ## Returns
 
 - `{ok, Reply, Reservation}`: Successfully received reply, must release reservation
-- `{error, no_connections_available}`: All connections busy after timeout
+- `{error, pool_busy}`: All connections busy after timeout
 - `{error, write_failed}`: Failed to send request to socket
 - `{error, timeout}`: No reply received within timeout
 - `{error, fifo_init_failed}`: Failed to initialize FIFO extension

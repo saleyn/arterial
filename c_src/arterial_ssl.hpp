@@ -12,8 +12,7 @@ namespace arterial {
 
 // Forward declarations for SSL functions used in connection handling
 static bool setup_ssl_on_socket(Connection& slot, int fd);
-static int  ssl_handshake_blocking(Connection& slot, int timeout_ms);
-static int  ssl_handshake_step(Connection& slot);
+static int  ssl_handshake_nonblocking(Connection& slot, int timeout_ms);
 
 // Global SSL context - initialized once
 static SSL_CTX* g_ssl_ctx = nullptr;
@@ -125,18 +124,16 @@ static bool setup_ssl_on_socket(Connection& slot, int fd) {
 
   // Ensure socket has adequate buffers for SSL handshake
   int bufsize = 65536;
-  if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize)) != 0) {
+  if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize)) != 0)
     fprintf(stderr, "Failed to set receive buffer size: %s\n", strerror(errno));
-  }
-  if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize)) != 0) {
+
+  if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize)) != 0)
     fprintf(stderr, "Failed to set send buffer size: %s\n", strerror(errno));
-  }
 
   // Disable Nagle algorithm for SSL (can interfere with handshake)
   int nodelay = 1;
-  if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) != 0) {
+  if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) != 0)
     fprintf(stderr, "Failed to set TCP_NODELAY: %s\n", strerror(errno));
-  }
 
 
   // Clean up any existing SSL object first
@@ -178,14 +175,14 @@ static bool setup_ssl_on_socket(Connection& slot, int fd) {
 // SSL handshake step with proper I/O event handling
 // Returns: 1 = completed, 0 = need read, -2 = need write, -1 = failed
 // TODO: make handshake non-blocking
-static int ssl_handshake_blocking(Connection& slot, int /*timeout_ms*/) {
-  if (!slot.ssl) return -1;
+static int ssl_handshake_nonblocking(Connection& slot, int /*timeout_ms*/) {
+  if (!slot.ssl) [[unlikely]]
+    return -1;
 
   // Ensure socket is in non-blocking mode
   int flags = fcntl(slot.fd, F_GETFL);
-  if (flags != -1 && !(flags & O_NONBLOCK)) {
+  if (flags != -1 && !(flags & O_NONBLOCK))
     fcntl(slot.fd, F_SETFL, flags | O_NONBLOCK);
-  }
 
   // Attempt SSL handshake
   int result = SSL_connect(slot.ssl);
@@ -201,12 +198,6 @@ static int ssl_handshake_blocking(Connection& slot, int /*timeout_ms*/) {
     case SSL_ERROR_WANT_WRITE: return -2; // Need to write more data
     default:                   return -1; // Actual error
   }
-}
-
-// Non-blocking SSL handshake step (kept for compatibility but prefer blocking version)
-static int ssl_handshake_step(Connection& slot) {
-  // For async connections, use blocking handshake with short timeout
-  return ssl_handshake_blocking(slot, 3000);  // 3 second timeout
 }
 
 } // namespace arterial

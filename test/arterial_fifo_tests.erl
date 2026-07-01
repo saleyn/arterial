@@ -89,7 +89,7 @@ test_fifo_reservation() ->
           % Clean up first reservation
           ok = arterial_client_fifo:release_connection(Reservation1)
       end;
-    {error, no_connections_available} ->
+    {error, pool_busy} ->
       % Expected behavior when no server is listening - test passes
       ok;
     {error, timeout} ->
@@ -119,7 +119,7 @@ test_fifo_request_send() ->
       % Clean up
       ok = arterial_client_fifo:release_connection(Reservation);
 
-    {error, no_connections_available} ->
+    {error, pool_busy} ->
       % Expected when no server is listening - test validates error handling
       ok;
 
@@ -143,7 +143,7 @@ test_fifo_connection_release() ->
         {error, _} ->
           ok = arterial_client_fifo:release_connection(Res1)
       end;
-    {error, no_connections_available} ->
+    {error, pool_busy} ->
       ok;  % Expected when no server available
     {error, timeout} ->
       ok   % Also acceptable
@@ -191,7 +191,7 @@ test_fifo_status_monitoring() ->
       % Clean up
       ok = arterial_client_fifo:release_connection(Reservation);
 
-    {error, no_connections_available} ->
+    {error, pool_busy} ->
       ok;  % Expected when no server available
 
     {error, timeout} ->
@@ -226,7 +226,7 @@ test_fifo_isolation() ->
 
       % Clean up
       ok = arterial_client_fifo:release_connection(FIFORes);
-    {error, no_connections_available} ->
+    {error, pool_busy} ->
       ok;  % Expected when no server available
     {error, timeout} ->
       ok   % Also acceptable
@@ -339,7 +339,7 @@ test_fifo_end_to_end_mock() ->
       % 4. Clean up
       ok = arterial_client_fifo:release_connection(Reservation);
 
-    {error, no_connections_available} ->
+    {error, pool_busy} ->
       ok;  % Expected when no server available
 
     {error, timeout} ->

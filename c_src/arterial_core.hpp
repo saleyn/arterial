@@ -36,8 +36,13 @@ using namespace nifpp;
 struct PoolStripe;
 
 //=============================================================================
-// Utility Functions
+// NIF Utility Functions
 //=============================================================================
+
+// Resolve {PoolRef, StripeId, SlotId} to a Connection&, or nullptr if any index is out of range.
+// This is used by handle_readable/3, handle_writable/3, close_slot/3, etc.
+inline Connection* resolve_slot(
+  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[], PoolContext** out_ctx);
 
 // Time spacing throttling check - returns true if the request was allowed
 inline bool throttle_allow(PoolContext* ctx, Connection& slot);
@@ -72,6 +77,30 @@ inline bool set_sockopt_by_name(const char* opt_name, const char* target_name,
 
 // Implementation of functions that require complete PoolContext definition
 namespace arterial {
+
+// Resolve {PoolRef, StripeId, SlotId} to a Connection&, or nullptr if any index is out of range
+inline Connection* resolve_slot(
+  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[], PoolContext** out_ctx)
+{
+  PoolContext* ctx;
+  unsigned int stripe_id, slot_id;
+
+  assert(argc == 3);
+
+  if  (!get(env, argv[0], ctx)
+    || !ctx
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
+    || !ctx->stripes[stripe_id]
+    || !get(env, argv[2], slot_id)) [[unlikely]]
+    return nullptr;
+
+  auto& stripe = *ctx->stripes[stripe_id];
+  if (slot_id >= stripe.capacity) [[unlikely]]
+    return nullptr;
+
+  *out_ctx = ctx;
+  return &stripe.slots[slot_id];
+}
 
 // Time spacing throttling check - returns true if the request was allowed
 inline bool throttle_allow(PoolContext* ctx, Connection& slot) {

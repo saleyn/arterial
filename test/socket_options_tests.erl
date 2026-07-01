@@ -30,6 +30,8 @@ basic_tcp_socket_options_test() ->
   % We expect either success or connect_failed (since nothing is listening
   % on 12345) but NOT socket_option_failed
   case Result of
+    {ok, connecting, _SlotId} ->
+      io:format("Basic TCP socket options test: CONNECTION IN PROGRESS~n");
     {ok, _SlotId} ->
       io:format("Basic TCP socket options test: SUCCESS~n");
     {error, connect_failed} ->
