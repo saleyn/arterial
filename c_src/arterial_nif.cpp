@@ -40,7 +40,6 @@
 using namespace nifpp;
 using namespace arterial;
 
-
 //===========================================================================
 // NIFs
 //===========================================================================
@@ -61,8 +60,7 @@ static ERL_NIF_TERM init_pool_nif(
   if (slots_per_stripe > 64)
     return make_tuple(env, am_error, am_max_slots_exceeded_64);
 
-  auto ctx = construct_resource_with_events<PoolContext>(
-    resource_events<PoolContext>(nullptr, PoolContext::pool_resource_stop));
+  auto ctx = construct_resource<PoolContext>();
 
   ctx->stripe_count = num_stripes;
   ctx->stripes.resize(num_stripes);
@@ -86,6 +84,14 @@ static ERL_NIF_TERM init_pool_nif(
       stripe.slots[j].status.store(SLOT_EMPTY, std::memory_order_relaxed);
     }
   }
+
+  // Start the reactor — it runs on its own thread for this pool's lifetime.
+  // Pass the calling process as owner so it receives
+  // {arterial_reactor_exit, Ident, Errno} if the reactor exits abnormally.
+  ErlNifPid owner_pid;
+  enif_self(env, &owner_pid);
+  ctx->reactor_ptr = std::make_unique<arterial::Reactor>("arterial_pool");
+  ctx->reactor_ptr->Start(owner_pid);
 
   return make_tuple(env, am_ok, ctx);
 }
@@ -141,9 +147,23 @@ static ERL_NIF_TERM register_socket_nif(
   auto& stripe = *ctx->stripes[stripe_id];
   int   flags  = fcntl(raw_fd, F_GETFL, 0);
 
-  return UNLIKELY(flags == -1 || fcntl(raw_fd, F_SETFL, flags | O_NONBLOCK) == -1)
-       ? make_tuple(env, am_error, am_failed_to_set_nonblocking)
-       : ctx->claim_slot_term(env, stripe, raw_fd, owner_pid);
+  if (UNLIKELY(flags == -1 || fcntl(raw_fd, F_SETFL, flags | O_NONBLOCK) == -1))
+    return make_tuple(env, am_error, am_failed_to_set_nonblocking);
+
+  int slot_id = ctx->claim_slot(env, stripe, raw_fd, owner_pid);
+  if (slot_id < 0)
+    return make_tuple(env, am_error, am_stripe_full);
+
+  Connection& conn = stripe.slots[slot_id];
+  conn.arm_read(env, ctx);
+
+  if (ctx->monitor_owner(env, conn) != 0) {
+    ctx->reactor().RemoveFd(raw_fd);
+    stripe.release_slot(slot_id);
+    return make_tuple(env, am_error, am_connect_failed);
+  }
+
+  return make_tuple(env, am_ok, slot_id);
 }
 
 //-----------------------------------------------------------------------------
@@ -210,20 +230,28 @@ static ERL_NIF_TERM connect_nif(
   // Claim slot and setup timeout if needed
   auto slot_result = ctx->claim_slot(env, stripe, fd, owner_pid);
   if (slot_result < 0) {
+    close(fd);
     return make_tuple(env, am_error, am_stripe_full);
+  }
+
+  Connection& conn = stripe.slots[slot_result];
+
+  // Monitor the owner: if it dies the on_down callback closes the slot.
+  if (ctx->monitor_owner(env, conn) != 0) {
+    stripe.release_slot(slot_result);
+    close(fd);
+    return make_tuple(env, am_error, am_connect_failed);
   }
 
   // Set up connection timeout using RAII if timeout_ms > 0
   if (timeout_ms > 0) {
-    Connection& conn = stripe.slots[slot_result];
     int timeout_fd = setup_connection_timeout_fd(conn, timeout_ms);
     if (timeout_fd < 0) {
-      // Failed to set up RAII timeout - clean up and return error
+      ctx->demonitor_owner(env, conn);
       stripe.release_slot(slot_result);
       close(fd);
       return make_tuple(env, am_error, am_timeout_setup_failed);
     }
-    // Note: timeout_fd should be registered with enif_select by the connection code
   }
 
   return make_tuple(env, am_ok, slot_result);
@@ -282,10 +310,7 @@ static ERL_NIF_TERM connect_async_nif(
     return make_tuple(env, am_error, am_connect_failed);
   }
 
-  // Use the centralized claim_slot function for consistent slot allocation
   int slot_id = ctx->claim_slot(env, stripe, fd, owner_pid);
-
-  // Check if slot claiming failed
   if (slot_id < 0) {
     close(fd);
     return make_tuple(env, am_error, am_stripe_full);
@@ -293,19 +318,24 @@ static ERL_NIF_TERM connect_async_nif(
 
   auto& conn = stripe.slots[slot_id];
 
+  if (ctx->monitor_owner(env, conn) != 0) {
+    stripe.release_slot(slot_id);
+    close(fd);
+    return make_tuple(env, am_error, am_connect_failed);
+  }
+
   if (rc == 0) {
     // Connection completed immediately
     conn.status.store(SLOT_AVAILABLE, std::memory_order_release);
-    conn.arm_read(env, ctx); // TODO: error handling?
+    conn.arm_read(env, ctx);
     return make_tuple(env, am_ok, slot_id);
   }
 
-  // Connection in progress - arm write notification for completion
+  // Connection in progress — arm write notification for completion
   conn.status.store(SLOT_CONNECTING, std::memory_order_release);
 
-  // Check if select registration succeeds
   if (conn.arm_connect(env, ctx) < 0) {
-    // Revert status, clear lease bit, and return error
+    ctx->demonitor_owner(env, conn);
     conn.status.store(SLOT_EMPTY, std::memory_order_release);
     stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
     close(conn.fd);
@@ -347,6 +377,115 @@ static ERL_NIF_TERM send_and_release_nif(
     default:
       return make_tuple(env, am_error, am_unknown);
   }
+}
+
+//-----------------------------------------------------------------------------
+// send_on_slot(PoolRef, StripeId, SlotId, DataList) → ok | {error, Reason}
+//
+// Like send_and_release but writes on a *specific* slot instead of scanning
+// for any free one.  Required when multiple workers share a stripe and each
+// must send on its own connection (otherwise send_and_release may pick a
+// neighbour's slot, routing the reply to the wrong process).
+//-----------------------------------------------------------------------------
+static ERL_NIF_TERM send_on_slot_nif(
+  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
+{
+  PoolContext*  ctx;
+  unsigned int  stripe_id, slot_id;
+
+  assert(argc == 4);
+
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count - 1))
+    || !get(env, argv[2], slot_id)
+    || !enif_is_list(env, argv[3])) [[unlikely]]
+    return enif_make_badarg(env);
+
+  auto& stripe = *ctx->stripes[stripe_id];
+  if (slot_id >= stripe.capacity) [[unlikely]]
+    return enif_make_badarg(env);
+
+  auto& conn = stripe.slots[slot_id];
+
+  // Atomically claim this specific slot by setting its lease bit.
+  uint64_t target_bit = 1ULL << slot_id;
+  uint64_t expected   = stripe.lease_mask.load(std::memory_order_relaxed) & ~target_bit;
+  uint64_t desired    = expected | target_bit;
+
+  for (int retries = 0; retries < 32; ++retries) {
+    if (stripe.lease_mask.compare_exchange_weak(
+          expected, desired,
+          std::memory_order_acquire,
+          std::memory_order_relaxed))
+      goto claimed;
+    expected &= ~target_bit;  // clear our bit in the refreshed expected value
+    desired   = expected | target_bit;
+  }
+  return make_tuple(env, am_error, am_pool_busy);
+
+claimed:
+  if (conn.status.load(std::memory_order_acquire) != SLOT_AVAILABLE || conn.fd < 0) {
+    stripe.lease_mask.fetch_and(~target_bit, std::memory_order_release);
+    return make_tuple(env, am_error, am_pool_busy);
+  }
+  conn.status.store(SLOT_LEASED, std::memory_order_relaxed);
+
+  // Build iovec from the data list and writev directly to conn.fd.
+  unsigned int list_len = 0;
+  enif_get_list_length(env, argv[3], &list_len);
+
+  constexpr size_t s_inline_iov_size = 8;
+  std::array<struct iovec, s_inline_iov_size> inline_iov;
+  std::vector<struct iovec> heap_iov;
+  struct iovec* iov = (list_len <= s_inline_iov_size)
+    ? inline_iov.data()
+    : (heap_iov.resize(list_len), heap_iov.data());
+
+  ERL_NIF_TERM head, tail = argv[3];
+  unsigned int i = 0;
+  size_t total_bytes = 0;
+  while (enif_get_list_cell(env, tail, &head, &tail)) {
+    ErlNifBinary bin;
+    if (enif_inspect_binary(env, head, &bin)) {
+      iov[i].iov_base = bin.data;
+      iov[i].iov_len  = bin.size;
+      total_bytes    += bin.size;
+      ++i;
+    }
+  }
+
+  ssize_t written = 0;
+  if (i > 0) {
+  RETRY:
+    written = writev(conn.fd, iov, static_cast<int>(i));
+    if (written < 0) {
+      if (errno == EINTR) [[unlikely]] goto RETRY;
+      if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        ctx->notify_and_close(env, conn);
+        return make_tuple(env, am_error, am_write_failed);
+      }
+      written = 0;
+    }
+  }
+
+  if (static_cast<size_t>(written) < total_bytes) {
+    // Partial write: buffer remaining bytes and arm writable notification.
+    size_t done = static_cast<size_t>(written);
+    conn.pending_buffer.resize(total_bytes);
+    size_t off = 0;
+    for (unsigned int j = 0; j < i; ++j) {
+      std::memcpy(conn.pending_buffer.data() + off, iov[j].iov_base, iov[j].iov_len);
+      off += iov[j].iov_len;
+    }
+    conn.bytes_written = done;
+    conn.status.store(SLOT_WRITE_POLLING, std::memory_order_release);
+    conn.arm_write(env, ctx);
+    return am_ok;
+  }
+
+  conn.status.store(SLOT_AVAILABLE, std::memory_order_release);
+  stripe.lease_mask.fetch_and(~target_bit, std::memory_order_release);
+  return am_ok;
 }
 
 //-----------------------------------------------------------------------------
@@ -563,6 +702,14 @@ static ERL_NIF_TERM close_slot_nif(
     return enif_make_badarg(env);
   Connection& conn = *pconn;
 
+  // Bump generation BEFORE RemoveFd so any in-flight reactor callback that
+  // fires after this point sees a mismatched generation and skips the stale slot.
+  conn.generation.fetch_add(1, std::memory_order_release);
+
+  // Remove the owner monitor before clearing the slot — prevents a race where
+  // on_down fires after the slot is released and tries to close an already-dead fd.
+  ctx->demonitor_owner(env, conn);
+
   // Always clear the lease bit and status, even if fd==-1 (pool_resource_stop
   // may have already closed it). This is the authoritative cleanup point called
   // by arterial_connection after set_slot_unavailable sets the bit.
@@ -576,7 +723,9 @@ static ERL_NIF_TERM close_slot_nif(
   cleanup_slot_ssl(conn);
 #endif
 
-  enif_select(env, conn.fd, ERL_NIF_SELECT_STOP, ctx, nullptr, am_stop);
+  // Reactor closes the fd on its thread — no enif_select(STOP) needed.
+  ctx->reactor().RemoveFd(conn.fd);
+  conn.fd = -1;
   return am_ok;
 }
 
@@ -592,17 +741,18 @@ static ERL_NIF_TERM handle_connection_timeout_nif(
     return enif_make_badarg(env);
   Connection& conn = *pconn;
 
-  // Free the slot before touching any fds
+  // Bump generation before RemoveFd so in-flight callbacks see stale gen.
+  conn.generation.fetch_add(1, std::memory_order_release);
+
+  // Free the slot.
   conn.status.store(SLOT_EMPTY, std::memory_order_release);
   auto& stripe = *ctx->stripes[conn.stripe_id];
   stripe.lease_mask.fetch_and(~(1ULL << conn.slot_id), std::memory_order_release);
 
-  // enif_select_read is one-shot: the registration was already consumed when
-  // the timeout message was delivered, so we can close the timer fd directly.
-  conn.timer.reset();  // RAII closes the timer fd
+  // Cancel the connection timeout timer (closes timerfd directly — safe since
+  // enif_select is no longer used for timer fds).
+  conn.timer.reset();
 
-  // Clear conn.fd before SELECT_STOP so that if pool_resource_stop fires
-  // after this slot is reused, it won't find the old fd and zero the new one.
   int fd = conn.fd;
   conn.fd = -1;
 
@@ -610,12 +760,178 @@ static ERL_NIF_TERM handle_connection_timeout_nif(
 #ifdef HAVE_OPENSSL
     cleanup_slot_ssl(conn);
 #endif
-    // Deregister socket from enif_select (arm_connect registered it write-ready).
-    // pool_resource_stop will close(fd) once SELECT_STOP is acknowledged.
-    enif_select(env, fd, ERL_NIF_SELECT_STOP, ctx, nullptr, am_stop);
+    // Reactor closes the fd on its thread — race-free, no enif_select(STOP).
+    ctx->reactor().RemoveFd(fd);
   }
 
   return am_ok;
+}
+
+//=============================================================================
+// Reactor server NIFs — pure-NIF listen/accept, no OTP socket involvement.
+//=============================================================================
+
+//-----------------------------------------------------------------------------
+// reactor_listen(PoolRef, Port) → {ok, Fd} | {error, Reason}
+// Creates a non-blocking, REUSEADDR TCP listen socket.
+// Port=0 → ephemeral; the actual port can be read with inet:port/1 or by
+// calling getsockname on the returned fd.
+//-----------------------------------------------------------------------------
+static ERL_NIF_TERM reactor_listen_nif(
+  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
+{
+  PoolContext* ctx;
+  int port;
+  if (!get(env, argv[0], ctx) || !get(env, argv[1], port, 0, 65535))
+    return badarg(env);
+
+  int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  if (fd < 0) return make_tuple(env, am_error, am_socket_failed);
+
+  int one = 1;
+  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+  struct sockaddr_in addr{};
+  addr.sin_family      = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port        = htons(static_cast<uint16_t>(port));
+
+  if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+    ::close(fd);
+    return make_tuple(env, am_error, am_connect_failed);  // re-use existing error atom
+  }
+  if (::listen(fd, 256) < 0) {
+    ::close(fd);
+    return make_tuple(env, am_error, am_connect_failed);
+  }
+
+  // Retrieve actual port (useful when port=0 was requested).
+  socklen_t len = sizeof(addr);
+  ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &len);
+  int actual_port = ntohs(addr.sin_port);
+
+  return make_tuple(env, am_ok,
+    make_tuple(env, static_cast<unsigned int>(fd),
+                    static_cast<unsigned int>(actual_port)));
+}
+
+//-----------------------------------------------------------------------------
+// reactor_accept(PoolRef, ListenFd, OwnerPid) → ok | {error, Reason}
+// Registers ListenFd with the reactor.  When a client connects, the reactor
+// fires the accept handler which calls accept4() and sends:
+//   {arterial_accept, ListenFd, ClientFd, {O1,O2,O3,O4}, Port}
+// to OwnerPid (persistent — keeps firing for every new connection).
+//-----------------------------------------------------------------------------
+static ERL_NIF_TERM reactor_accept_nif(
+  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
+{
+  PoolContext* ctx;
+  int listen_fd;
+  ErlNifPid owner_pid;
+  if (!get(env, argv[0], ctx) || !get(env, argv[1], listen_fd) ||
+      !get(env, argv[2], owner_pid)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  // Register the listen fd for persistent readable events.
+  // The handler accepts and notifies owner_pid for each new connection.
+  ctx->reactor().AddFd(
+    listen_fd,
+    // on_readable: drain all pending connections and notify owner for each.
+    // Loop until accept4 returns EAGAIN so no connections are missed when
+    // multiple clients arrive in the same edge-triggered EPOLLIN event.
+    // NOTE: env must NOT be captured — it is freed when the NIF returns.
+    //       Each accepted connection gets its own msg_env for term allocation.
+    [lfd = listen_fd, owner_pid](int /*fd*/, void*) -> int {
+      for (;;) {
+        struct sockaddr_in caddr{};
+        socklen_t clen = sizeof(caddr);
+        int cfd = ::accept4(lfd, reinterpret_cast<struct sockaddr*>(&caddr),
+                            &clen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (cfd < 0) {
+          if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+          // Fatal accept error: notify owner then let the reactor remove the fd.
+          nifpp::msg_env me;
+          ERL_NIF_TERM msg = make_tuple(me, am_arterial_accept, lfd, am_closed, errno);
+          enif_send(nullptr, const_cast<ErlNifPid*>(&owner_pid), me, msg);
+          return -1;
+        }
+
+        uint32_t ip  = ntohl(caddr.sin_addr.s_addr);
+        uint16_t prt = ntohs(caddr.sin_port);
+        nifpp::msg_env me;
+        ERL_NIF_TERM msg = make_tuple(me, am_arterial_accept, lfd, cfd, ip, (uint32_t)prt);
+        if (!enif_send(nullptr, const_cast<ErlNifPid*>(&owner_pid), me, msg))
+          close(cfd);
+      }
+      return 0;  // keep listen fd registered
+    },
+    // on_error
+    [](int, void*) {}
+  );
+  return am_ok;
+}
+
+//-----------------------------------------------------------------------------
+// reactor_close_fd(PoolRef, Fd) → ok
+// Removes Fd from the reactor (closes it on the reactor thread).
+//-----------------------------------------------------------------------------
+static ERL_NIF_TERM reactor_close_fd_nif(
+  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
+{
+  PoolContext* ctx;
+  int fd;
+  if (!get(env, argv[0], ctx) || !get(env, argv[1], fd)) [[unlikely]]
+    return enif_make_badarg(env);
+  ctx->reactor().RemoveFd(fd);
+  return am_ok;
+}
+
+//-----------------------------------------------------------------------------
+// reactor_register_client(PoolRef, StripeId, ClientFd, OwnerPid) →
+//   {ok, SlotId} | {error, stripe_full | failed_to_set_nonblocking}
+//
+// Registers a client fd (from reactor_accept) with the NIF pool so the
+// reactor delivers:
+//   {arterial_event, StripeId, SlotId, read, Binary}
+// to OwnerPid on each read event.
+//-----------------------------------------------------------------------------
+static ERL_NIF_TERM reactor_register_client_nif(
+  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
+{
+  PoolContext*  ctx;
+  unsigned int  stripe_id;
+  int           client_fd;
+  ErlNifPid     owner_pid;
+
+  if (!get(env, argv[0], ctx) ||
+      !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1)) ||
+      !get(env, argv[2], client_fd) ||
+      !get(env, argv[3], owner_pid)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  // Ensure non-blocking (accept4 with SOCK_NONBLOCK handles this, but belt+braces).
+  int flags = ::fcntl(client_fd, F_GETFL, 0);
+  if (flags == -1 || ::fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) == -1)
+    return make_tuple(env, am_error, am_failed_to_set_nonblocking);
+
+  auto& stripe  = *ctx->stripes[stripe_id];
+  int   slot_id = ctx->claim_slot(env, stripe, client_fd, owner_pid);
+  if (slot_id < 0) [[unlikely]]
+    return make_tuple(env, am_error, am_stripe_full);
+
+  auto& conn = stripe.slots[slot_id];
+  conn.arm_read(env, ctx);
+
+  if (ctx->monitor_owner(env, conn) != 0) {
+    ctx->reactor().RemoveFd(client_fd);
+    stripe.release_slot(slot_id);
+    return make_tuple(env, am_error, am_connect_failed);
+  }
+
+  // Clear the lease bit so send_and_release can claim the slot.
+  stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
+
+  return make_tuple(env, am_ok, static_cast<unsigned int>(slot_id));
 }
 
 //-----------------------------------------------------------------------------
@@ -820,7 +1136,7 @@ static ERL_NIF_TERM reserve_fifo_connection_nif(
       break;  // No slots available, try queueing
 
     uint64_t target_bit = (1ULL << slot_id);
-    uint64_t new_mask = current_mask | target_bit;
+    uint64_t new_mask   = current_mask | target_bit;
 
     if (stripe.lease_mask.compare_exchange_weak(
           current_mask, new_mask,
@@ -1153,6 +1469,68 @@ static ERL_NIF_TERM reserve_send_fifo_request_nif(
   }
 }
 
+//-----------------------------------------------------------------------------
+// NIF: info
+//-----------------------------------------------------------------------------
+
+#ifndef ARTERIAL_VERSION
+#define ARTERIAL_VERSION "unknown"
+#endif
+#ifndef ARTERIAL_APP_VERSION
+#define ARTERIAL_APP_VERSION "unknown"
+#endif
+#ifndef ARTERIAL_OPT_LEVEL
+#define ARTERIAL_OPT_LEVEL "none"
+#endif
+#ifndef ARTERIAL_PGO
+#define ARTERIAL_PGO 0
+#endif
+#ifndef ARTERIAL_BACKEND
+#  if defined(REACTOR_BACKEND_URING)
+#    define ARTERIAL_BACKEND "io_uring"
+#  elif defined(REACTOR_BACKEND_EPOLL)
+#    define ARTERIAL_BACKEND "epoll"
+#  elif defined(REACTOR_BACKEND_KQUEUE)
+#    define ARTERIAL_BACKEND "kqueue"
+#  else
+#    define ARTERIAL_BACKEND "unknown"
+#  endif
+#endif
+
+static ERL_NIF_TERM info_nif(ErlNifEnv* env, int argc, [[maybe_unused]] const ERL_NIF_TERM argv[])
+{
+  if (argc != 0) [[unlikely]]
+    return enif_make_badarg(env);
+
+  auto opt = [=]() -> ERL_NIF_TERM {
+    if (!strcmp(ARTERIAL_OPT_LEVEL, "none")) return enif_make_atom(env, "none");
+    if (!strcmp(ARTERIAL_OPT_LEVEL, "O1"))   return enif_make_int(env, 1);
+    if (!strcmp(ARTERIAL_OPT_LEVEL, "O2"))   return enif_make_int(env, 2);
+    if (!strcmp(ARTERIAL_OPT_LEVEL, "O3"))   return enif_make_int(env, 3);
+    return make_binary(env, std::string_view(ARTERIAL_OPT_LEVEL));
+  };
+
+  auto backend = [=]() -> ERL_NIF_TERM {
+    if (!strcmp(ARTERIAL_BACKEND, "io_uring")) return am_io_uring;
+    if (!strcmp(ARTERIAL_BACKEND, "epoll"))    return am_epoll;
+    if (!strcmp(ARTERIAL_BACKEND, "kqueue"))   return am_kqueue;
+    return am_unknown;
+  };
+
+  ERL_NIF_TERM keys[]   = { am_version, am_app_version, am_pgo, am_optimization, am_backend };
+  ERL_NIF_TERM values[] = {
+    make_binary(env, std::string_view(ARTERIAL_VERSION)),
+    make_binary(env, std::string_view(ARTERIAL_APP_VERSION)),
+    ARTERIAL_PGO ? am_true : am_false,
+    opt(),
+    backend()
+  };
+
+  ERL_NIF_TERM map;
+  enif_make_map_from_arrays(env, keys, values, 5, &map);
+  return map;
+}
+
 //=============================================================================
 // NIF Initialization/Finalization
 //=============================================================================
@@ -1170,7 +1548,14 @@ static int load(ErlNifEnv* env,
 
   // RAII timer system requires no global initialization
 
-  return register_resource<PoolContext>(env, "arterial_pool_context") ? 0 : 1;
+  if (!register_resource<PoolContext>(env, "arterial_pool_context"))
+    return 1;
+
+  // SlotRef: one per live connection, used as the enif_monitor_process object.
+  // on_down is dispatched by ERTS directly to the SlotRef — O(1), no scan.
+  // The per-instance on_down callback is set in monitor_owner() via
+  // construct_resource_with_events; the type just needs to be registered here.
+  return register_resource<SlotRef>(env, "arterial_slot_ref") ? 0 : 1;
 }
 
 static void unload([[maybe_unused]] ErlNifEnv* env, [[maybe_unused]] void* priv_data)

@@ -331,21 +331,26 @@ inline int setup_connection_timeout_fd(Connection& conn, uint64_t timeout_ms) {
   return fd;
 }
 
-/// @brief Cancel connection timeout, deregistering from enif_select first.
-/// @param conn Connection to cancel timeout for
-/// @param env  ErlNifEnv from the current NIF call
-/// @param ctx  PoolContext resource object (used by SELECT_STOP as the resource)
-inline void cancel_connection_timeout(Connection& conn,
-                                      ErlNifEnv* env, PoolContext* ctx) {
-  if (!conn.timer) return;
-  int timer_fd = conn.timer->get_fd();
-  if (timer_fd >= 0) {
-    // Deregister the timer fd from enif_select before closing it.
-    // pool_resource_stop will call close(timer_fd) once SELECT_STOP is acked.
-    // We release ownership so the RAII destructor does not also close it.
-    (void)conn.timer->release();
-    enif_select(env, timer_fd, ERL_NIF_SELECT_STOP, ctx, nullptr, am_stop);
-  }
+/// @brief Cancel connection timeout.
+/// @param conn  Connection to cancel timeout for
+/// @param env   Unused — kept for call-site compatibility during transition
+/// @param ctx   Unused — kept for call-site compatibility during transition
+///
+/// Closes the timer fd directly without going through enif_select(STOP).
+/// Rationale: the timer fd was registered with enif_select_read (one-shot).
+/// Calling close() on a Linux fd automatically removes it from epoll, so the
+/// OTP poller will never deliver an event for it.  The alternative —
+/// enif_select(STOP) + pool_resource_stop — creates an fd-reuse race:
+/// pool_resource_stop calls close() synchronously (is_direct_call=1) inside
+/// the current NIF call, freeing the fd number before OTP finishes its
+/// internal deregistration cleanup.  A concurrent timerfd_create() or
+/// socket() call on another scheduler thread may then get the same number and
+/// register it with enif_select, triggering a "stealing control" warning and,
+/// worse, delivering the new fd's events to the wrong enif_select registration.
+inline void cancel_connection_timeout(Connection& conn) {
+  // RAII destructor calls close_connection_timeout_fd() which closes the fd.
+  // Linux close() atomically removes the fd from all epoll/io_uring interest
+  // sets — no enif_select(STOP) needed.
   conn.timer.reset();
 }
 

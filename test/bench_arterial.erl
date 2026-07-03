@@ -366,6 +366,8 @@ worker_loop(Parent, Deadline, Payload, Acc, Rejected) ->
           %% identical comment on why this matters under contention.
           erlang:yield(),
           worker_loop(Parent, Deadline, Payload, Acc, Rejected + 1);
+        {error, timeout} ->
+          worker_loop(Parent, Deadline, Payload, Acc, Rejected + 1);
         Other ->
           Parent ! {self(), done, Acc, Rejected},
           error({unexpected_reply, Other})

@@ -3,6 +3,7 @@
 #include "arterial_types.hpp"
 #include "arterial_connection.hpp"
 #include "arterial_fifo.hpp"
+#include "reactor.hpp"
 #include <atomic>
 #include <array>
 #include <vector>
@@ -136,6 +137,14 @@ struct PoolContext {
   uint32_t    throttle_rate_per_sec{0};   // requests per second
   uint32_t    throttle_window_msec{0};    // time window in milliseconds
 
+  // Async I/O reactor — one per pool, owns all fd lifecycle and I/O dispatch.
+  // Stored as unique_ptr so construction (io_uring setup) can be deferred to
+  // init_pool_nif, after the resource object itself has been constructed.
+  // Replaces enif_select entirely: no pool_resource_stop callback needed.
+  std::unique_ptr<arterial::Reactor> reactor_ptr;
+
+  arterial::Reactor& reactor() { return *reactor_ptr; }
+
   //===========================================================================
   // Load Balancing Algorithms
   //===========================================================================
@@ -169,18 +178,10 @@ struct PoolContext {
   inline std::size_t
   select_stripe_by_hash(size_t hash) { return hash % stripe_count; }
 
-  // Invoked by the runtime once it's safe to close a fd that was selected
-  // via enif_select (i.e. after ERL_NIF_SELECT_STOP, from notify_and_close/
-  // close_slot_nif) -- never call close() on a selected fd anywhere else.
-  //
-  // PoolContext's own destructor (run via the generic
-  // detail::resource_dtor<PoolContext> wired up by register_resource<>())
-  // closes any fds still open at resource-teardown time, so this is the
-  // only other place a slot's fd is ever close()'d.
-  static void pool_resource_stop(PoolContext* ctx, ErlNifEnv*, ErlNifEvent fd, int);
-
-  // FIFO types are defined in arterial_fifo.hpp and will be available after include
-  // One-shot heads-up to the owner that this slot's connection just died
+  // One-shot heads-up to the owner that this slot's connection just died.
+  // Sends {arterial_event, StripeId, SlotId, closed} to owner_pid (unless
+  // owner is the caller), clears slot state, and tells the reactor to
+  // remove the fd (which closes it on the reactor thread — race-free).
   int notify_and_close(ErlNifEnv* env, Connection& slot);
 
   // Claim the first unregistered slot in `stripe` for `fd`/`owner_pid`
@@ -192,7 +193,29 @@ struct PoolContext {
   ERL_NIF_TERM claim_slot_term(ErlNifEnv* env, PoolStripe& stripe, int fd,
                                ErlNifPid  owner_pid);
 
+  // Set up a process monitor for conn.owner_pid, storing the monitor token in
+  // conn.owner_monitor.  The on_down callback (registered at load time on the
+  // PoolContext resource type) will close the slot if the owner dies.
+  // Returns 0 on success, -1 if enif_monitor_process failed (process already dead).
+  int monitor_owner(ErlNifEnv* env, Connection& conn);
+
+  // Remove the monitor set by monitor_owner.  Safe to call even if the monitor
+  // was never set (no-op when conn.fd < 0 after reset()).
+  void demonitor_owner(ErlNifEnv* env, Connection& conn);
+
 private:
+};
+
+// Full definition — placed after PoolContext so the ctx pointer is complete.
+// The forward declaration at the top of this file allows arterial_connection.hpp
+// to hold a SlotRef* without pulling in the full definition there.
+struct SlotRef {
+  PoolContext* ctx;
+  uint32_t     stripe_id;
+  uint32_t     slot_id;
+
+  SlotRef(PoolContext* c, uint32_t sid, uint32_t slt)
+    : ctx(c), stripe_id(sid), slot_id(slt) {}
 };
 
 } // namespace arterial

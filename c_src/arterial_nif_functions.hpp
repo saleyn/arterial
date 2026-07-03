@@ -31,6 +31,7 @@ static ERL_NIF_TERM connect_proto_with_opts_nif(ErlNifEnv* env, int argc, const 
 //=============================================================================
 
 static ERL_NIF_TERM send_and_release_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM send_on_slot_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM handle_readable_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM handle_writable_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
@@ -40,6 +41,32 @@ static ERL_NIF_TERM handle_writable_nif(ErlNifEnv* env, int argc, const ERL_NIF_
 
 static ERL_NIF_TERM close_slot_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM handle_connection_timeout_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
+//=============================================================================
+// Reactor server NIFs — pure-NIF listen/accept, no OTP socket involvement.
+//=============================================================================
+// reactor_listen(PoolRef, Port::integer()) → {ok, ListenFd::integer()} | {error, Reason}
+//   Creates a non-blocking TCP listen socket bound to 127.0.0.1:Port (or any
+//   interface if Port=0 for ephemeral).  Returns the raw fd for use with
+//   reactor_accept.
+static ERL_NIF_TERM reactor_listen_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
+// reactor_accept(PoolRef, ListenFd::integer(), OwnerPid::pid()) → ok | {error, Reason}
+//   Registers ListenFd with the pool's Reactor.  Whenever a client connects,
+//   the reactor calls accept4() and sends:
+//     {arterial_accept, ListenFd, ClientFd::integer(), {IP4, Port}}
+//   to OwnerPid.  The server process should then register ClientFd with the
+//   reactor for I/O and re-arm accept if needed (it is persistent/multishot).
+static ERL_NIF_TERM reactor_accept_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
+// reactor_close_fd(PoolRef, Fd::integer()) → ok
+//   Removes Fd from the reactor and closes it (RemoveFd).
+static ERL_NIF_TERM reactor_close_fd_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
+// reactor_register_client(PoolRef, StripeId, ClientFd, OwnerPid) → {ok, SlotId} | {error, Reason}
+//   Registers a ClientFd (from reactor_accept) with the NIF pool for read/write
+//   events.  OwnerPid receives {arterial_event, StripeId, SlotId, read, Bin}.
+static ERL_NIF_TERM reactor_register_client_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM is_slot_available_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM set_slot_available_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM set_slot_unavailable_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
@@ -54,6 +81,12 @@ static ERL_NIF_TERM release_fifo_connection_nif(ErlNifEnv* env, int argc, const 
 static ERL_NIF_TERM fifo_connection_status_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM handle_fifo_reply_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM reserve_send_fifo_request_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
+//=============================================================================
+// Misc NIFs
+//=============================================================================
+
+static ERL_NIF_TERM info_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 //=============================================================================
 // NIF Module Lifecycle
@@ -86,8 +119,15 @@ static ErlNifFunc nif_funcs[] = {
 
   // I/O operations
   {"send_and_release",            3, send_and_release_nif,          0},
+  {"send_on_slot",                4, send_on_slot_nif,              0},
   {"handle_readable",             3, handle_readable_nif,           0},
   {"handle_writable",             3, handle_writable_nif,           0},
+
+  // Reactor server (pure-NIF listen/accept, no OTP socket)
+  {"reactor_listen",              2, reactor_listen_nif,            0},
+  {"reactor_accept",              3, reactor_accept_nif,            0},
+  {"reactor_close_fd",            2, reactor_close_fd_nif,          0},
+  {"reactor_register_client",     4, reactor_register_client_nif,   0},
 
   // Slot management
   {"close_slot",                  3, close_slot_nif,                0},
@@ -102,5 +142,7 @@ static ErlNifFunc nif_funcs[] = {
   {"release_fifo_connection",     4, release_fifo_connection_nif,   0},
   {"fifo_connection_status",      3, fifo_connection_status_nif,    0},
   {"handle_fifo_reply",           4, handle_fifo_reply_nif,         0},
-  {"reserve_send_fifo_request",   5, reserve_send_fifo_request_nif, 0}
+  {"reserve_send_fifo_request",   5, reserve_send_fifo_request_nif, 0},
+
+  {"info",                        0, info_nif,                      0},
 };

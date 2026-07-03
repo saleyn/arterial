@@ -249,22 +249,10 @@ handle_info(reconnect, State) ->
 handle_info(bounce_check, #state{bounce = #bounce_state{}} = State) ->
   bounce_check(State);
 
-handle_info({arterial_event, ConnID, 0, read}, #state{conn_id = ConnID} = State) ->
-  handle_read_event(State);
-
-handle_info({arterial_event, ConnID, 0, write}, #state{conn_id = ConnID, pool = Pool} = State) ->
-  case arterial_observe:enabled() of
-    false ->
-      _ = arterial_nif:handle_writable(arterial_pool:pool_ref(Pool), ConnID, 0);
-    true ->
-      arterial_observe:span([nif, write], #{pool => Pool, conn_id => ConnID}, fun() ->
-        case arterial_nif:handle_writable(arterial_pool:pool_ref(Pool), ConnID, 0) of
-          ok -> {ok, #{result => ok}};
-          closed -> {closed, #{result => closed}}
-        end
-      end)
-  end,
-  {noreply, State};
+%% Reactor NIF: data arrives pre-read from C++ reactor thread.
+%% The binary is already decoded from the socket; we just decode the protocol.
+handle_info({arterial_event, ConnID, 0, read, Bin}, #state{conn_id = ConnID} = State) ->
+  append_and_decode(Bin, State);
 
 handle_info({arterial_event, ConnID, 0, closed}, #state{conn_id = ConnID} = State) ->
   disconnect(closed, State#state{buffer = <<>>});
@@ -357,40 +345,21 @@ try_addresses([Entry | Rest], #state{
 %%%-----------------------------------------------------------------------------
 
 handle_connect_result(ok, #state{pfx = Pfx, pool = Pool, conn_id = ConnID} = State) ->
-  ?LOG_NOTICE("~s async connect completed successfully", [Pfx]),
+  ?LOG_DEBUG("~s async connect completed successfully", [Pfx]),
   arterial_pool:set_available(Pool, ConnID),
   arterial_observe:event([reconnect, success], #{pool => Pool, conn_id => ConnID}),
   {noreply, reset_backoff(State#state{connected = true})};
 
 handle_connect_result(Error, #state{pfx = Pfx} = State) ->
-  ?LOG_NOTICE("~s async connect failed: ~p", [Pfx, Error]),
+  ?LOG_WARNING("~s async connect failed: ~p", [Pfx, Error]),
   disconnect({connect_failed, Error}, State).
 
 %%%-----------------------------------------------------------------------------
 %%% Internal functions: read path (decode + dispatch)
 %%%-----------------------------------------------------------------------------
 
-handle_read_event(#state{pool = Pool, conn_id = ConnID} = State) ->
-  PoolRef = arterial_pool:pool_ref(Pool),
-  case arterial_observe:enabled() of
-    false ->
-      case arterial_nif:handle_readable(PoolRef, ConnID, 0) of
-        {ok, Bin} -> append_and_decode(Bin, State);
-        closed -> disconnect(closed, State#state{buffer = <<>>})
-      end;
-    true ->
-      case arterial_observe:span([nif, read], #{pool => Pool, conn_id => ConnID}, fun() ->
-        case arterial_nif:handle_readable(PoolRef, ConnID, 0) of
-          {ok, Bin} ->
-            {{ok, Bin}, #{result => ok, bytes => byte_size(Bin)}};
-          closed ->
-            {closed, #{result => closed}}
-        end
-      end) of
-        {ok, Bin} -> append_and_decode(Bin, State);
-        closed -> disconnect(closed, State#state{buffer = <<>>})
-      end
-  end.
+%% handle_read_event/1 removed: the Reactor NIF reads data in C++ and delivers
+%% it directly as {arterial_event, ConnID, 0, read, Binary} — no NIF callback.
 
 append_and_decode(Bin, #state{pfx = Pfx, pool = Pool, codec = Codec, buffer = Buffer} = State) ->
   NewBuffer = <<Buffer/binary, Bin/binary>>,
