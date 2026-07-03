@@ -75,14 +75,23 @@ struct alignas(64) Connection {
   using Throttle     = arterial::time_spacing_throttle;
 
   // Core connection state
-  StatusT             status{SLOT_AVAILABLE};
+  StatusT             status{SLOT_EMPTY};
   int                 fd{-1};  // TODO: Replace with FileDescriptor for RAII safety
   uint32_t            stripe_id{0};
   uint32_t            slot_id{0};
+  // Monotonically increasing generation counter.  Incremented on every
+  // close/reset so that reactor callbacks captured at an earlier generation
+  // can detect slot reuse and bail out without touching stale fields.
+  std::atomic<uint32_t> generation{0};
 
   // Long-lived process that owns this slot's read/write-ready
   // notifications (set once, at register_socket/4 time).
   NifPid              owner_pid{};
+  ErlNifMonitor       owner_monitor{};  // valid when slot_ref != nullptr
+  // Per-connection NIF resource that backs the process monitor.
+  // Allocated at monitor_owner() time, released at demonitor_owner() time.
+  // ERTS dispatches on_down directly to this pointer — O(1), no scan.
+  arterial::SlotRef*  slot_ref{nullptr};
 
   // Buffer management for pending writes
   std::vector<char>   pending_buffer;
@@ -115,9 +124,11 @@ struct alignas(64) Connection {
 
   // Reset slot to available state
   void reset() {
-    status.store(SLOT_AVAILABLE, std::memory_order_release);
+    status.store(SLOT_EMPTY, std::memory_order_release);
     fd = -1;
     owner_pid = {};
+    owner_monitor = {};
+    slot_ref = nullptr;
     pending_buffer.clear();
     bytes_written = 0;
 
@@ -218,26 +229,17 @@ struct alignas(64) Connection {
   // Socket Operations
   //===========================================================================
 
-  // Re-arm (one-shot) read/write readiness notification, targeted at the
-  // slot's owner pid, using a freshly allocated env each time -- enif_select
-  // permanently adopts msg/msg_env, so it can never be reused across calls.
-  inline int arm_read(ErlNifEnv* env, const PoolContext* ctx) {
-    nifpp::msg_env msg_env;
-    auto msg = make_event_msg(msg_env, am_read);
-    return nifpp::select_read(env, fd, ctx, &owner_pid, msg, msg_env);
-  }
-
-  inline int arm_write(ErlNifEnv* env, const PoolContext* ctx) {
-    nifpp::msg_env msg_env;
-    auto msg = make_event_msg(msg_env, am_write);
-    return nifpp::select_write(env, fd, ctx, &owner_pid, msg, msg_env);
-  }
-
-  inline int arm_connect(ErlNifEnv* env, const PoolContext* ctx) {
-    nifpp::msg_env msg_env;
-    auto msg = make_event_msg(msg_env, am_write);
-    return nifpp::select_write(env, fd, ctx, &owner_pid, msg, msg_env);
-  }
+  // Register/re-arm fd with the pool's Reactor for async I/O notification.
+  // All events (read, write, connect-complete, timeout) are dispatched by the
+  // reactor thread, which calls handle_readable/handle_writable/notify_and_close
+  // directly in C++ and sends high-level messages to owner_pid via enif_send.
+  // No enif_select is used — the Reactor owns the fd lifecycle entirely.
+  inline int arm_read(ErlNifEnv* env, const PoolContext* ctx);
+  inline int arm_write(ErlNifEnv* env, const PoolContext* ctx);
+  inline int arm_connect(ErlNifEnv* env, const PoolContext* ctx);
+  // Install a connect-phase timeout via the Reactor.
+  // Replaces the old nifpp::select_read(timerfd, ...) approach entirely.
+  inline void set_connect_timeout(const PoolContext* ctx, uint64_t timeout_ms);
 
   //===========================================================================
   // High-level Connection Event Handlers

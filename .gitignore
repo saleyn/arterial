@@ -35,9 +35,10 @@ arterial-*.tar
 c_src/enif.hpp
 c_src/test_pool
 c_src/*.o
-priv/*.so
+/priv/
 
 # Temporary files, for example, from tests.
 /tmp/
 
+/.claude/settings.local.json
 rebar3.crashdump

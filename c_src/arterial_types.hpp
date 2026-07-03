@@ -207,4 +207,8 @@ inline size_t count_one_bits(uint64_t value) {
 #endif
 }
 
+// Forward declaration for the per-connection monitor resource.
+// Full definition lives in arterial_pool.hpp after PoolContext is complete.
+struct SlotRef;
+
 } // namespace arterial

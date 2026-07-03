@@ -34,7 +34,7 @@ Connection::handle_readable(ErlNifEnv* env, PoolContext* ctx)
 
       if (handshake_result == 1) {
         // Handshake completed successfully - cancel any active timeout
-        cancel_connection_timeout(*this, env, ctx);
+        cancel_connection_timeout(*this);
         status.store(SLOT_AVAILABLE, std::memory_order_release);
         auto& stripe = *ctx->stripes[stripe_id];
         stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
@@ -137,7 +137,8 @@ Connection::handle_readable(ErlNifEnv* env, PoolContext* ctx)
     return ReadResultData(ReadResult::CLOSED);
   }
 
-  arm_read(env, ctx); // TODO: error handling?
+  // No arm_read: the reactor's persistent multishot EPOLLIN poll registered
+  // at connect time continuously delivers read events without re-registration.
 
   // FIFO Mode 3: if this slot is reserved, deliver reply directly
   // to the waiting caller instead of returning bytes for codec decoding.
@@ -173,14 +174,14 @@ inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, P
     socklen_t len = sizeof(so_err);
     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &len) == -1 || so_err != 0) {
       // Connection failed - cancel timeout using RAII cleanup
-      cancel_connection_timeout(*this, env, ctx);
+      cancel_connection_timeout(*this);
       WriteResultData result(WriteResult::CONNECT_FAILED);
       result.send_connect_msg = true;
       result.connect_result = am_connect_failed;
       return result;
     } else {
       // Connection succeeded - cancel timeout using RAII cleanup
-      cancel_connection_timeout(*this, env, ctx);
+      cancel_connection_timeout(*this);
       // Check if we need SSL handshake
 #ifdef HAVE_OPENSSL
       if (protocol == PROTO_SSL) {
@@ -196,7 +197,7 @@ inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, P
 
         if (handshake_result == 1) {
           // Handshake completed successfully - cancel any active timeout
-          cancel_connection_timeout(*this, env, ctx);
+          cancel_connection_timeout(*this);
           status.store(SLOT_AVAILABLE, std::memory_order_release);
           auto& stripe = *ctx->stripes[stripe_id];
           stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
@@ -248,7 +249,7 @@ inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, P
       case 1:
       {
         // Handshake completed successfully - cancel any active timeout
-        cancel_connection_timeout(*this, env, ctx);
+        cancel_connection_timeout(*this);
         status.store(SLOT_AVAILABLE, std::memory_order_release);
         auto& stripe = *ctx->stripes[stripe_id];
         stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
@@ -417,7 +418,7 @@ Connection::connect_proto(ErlNifEnv* env, PoolContext* ctx,
       int handshake_result = ssl_handshake_nonblocking(conn, timeout_ms);
       if (handshake_result == 1) {
         // Handshake completed successfully - cancel any active timeout
-        cancel_connection_timeout(conn, env, ctx);
+        cancel_connection_timeout(conn);
         conn.status.store(SLOT_AVAILABLE, std::memory_order_release);
         conn.arm_read(env, ctx);
         return ConnectResultData(ConnectResult::OK, slot_id);
@@ -578,7 +579,7 @@ Connection::connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
       int handshake_result = ssl_handshake_nonblocking(conn, 5000);
       if (handshake_result == 1) {
         // Handshake completed successfully - cancel any active timeout
-        cancel_connection_timeout(conn, env, ctx);
+        cancel_connection_timeout(conn);
         conn.status.store(SLOT_AVAILABLE, std::memory_order_release);
         conn.arm_read(env, ctx);
         return ConnectResultData(ConnectResult::OK, slot_id);
@@ -900,18 +901,17 @@ Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
     conn.status.store(SLOT_WRITE_POLLING, std::memory_order_release);
 
     conn.arm_write(env, ctx); // TODO: handle errors
-
-    // CRITICAL FIX: Also arm read for eventual response even with partial writes
-    conn.arm_read(env, ctx); // TODO: error handling?
-
+    // No arm_read: reactor's persistent multishot EPOLLIN handles read events.
     return SendResultData(SendResult::PARTIAL, slot_id);
   }
 
   conn.status.store(SLOT_AVAILABLE, std::memory_order_release);
   stripe.lease_mask.fetch_and(~target_bit, std::memory_order_release);
 
-  // CRITICAL FIX: Arm socket for reading response after successful send
-  conn.arm_read(env, ctx); // TODO: error handling?
+  // No arm_read needed: the reactor's persistent multishot EPOLLIN poll
+  // (registered once at connect time) continuously delivers read events.
+  // Calling arm_read on every send would cancel+re-add the poll SQE 10k
+  // times per connection, creating unnecessary overhead.
 
   return SendResultData(SendResult::OK, slot_id);
 }
@@ -996,18 +996,8 @@ Connection::connect_with_opts(ErlNifEnv* env, PoolContext* ctx,
     conn.status.store(SLOT_CONNECTING, std::memory_order_release);
     conn.arm_connect(env, ctx);
 
-    if (timeout_ms > 0) {
-      int timeout_fd = setup_connection_timeout_fd(conn, timeout_ms);
-      if (timeout_fd >= 0) {
-        nifpp::msg_env timeout_msg_env;
-        auto timeout_msg = conn.make_event_msg(timeout_msg_env, am_timeout);
-        if (nifpp::select_read(env, timeout_fd, ctx, &conn.owner_pid,
-                                timeout_msg, timeout_msg_env) != 0) {
-          // Failed to register timer — cancel it but keep the connection going
-          conn.timer.reset();
-        }
-      }
-    }
+    if (timeout_ms > 0)
+      conn.set_connect_timeout(ctx, timeout_ms);
   }
 
   stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
@@ -1100,7 +1090,7 @@ Connection::connect_proto_with_opts(ErlNifEnv* env, PoolContext* ctx,
       // Perform SSL handshake
       switch (ssl_handshake_nonblocking(conn, timeout_ms)) {
         case 1: // Handshake completed successfully - cancel any active timeout
-          cancel_connection_timeout(conn, env, ctx);
+          cancel_connection_timeout(conn);
           conn.status.store(SLOT_AVAILABLE, std::memory_order_release);
           conn.arm_read(env, ctx);
           return ConnectResultData(ConnectResult::OK, slot_id);
@@ -1126,7 +1116,7 @@ Connection::connect_proto_with_opts(ErlNifEnv* env, PoolContext* ctx,
 
     case PROTO_TCP:
       if (result == 0) {
-        cancel_connection_timeout(conn, env, ctx);
+        cancel_connection_timeout(conn);
         conn.status.store(SLOT_AVAILABLE, std::memory_order_release);
         conn.arm_read(env, ctx);
         stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
@@ -1138,18 +1128,8 @@ Connection::connect_proto_with_opts(ErlNifEnv* env, PoolContext* ctx,
       conn.status.store(SLOT_CONNECTING, std::memory_order_release);
       conn.arm_connect(env, ctx);
 
-      if (timeout_ms > 0) {
-        int timeout_fd = setup_connection_timeout_fd(conn, timeout_ms);
-        if (timeout_fd >= 0) {
-          nifpp::msg_env timeout_msg_env;
-          auto timeout_msg = conn.make_event_msg(timeout_msg_env, am_timeout);
-          if (nifpp::select_read(env, timeout_fd, ctx, &conn.owner_pid,
-                                  timeout_msg, timeout_msg_env) != 0) {
-            // Failed to register timer — cancel it but keep the connection going
-            conn.timer.reset();
-          }
-        }
-      }
+      if (timeout_ms > 0)
+        conn.set_connect_timeout(ctx, timeout_ms);
 
       stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
       return ConnectResultData(ConnectResult::CONNECTING, slot_id);

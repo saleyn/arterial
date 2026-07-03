@@ -76,27 +76,24 @@ BENCH_OPTS_MAP := $(HASH){$(shell echo '$(BENCH_OPTS)' | \
   paste -sd, -)}
 endif
 
+ERL_BENCH = erl -noshell -noinput -config test/test.config \
+              -pa _build/test/lib/*/ebin -pa _build/test/lib/arterial/test
+
 bench: bench-compare
 bench-help: bench-compare-help
 bench-plot: bench-compare-plot
 
 bench-compare bench-compare-help:
 	@$(REBAR) as test compile
-	erl -noshell -noinput -pa _build/test/lib/*/ebin \
-	  -pa _build/test/lib/arterial/test \
-	  -eval "bench_compare:$(subst -,_,$(subst bench-compare,bench,$@))($(BENCH_OPTS_MAP)), halt()."
+	$(ERL_BENCH) -eval "bench_compare:$(subst -,_,$(subst bench-compare,bench,$@))($(BENCH_OPTS_MAP)), halt()."
 
 bench-compare-plot:
 	@$(REBAR) as test compile
-	erl -noshell -noinput -pa _build/test/lib/*/ebin \
-	  -pa _build/test/lib/arterial/test \
-	  -eval "bench_compare:plot_scaling($(BENCH_OPTS_MAP)), halt()."
+	$(ERL_BENCH) -eval "bench_compare:plot_scaling($(BENCH_OPTS_MAP)), halt()."
 
 bench-arterial bench-arterial-help:
 	@$(REBAR) as test compile
-	erl -noshell -noinput -pa _build/test/lib/arterial/ebin \
-	  -pa _build/test/lib/arterial/test \
-	  -eval "bench_arterial:$(subst -,_,$(subst bench-arterial,bench,$@))($(BENCH_OPTS_MAP)), halt()."
+	$(ERL_BENCH) -eval "bench_arterial:$(subst -,_,$(subst bench-arterial,bench,$@))($(BENCH_OPTS_MAP)), halt()."
 
 # Runs test/shackle_bench.erl -- the same workload shape/wire framing as
 # `bench` above, but driven through https://github.com/lpgauth/shackle
@@ -106,9 +103,7 @@ bench-arterial bench-arterial-help:
 # not just arterial's.
 bench-shackle bench-shackle-help:
 	@$(REBAR) as test compile
-	@erl -noshell -noinput -pa _build/test/lib/*/ebin \
-	  -pa _build/test/lib/arterial/test \
-	  -eval "bench_shackle:$(subst -,_,$(subst bench-shackle,bench,$@))($(BENCH_OPTS_MAP)), halt()."
+	$(ERL_BENCH) -eval "bench_shackle:$(subst -,_,$(subst bench-shackle,bench,$@))($(BENCH_OPTS_MAP)), halt()."
 
 # Runs test/poolboy_bench.erl -- the same workload shape/wire framing as
 # `bench` above, but driven through https://github.com/devinus/poolboy
@@ -118,9 +113,7 @@ bench-shackle bench-shackle-help:
 # not just arterial's.
 bench-poolboy bench-poolboy-help:
 	@$(REBAR) as test compile
-	@erl -noshell -noinput -pa _build/test/lib/*/ebin \
-	  -pa _build/test/lib/arterial/test \
-	  -eval "bench_poolboy:$(subst -,_,$(subst bench-poolboy,bench,$@))($(BENCH_OPTS_MAP)), halt()."
+	$(ERL_BENCH) -eval "bench_poolboy:$(subst -,_,$(subst bench-poolboy,bench,$@))($(BENCH_OPTS_MAP)), halt()."
 
 # Runs test/bench_arterial_fifo.erl -- benchmarks FIFO Mode 3 performance
 # against arterial existing modes, shackle, and poolboy for comparison.
@@ -128,24 +121,18 @@ bench-poolboy bench-poolboy-help:
 # of the FIFO request/reply matching implementation.
 bench-fifo bench-fifo-help:
 	@$(REBAR) as test compile
-	@erl -noshell -noinput -pa _build/test/lib/*/ebin \
-	  -pa _build/test/lib/arterial/test \
-	  -eval "bench_arterial_fifo:$(subst -,_,$(subst bench-fifo,bench,$@))($(BENCH_OPTS_MAP)), halt()."
+	$(ERL_BENCH) -eval "bench_arterial_fifo:$(subst -,_,$(subst bench-fifo,bench,$@))($(BENCH_OPTS_MAP)), halt()."
 
 # Shackle in FIFO Mode 3 equivalent configuration:
 # backlog_size=1, one worker per connection — direct comparison to bench-fifo.
 bench-fifo-shackle bench-fifo-shackle-help:
 	@$(REBAR) as test compile
-	@erl -noshell -noinput -pa _build/test/lib/*/ebin \
-	  -pa _build/test/lib/arterial/test \
-	  -eval "bench_fifo_shackle:$(subst -,_,$(subst bench-fifo-shackle,bench,$@))($(BENCH_OPTS_MAP)), halt()."
+	$(ERL_BENCH) -eval "bench_fifo_shackle:$(subst -,_,$(subst bench-fifo-shackle,bench,$@))($(BENCH_OPTS_MAP)), halt()."
 
 # Comprehensive benchmark comparing all available pool implementations
 bench-fifo-all:
 	@$(REBAR) as test compile
-	@erl -noshell -noinput -pa _build/test/lib/*/ebin \
-	  -pa _build/test/lib/arterial/test \
-	  -eval "bench_arterial_fifo:bench_all(), halt()."
+	$(ERL_BENCH) -eval "bench_arterial_fifo:bench_all(), halt()."
 
 clean:
 	$(MAKE) -C c_src $@
