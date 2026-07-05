@@ -6,6 +6,8 @@
 #include <array>
 #include <vector>
 #include <memory>
+#include <algorithm>
+#include <cstring>
 #include <type_traits>
 #include <unistd.h>
 #include <sys/uio.h>
@@ -58,6 +60,26 @@ NIFPP_ADD_KNOWN_ATOM(am_ssl);
 
 namespace arterial {
 
+//=============================================================================
+// Core Enumerations
+//=============================================================================
+
+enum SlotStatus : uint32_t {
+  SLOT_EMPTY         = 0,
+  SLOT_AVAILABLE     = 1,
+  SLOT_LEASED        = 2,
+  SLOT_WRITE_POLLING = 3,
+  SLOT_CONNECTING    = 4,
+  SLOT_SSL_HANDSHAKE = 5
+};
+
+enum ProtocolType : uint32_t {
+  PROTO_UNKNOWN = 0
+  PROTO_TCP     = 1,
+  PROTO_UDP     = 2,
+  PROTO_SSL     = 3
+};
+
 // 1. The protocol dispatcher
 template <typename Visitor>
 void visit_protocol(ProtocolType proto, Visitor&& visitor) {
@@ -74,24 +96,42 @@ void visit_protocol(ProtocolType proto, Visitor&& visitor) {
   }
 }
 
-//=============================================================================
-// Core Enumerations
-//=============================================================================
-
-enum SlotStatus : uint32_t {
-  SLOT_EMPTY         = 0,
-  SLOT_AVAILABLE     = 1,
-  SLOT_LEASED        = 2,
-  SLOT_WRITE_POLLING = 3,
-  SLOT_CONNECTING    = 4,
-  SLOT_SSL_HANDSHAKE = 5
+// A tiny helper mapping struct
+struct ProtocolMap {
+    const char* name;
+    ProtocolType type;
 };
 
-enum ProtocolType : uint32_t {
-  PROTO_TCP = 0,
-  PROTO_UDP = 1,
-  PROTO_SSL = 2
-};
+// The dispatcher loop
+template <typename Visitor>
+auto visit_protocol_str(const char* protocol_str, Visitor&& visitor) {
+  // 1. Define the supported protocols in a clean data table
+  static constexpr ProtocolMap mapping[] = {
+    {"tcp", PROTO_TCP},
+    {"udp", PROTO_UDP},
+#ifdef HAVE_OPENSSL
+    {"ssl", PROTO_SSL},
+#endif
+  };
+
+  // 2. Search for a matching string
+  for (const auto& entry : mapping) {
+    if (strcmp(protocol_str, entry.name) == 0) {
+      // Found it! Execute the template logic via runtime-to-compile-time switch
+      switch (entry.type) {
+        case PROTO_TCP: return visitor(std::integral_constant<ProtocolType, PROTO_TCP>{});
+        case PROTO_UDP: return visitor(std::integral_constant<ProtocolType, PROTO_UDP>{});
+#ifdef HAVE_OPENSSL
+        case PROTO_SSL: return visitor(std::integral_constant<ProtocolType, PROTO_SSL>{});
+#endif
+      }
+    }
+  }
+
+  // 3. Fallback sentinel object (empty/null variant indicator)
+  return visitor(std::integral_constant<ProtocolType, PROTO_UNKNOWN>{});
+}
+
 
 //=============================================================================
 // Core Data Structures
