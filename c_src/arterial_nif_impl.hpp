@@ -253,37 +253,34 @@ static ERL_NIF_TERM connect_proto_nif(ErlNifEnv* env, int argc, const ERL_NIF_TE
     return enif_make_badarg(env);
   }
 
-  if (strcmp(protocol_str, "tcp") == 0) {
-    return connect_generic_nif<PROTO_TCP>(env, argc, argv, false, false);
-  } else if (strcmp(protocol_str, "udp") == 0) {
-    return connect_generic_nif<PROTO_UDP>(env, argc, argv, false, false);
-#ifdef HAVE_OPENSSL
-  } else if (strcmp(protocol_str, "ssl") == 0) {
-    return connect_generic_nif<PROTO_SSL>(env, argc, argv, false, false);
-#endif
-  } else {
-    return make(env, std::make_tuple(am_error, am_unsupported_protocol));
-  }
+  return visit_protocol_str(protocol_str, [&](auto PassedProto) {
+    constexpr ProtocolType Proto = decltype(PassedProto)::value;
+
+    if constexpr (Proto == PROTO_UNKNOWN)
+      // No matching string was found
+      return make(env, std::make_tuple(am_error, am_unsupported_protocol));
+    else
+      // Found! Invoke your NIF function cleanly
+      return connect_generic_nif<Proto>(env, argc, argv, false, false);
+  });
 }
 
 static ERL_NIF_TERM connect_async_proto_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
   // Extract protocol from arguments (position 4 for async)
   char protocol_str[8];
-  if (!enif_get_atom(env, argv[4], protocol_str, sizeof(protocol_str), ERL_NIF_LATIN1)) {
+  if (!enif_get_atom(env, argv[4], protocol_str, sizeof(protocol_str), ERL_NIF_LATIN1))
     return enif_make_badarg(env);
-  }
 
-  if (strcmp(protocol_str, "tcp") == 0) {
-    return connect_generic_nif<PROTO_TCP>(env, argc, argv, true, false);
-  } else if (strcmp(protocol_str, "udp") == 0) {
-    return connect_generic_nif<PROTO_UDP>(env, argc, argv, true, false);
-#ifdef HAVE_OPENSSL
-  } else if (strcmp(protocol_str, "ssl") == 0) {
-    return connect_generic_nif<PROTO_SSL>(env, argc, argv, true, false);
-#endif
-  } else {
-    return make(env, std::make_tuple(am_error, am_unsupported_protocol));
-  }
+  return visit_protocol_str(protocol_str, [&](auto PassedProto) {
+    constexpr ProtocolType Proto = decltype(PassedProto)::value;
+
+    if constexpr (Proto == PROTO_UNKNOWN)
+      // No matching string was found
+      return make(env, std::make_tuple(am_error, am_unsupported_protocol));
+    else
+      // Found! Invoke your NIF function cleanly
+      return connect_generic_nif<Proto>(env, argc, argv, true, false);
+  });  
 }
 
 static ERL_NIF_TERM connect_proto_with_opts_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
@@ -293,17 +290,16 @@ static ERL_NIF_TERM connect_proto_with_opts_nif(ErlNifEnv* env, int argc, const 
     return enif_make_badarg(env);
   }
 
-  if (strcmp(protocol_str, "tcp") == 0) {
-    return connect_generic_nif<PROTO_TCP>(env, argc, argv, false, true);
-  } else if (strcmp(protocol_str, "udp") == 0) {
-    return connect_generic_nif<PROTO_UDP>(env, argc, argv, false, true);
-#ifdef HAVE_OPENSSL
-  } else if (strcmp(protocol_str, "ssl") == 0) {
-    return connect_generic_nif<PROTO_SSL>(env, argc, argv, false, true);
-#endif
-  } else {
-    return make(env, std::make_tuple(am_error, am_unsupported_protocol));
-  }
+  return visit_protocol_str(protocol_str, [&](auto PassedProto) {
+    constexpr ProtocolType Proto = decltype(PassedProto)::value;
+
+    if constexpr (Proto == PROTO_UNKNOWN)
+      // No matching string was found
+      return make_tuple(env, am_error, am_unsupported_protocol));
+    else
+      // Found! Invoke your NIF function cleanly
+      return connect_generic_nif<Proto>(env, argc, argv, false, true);
+  });
 }
 
 static ERL_NIF_TERM send_and_release_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
@@ -386,14 +382,11 @@ static ERL_NIF_TERM send_and_release_nif(ErlNifEnv* env, int argc, const ERL_NIF
   }
 
   // Use protocol-specific write
-  ssize_t bytes_written;
-  if (slot.protocol == PROTO_SSL) {
-    bytes_written = ProtocolHandler<PROTO_SSL>::write_data(slot, iov, list_len);
-  } else if (slot.protocol == PROTO_UDP) {
-    bytes_written = ProtocolHandler<PROTO_UDP>::write_data(slot, iov, list_len);
-  } else {
-    bytes_written = ProtocolHandler<PROTO_TCP>::write_data(slot, iov, list_len);
-  }
+  ssize_t bytes_written = visit_protocol(slot.protocol, [&](auto PassedProto) {
+    constexpr ProtocolType Proto = decltype(PassedProto)::value;
+    return ProtocolHandler<Proto>::write_data(slot, iov, list_len);
+  });
+
 
   if (bytes_written == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
     notify_and_close(env, ctx, slot);
@@ -446,13 +439,10 @@ static ERL_NIF_TERM close_slot_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
   ConnSlot& slot = *slot_ptr;
 
   // Use protocol-specific cleanup
-  if (slot.protocol == PROTO_SSL) {
+  visit_protocol(slot.protocol, [&](auto PassedProto) {
+    constexpr ProtocolType Proto = decltype(PassedProto)::value;
     ProtocolHandler<PROTO_SSL>::cleanup_connection(slot);
-  } else if (slot.protocol == PROTO_UDP) {
-    ProtocolHandler<PROTO_UDP>::cleanup_connection(slot);
-  } else {
-    ProtocolHandler<PROTO_TCP>::cleanup_connection(slot);
-  }
+  } 
 
   slot.pending_buffer.clear();
   slot.bytes_written = 0;
