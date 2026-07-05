@@ -6,6 +6,7 @@
 #include <array>
 #include <vector>
 #include <memory>
+#include <type_traits>
 #include <unistd.h>
 #include <sys/uio.h>
 #include <sys/ioctl.h>
@@ -56,6 +57,22 @@ NIFPP_ADD_KNOWN_ATOM(am_udp);
 NIFPP_ADD_KNOWN_ATOM(am_ssl);
 
 namespace arterial {
+
+// 1. The protocol dispatcher
+template <typename Visitor>
+void visit_protocol(ProtocolType proto, Visitor&& visitor) {
+  switch (proto) {
+    case PROTO_SSL: 
+      visitor(std::integral_constant<ProtocolType, PROTO_SSL>{}); 
+      break;
+    case PROTO_UDP: 
+      visitor(std::integral_constant<ProtocolType, PROTO_UDP>{}); 
+      break;
+    default:        
+      visitor(std::integral_constant<ProtocolType, PROTO_TCP>{}); 
+      break;
+  }
+}
 
 //=============================================================================
 // Core Enumerations
