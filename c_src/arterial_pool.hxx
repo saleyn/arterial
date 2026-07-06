@@ -16,7 +16,7 @@ namespace arterial {
 //   {arterial_event, StripeId, SlotId, data, Binary}  — when data arrives
 //   {arterial_event, StripeId, SlotId, closed}         — when connection closes
 // to owner_pid so the Erlang arterial_connection can decode and dispatch.
-// Returns 0 to keep registered, -1 to tell the reactor to RemoveFd+close.
+// Returns 0 to keep registered, -1 to tell the reactor to remove_fd+close.
 static inline ReadHandler make_read_handler(PoolContext* ctx,
                                              unsigned stripe_id,
                                              unsigned slot_id)
@@ -94,13 +94,13 @@ inline int Connection::arm_read(ErlNifEnv* /*env*/, const PoolContext* ctx)
 {
   // Register the fd with the reactor for persistent read notifications.
   // With the reactor's edge-triggered multishot mode, this is idempotent:
-  // calling AddFd again on an already-registered fd is harmless (the reactor
+  // calling add_fd again on an already-registered fd is harmless (the reactor
   // treats it as an update). In practice arm_read is called:
   //   - Once at claim_slot_term (initial registration)
   //   - From handle_readable/writable to re-arm after an event (no-op here
   //     since the reactor is persistent — events keep firing automatically)
   auto* mctx = const_cast<PoolContext*>(ctx);
-  mctx->reactor().AddFd(
+  mctx->reactor().add_fd(
     fd,
     make_read_handler(mctx, stripe_id, slot_id),
     make_error_handler(mctx, stripe_id, slot_id),
@@ -112,22 +112,22 @@ inline int Connection::arm_write(ErlNifEnv* /*env*/, const PoolContext* ctx)
 {
   // One-shot write-ready notification (for pending sends after partial write).
   auto* mctx = const_cast<PoolContext*>(ctx);
-  mctx->reactor().ArmWrite(fd);
+  mctx->reactor().arm_write(fd);
   return 0;
 }
 
 inline int Connection::arm_connect(ErlNifEnv* /*env*/, const PoolContext* ctx)
 {
   // Store handlers without triggering a kernel poll registration (avoids
-  // EPOLLIN on an EINPROGRESS socket).  ArmWrite then registers EPOLLOUT
+  // EPOLLIN on an EINPROGRESS socket).  arm_write then registers EPOLLOUT
   // (via do_arm_write → reactor_mod) to detect connect completion.
   auto* mctx = const_cast<PoolContext*>(ctx);
-  mctx->reactor().RegisterHandlers(
+  mctx->reactor().register_handlers(
     fd,
     {},                                               // no on_read during connect
     make_error_handler(mctx, stripe_id, slot_id),
     make_write_handler(mctx, stripe_id, slot_id));
-  mctx->reactor().ArmWrite(fd);
+  mctx->reactor().arm_write(fd);
   return 0;
 }
 
@@ -141,10 +141,10 @@ inline void Connection::set_connect_timeout(const PoolContext* ctx, uint64_t tim
   unsigned sid = stripe_id;
   unsigned slt = slot_id;
   // On timeout: send {arterial_event, StripeId, SlotId, timeout} to owner_pid
-  // and close the connecting socket (the reactor calls RemoveFd for us after
+  // and close the connecting socket (the reactor calls remove_fd for us after
   // on_timeout returns via the normal timeout dispatch path).
   ErlNifPid pid = owner_pid;
-  mctx->reactor().AddFd(
+  mctx->reactor().add_fd(
     fd,
     {},                                           // keep existing handlers
     make_error_handler(mctx, sid, slt),
@@ -153,11 +153,11 @@ inline void Connection::set_connect_timeout(const PoolContext* ctx, uint64_t tim
     [mctx, sid, slt, pid](int cfd, void*) {
       auto& conn = mctx->stripes[sid]->slots[slt];
       cancel_connection_timeout(conn);
-      // Queue RemoveFd so the reactor deregisters from epoll and closes cfd
+      // Queue remove_fd so the reactor deregisters from epoll and closes cfd
       // on the next iteration.  We clear conn.fd now so the PoolContext
       // destructor does not double-close it.
       conn.fd = -1;
-      mctx->reactor().RemoveFd(cfd);
+      mctx->reactor().remove_fd(cfd);
       conn.status.store(SLOT_EMPTY, std::memory_order_release);
       mctx->stripes[sid]->lease_mask.fetch_and(
         ~(1ULL << slt), std::memory_order_release);
@@ -166,7 +166,7 @@ inline void Connection::set_connect_timeout(const PoolContext* ctx, uint64_t tim
       auto msg = conn.make_event_msg(me, am_timeout);
       enif_send(nullptr, &pid, me, msg);
     });
-  mctx->reactor().SetTimeout(fd, timeout_ms);
+  mctx->reactor().set_timeout(fd, timeout_ms);
 }
 
 //=============================================================================
@@ -352,7 +352,7 @@ int PoolContext::notify_and_close(ErlNifEnv* env, Connection& slot) {
   // Tell the reactor to remove and close the fd on its thread.
   // This is race-free: the reactor is the sole owner of the fd lifecycle.
   if (slot.fd >= 0) {
-    reactor().RemoveFd(slot.fd);
+    reactor().remove_fd(slot.fd);
     slot.fd = -1;
   }
   return 0;

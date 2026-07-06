@@ -60,7 +60,7 @@ static ERL_NIF_TERM reactor_listen_nif(ErlNifEnv* env, int argc, const ERL_NIF_T
 static ERL_NIF_TERM reactor_accept_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 // reactor_close_fd(PoolRef, Fd::integer()) → ok
-//   Removes Fd from the reactor and closes it (RemoveFd).
+//   Removes Fd from the reactor and closes it (remove_fd).
 static ERL_NIF_TERM reactor_close_fd_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 // reactor_register_client(PoolRef, StripeId, ClientFd, OwnerPid) → {ok, SlotId} | {error, Reason}

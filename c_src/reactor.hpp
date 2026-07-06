@@ -32,7 +32,7 @@
 ///
 /// Connect flow (from NIF thread → reactor thread → Erlang process)
 /// -----------------------------------------------------------------
-///   1. NIF calls Reactor::Connect(fd, addr, timeout_ms, pid, opaque)
+///   1. NIF calls Reactor::connect(fd, addr, timeout_ms, pid, opaque)
 ///      This enqueues a ConnectCmd into the command ring and writes to
 ///      the wakeup eventfd.
 ///   2. Reactor thread wakes up, prepares IORING_OP_CONNECT (or registers
@@ -140,9 +140,9 @@ struct SetTimeoutParams {
 struct ReactorCmd {
   CmdType type = CmdType::Nop;
   // Payload — we don't use a union to avoid UB; zero-init unused fields.
-  int              fd      = -1;   // AddFd / RemoveFd / ArmWrite / CancelTimeout
-  ConnectParams    connect = {};   // Connect
-  SetTimeoutParams timeout = {};   // SetTimeout
+  int              fd      = -1;   // add_fd / remove_fd / arm_write / CancelTimeout
+  ConnectParams    connect = {};   // connect
+  SetTimeoutParams timeout = {};   // set_timeout
 };
 
 //------------------------------------------------------------------------------
@@ -236,21 +236,21 @@ public:
     reactor_add(m_handle, m_wakeup_rd, REACTOR_EV_IN | REACTOR_EV_ET);
   }
 
-  ~Reactor() { Stop(); }
+  ~Reactor() { stop(); }
 
   /// Start the reactor thread and block until it signals ready.
   ///
   /// @param owner_pid  Erlang pid to receive
   ///   `{arterial_reactor_exit, Ident, Reason}` if the reactor loop exits
-  ///   for any reason other than an explicit Stop() call.
+  ///   for any reason other than an explicit stop() call.
   ///   Pass a zero-initialised ErlNifPid{} (the default) to opt out.
   ///
   /// The reactor thread sets the ready condition before entering its first
-  /// reactor_wait() call, guaranteeing that any AddFd/Connect/SetTimeout
-  /// posted immediately after Start() returns will be seen by the reactor
+  /// reactor_wait() call, guaranteeing that any add_fd/connect/set_timeout
+  /// posted immediately after start() returns will be seen by the reactor
   /// on the very first drain_commands() cycle — no race between the caller
   /// and the reactor on startup.
-  void Start(ErlNifPid owner_pid = ErlNifPid{})
+  void start(ErlNifPid owner_pid = ErlNifPid{})
   {
     bool expected = false;
     if (!m_running.compare_exchange_strong(expected, true))
@@ -264,8 +264,8 @@ public:
     m_ready_cv.wait(lk, [this]{ return m_ready; });
   }
 
-  /// Stop the reactor thread and wait for it to exit.
-  void Stop()
+  /// stop the reactor thread and wait for it to exit.
+  void stop()
   {
     bool expected = true;
     if (!m_running.compare_exchange_strong(expected, false))
@@ -277,16 +277,16 @@ public:
     reactor_destroy(m_handle);
   }
 
-  bool Running() const { return m_running.load(std::memory_order_relaxed); }
+  bool running() const { return m_running.load(std::memory_order_relaxed); }
 
   //----------------------------------------------------------------------------
   // Registration API (thread-safe — may be called from any thread)
   //----------------------------------------------------------------------------
 
   /// Store handlers for fd without registering with the kernel multiplexer.
-  /// Used by arm_connect to set up write/error handlers before ArmWrite
+  /// Used by arm_connect to set up write/error handlers before arm_write
   /// registers EPOLLOUT — avoids a redundant EPOLLIN poll on connecting sockets.
-  void RegisterHandlers(int fd,
+  void register_handlers(int fd,
                         ReadHandler    on_read,
                         ErrorHandler   on_error,
                         WriteHandler   on_write   = {},
@@ -304,7 +304,7 @@ public:
   }
 
   /// Register fd for persistent read notifications.
-  void AddFd(int fd,
+  void add_fd(int fd,
              ReadHandler    on_read,
              ErrorHandler   on_error,
              WriteHandler   on_write   = {},
@@ -325,14 +325,14 @@ public:
   }
 
   /// Deregister fd from the reactor (closes it).
-  void RemoveFd(int fd)
+  void remove_fd(int fd)
   {
     ReactorCmd cmd{}; cmd.type = CmdType::RemoveFd; cmd.fd = fd;
     post(cmd);
   }
 
   /// Arm one-shot write-readiness on an already-registered fd.
-  void ArmWrite(int fd)
+  void arm_write(int fd)
   {
     ReactorCmd cmd{}; cmd.type = CmdType::ArmWrite; cmd.fd = fd;
     post(cmd);
@@ -340,7 +340,7 @@ public:
 
   /// Set / reset a timeout for an fd.  When it fires, on_timeout() is called.
   /// Passing 0 cancels any existing timeout.
-  void SetTimeout(int fd, uint64_t timeout_ms)
+  void set_timeout(int fd, uint64_t timeout_ms)
   {
     if (timeout_ms == 0) {
       ReactorCmd cmd{}; cmd.type = CmdType::CancelTimeout; cmd.fd = fd;
@@ -368,7 +368,7 @@ public:
   // on_readable / on_writable / on_error / on_timeout are installed as
   // the I/O handlers for this fd after the connect completes.
   //----------------------------------------------------------------------------
-  void Connect(int            fd,
+  void connect(int            fd,
                struct sockaddr_in addr,
                uint64_t       timeout_ms,
                ErlNifPid      caller_pid,
@@ -398,11 +398,11 @@ public:
   //----------------------------------------------------------------------------
   // Accessors
   //----------------------------------------------------------------------------
-  const std::string& Ident()  const { return m_ident; }
-  reactor_handle_t   Handle() const { return m_handle; }
+  const std::string& ident()  const { return m_ident; }
+  reactor_handle_t   handle() const { return m_handle; }
 
 #if defined(REACTOR_BACKEND_URING)
-  struct io_uring* Ring() { return reactor_uring(m_handle); }
+  struct io_uring* ring() { return reactor_uring(m_handle); }
 #endif
 
 private:
@@ -427,9 +427,9 @@ private:
   {
     reactor_event_t events[kMaxEvents];
 
-    // Signal the caller of Start() that we are ready.
+    // Signal the caller of start() that we are ready.
     // This happens before the first reactor_wait() so any commands posted
-    // immediately after Start() returns are guaranteed to be seen.
+    // immediately after start() returns are guaranteed to be seen.
     {
       std::lock_guard<std::mutex> lk(m_ready_mu);
       m_ready = true;
@@ -461,8 +461,8 @@ private:
     // Drain any last commands before exit.
     drain_commands();
 
-    // Notify the owner if the loop exited for a reason other than Stop().
-    // Stop() sets m_running=false before the break condition fires, so
+    // Notify the owner if the loop exited for a reason other than stop().
+    // stop() sets m_running=false before the break condition fires, so
     // a normal shutdown has m_running==false AND abnormal_exit==false.
     if (abnormal_exit)
       send_reactor_exit(exit_errno);
@@ -545,7 +545,7 @@ private:
     ReactorCmd cmd;
     while (m_cmds.pop(cmd)) {
       switch (cmd.type) {
-        case CmdType::Stop:          m_running.store(false); return;
+        case CmdType::Stop:          m_running.store(false);           return;
         case CmdType::AddFd:         do_add_fd   (cmd.fd);             break;
         case CmdType::RemoveFd:      do_remove_fd(cmd.fd);             break;
         case CmdType::ArmWrite:      do_arm_write(cmd.fd);             break;
@@ -598,7 +598,7 @@ private:
     try {
       reactor_mod(m_handle, fd, ev);
     } catch (...) {
-      // fd was closed before the ArmWrite cmd was processed; treat as gone.
+      // fd was closed before the arm_write cmd was processed; treat as gone.
       do_remove_fd(fd);
     }
   }
@@ -704,7 +704,7 @@ private:
     //   timeout fires:    CQE[0].res=-ECANCELED,  CQE[1].res=0
     //   connect fails:    CQE[0].res=-Exxx,       CQE[1].res=-ECANCELED
     //
-    // reactor_wait translates the Connect CQE into a synthetic reactor_event_t
+    // reactor_wait translates the connect CQE into a synthetic reactor_event_t
     // with REACTOR_EV_CONNECT in the mask; dispatch() reads that flag here.
     // The Timeout CQE is silently dropped in reactor_wait.
     //
@@ -772,7 +772,7 @@ private:
         } else {
           // REACTOR_EV_CONNECT alone = success.
           // Install read-interest for subsequent I/O; the caller's on_readable
-          // (set via Reactor::Connect) is already in e->on_readable.
+          // (set via Reactor::connect) is already in e->on_readable.
           try {
             reactor_add(m_handle, fd, REACTOR_EV_IN | REACTOR_EV_RDHUP);
           } catch (...) {}
@@ -975,7 +975,7 @@ private:
   std::thread       m_thread;
   ErlNifPid         m_owner_pid{};  ///< receives exit notification on abnormal stop
 
-  // Ready-signal: Start() blocks until the reactor thread sets m_ready=true,
+  // Ready-signal: start() blocks until the reactor thread sets m_ready=true,
   // guaranteeing the caller can post commands without a startup race.
   std::mutex              m_ready_mu;
   std::condition_variable m_ready_cv;

@@ -91,7 +91,7 @@ static ERL_NIF_TERM init_pool_nif(
   ErlNifPid owner_pid;
   enif_self(env, &owner_pid);
   ctx->reactor_ptr = std::make_unique<arterial::Reactor>("arterial_pool");
-  ctx->reactor_ptr->Start(owner_pid);
+  ctx->reactor_ptr->start(owner_pid);
 
   return make_tuple(env, am_ok, ctx);
 }
@@ -158,7 +158,7 @@ static ERL_NIF_TERM register_socket_nif(
   conn.arm_read(env, ctx);
 
   if (ctx->monitor_owner(env, conn) != 0) {
-    ctx->reactor().RemoveFd(raw_fd);
+    ctx->reactor().remove_fd(raw_fd);
     stripe.release_slot(slot_id);
     return make_tuple(env, am_error, am_connect_failed);
   }
@@ -702,7 +702,7 @@ static ERL_NIF_TERM close_slot_nif(
     return enif_make_badarg(env);
   Connection& conn = *pconn;
 
-  // Bump generation BEFORE RemoveFd so any in-flight reactor callback that
+  // Bump generation BEFORE remove_fd so any in-flight reactor callback that
   // fires after this point sees a mismatched generation and skips the stale slot.
   conn.generation.fetch_add(1, std::memory_order_release);
 
@@ -724,7 +724,7 @@ static ERL_NIF_TERM close_slot_nif(
 #endif
 
   // Reactor closes the fd on its thread — no enif_select(STOP) needed.
-  ctx->reactor().RemoveFd(conn.fd);
+  ctx->reactor().remove_fd(conn.fd);
   conn.fd = -1;
   return am_ok;
 }
@@ -741,7 +741,7 @@ static ERL_NIF_TERM handle_connection_timeout_nif(
     return enif_make_badarg(env);
   Connection& conn = *pconn;
 
-  // Bump generation before RemoveFd so in-flight callbacks see stale gen.
+  // Bump generation before remove_fd so in-flight callbacks see stale gen.
   conn.generation.fetch_add(1, std::memory_order_release);
 
   // Free the slot.
@@ -761,7 +761,7 @@ static ERL_NIF_TERM handle_connection_timeout_nif(
     cleanup_slot_ssl(conn);
 #endif
     // Reactor closes the fd on its thread — race-free, no enif_select(STOP).
-    ctx->reactor().RemoveFd(fd);
+    ctx->reactor().remove_fd(fd);
   }
 
   return am_ok;
@@ -834,7 +834,7 @@ static ERL_NIF_TERM reactor_accept_nif(
 
   // Register the listen fd for persistent readable events.
   // The handler accepts and notifies owner_pid for each new connection.
-  ctx->reactor().AddFd(
+  ctx->reactor().add_fd(
     listen_fd,
     // on_readable: drain all pending connections and notify owner for each.
     // Loop until accept4 returns EAGAIN so no connections are missed when
@@ -882,7 +882,7 @@ static ERL_NIF_TERM reactor_close_fd_nif(
   int fd;
   if (!get(env, argv[0], ctx) || !get(env, argv[1], fd)) [[unlikely]]
     return enif_make_badarg(env);
-  ctx->reactor().RemoveFd(fd);
+  ctx->reactor().remove_fd(fd);
   return am_ok;
 }
 
@@ -923,7 +923,7 @@ static ERL_NIF_TERM reactor_register_client_nif(
   conn.arm_read(env, ctx);
 
   if (ctx->monitor_owner(env, conn) != 0) {
-    ctx->reactor().RemoveFd(client_fd);
+    ctx->reactor().remove_fd(client_fd);
     stripe.release_slot(slot_id);
     return make_tuple(env, am_error, am_connect_failed);
   }
