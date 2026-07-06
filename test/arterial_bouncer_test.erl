@@ -10,6 +10,7 @@ basic behavior of the bouncer component.
 %% Test that bouncer is started when bounce_interval_ms is configured
 bouncer_integration_test() ->
   ok = test_helper:set_log_level(),
+  {ok, _} = application:ensure_all_started(arterial),
 
   % Start a pool with bouncer configuration
   {ok, _SupPid} = arterial_pool:start_link(test_bouncer_pool, #{
@@ -40,12 +41,14 @@ bouncer_integration_test() ->
 
     ok
   after
-    arterial_pool:stop(test_bouncer_pool)
+    arterial_pool:stop(test_bouncer_pool),
+    application:stop(arterial)
   end.
 
 %% Test that bouncer is NOT started when bounce_interval_ms is undefined
 no_bouncer_test() ->
   ok = test_helper:set_log_level(),
+  {ok, _} = application:ensure_all_started(arterial),
 
   % Start a pool without bouncer configuration
   {ok, _SupPid} = arterial_pool:start_link(test_no_bouncer_pool, #{
@@ -71,13 +74,15 @@ no_bouncer_test() ->
 
     ok
   after
-    arterial_pool:stop(test_no_bouncer_pool)
+    arterial_pool:stop(test_no_bouncer_pool),
+    application:stop(arterial)
   end.
 
 %% Test bounce function directly (the connections will fail to connect,
 %% but bounce should handle the case gracefully)
 direct_bounce_test() ->
   ok = test_helper:set_log_level(),
+  {ok, _} = application:ensure_all_started(arterial),
 
   {ok, _SupPid} = arterial_pool:start_link(test_direct_bounce_pool, #{
     size => 1,
@@ -105,12 +110,14 @@ direct_bounce_test() ->
 
     ok
   after
-    arterial_pool:stop(test_direct_bounce_pool)
+    arterial_pool:stop(test_direct_bounce_pool),
+    application:stop(arterial)
   end.
 
 %% Test that throttling can be configured and works at the NIF level
 throttling_configuration_test() ->
   ok = test_helper:set_log_level(),
+  {ok, _} = application:ensure_all_started(arterial),
 
   % Start a pool with throttling configuration
   {ok, _SupPid} = arterial_pool:start_link(test_throttle_pool, #{
@@ -131,5 +138,6 @@ throttling_configuration_test() ->
     % send_and_release calls, but we can verify the configuration is correct
     ok
   after
-    arterial_pool:stop(test_throttle_pool)
+    arterial_pool:stop(test_throttle_pool),
+    application:stop(arterial)
   end.

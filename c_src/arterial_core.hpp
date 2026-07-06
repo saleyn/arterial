@@ -2,6 +2,7 @@
 
 #include "enif.hpp"
 #include "throttle.hpp"
+#include "arterial_connection.hpp"
 #include <atomic>
 #include <array>
 #include <vector>
@@ -30,55 +31,12 @@
 #include <openssl/opensslv.h>
 #endif
 
-using namespace nifpp;
-
-//=============================================================================
-// Custom Atoms (declared in global nifpp namespace)
-//=============================================================================
-
-NIFPP_ADD_KNOWN_ATOM(am_arterial_event);
-NIFPP_ADD_KNOWN_ATOM(am_read);
-NIFPP_ADD_KNOWN_ATOM(am_write);
-NIFPP_ADD_KNOWN_ATOM(am_closed);
-NIFPP_ADD_KNOWN_ATOM(am_stop);
-NIFPP_ADD_KNOWN_ATOM(am_connect_result);
-NIFPP_ADD_KNOWN_ATOM(am_connecting);
-NIFPP_ADD_KNOWN_ATOM(am_stripe_full);
-NIFPP_ADD_KNOWN_ATOM(am_max_slots_exceeded_64);
-NIFPP_ADD_KNOWN_ATOM(am_failed_to_set_nonblocking);
-NIFPP_ADD_KNOWN_ATOM(am_socket_failed);
-NIFPP_ADD_KNOWN_ATOM(am_connect_failed);
-NIFPP_ADD_KNOWN_ATOM(am_timeout);
-NIFPP_ADD_KNOWN_ATOM(am_write_failed);
-NIFPP_ADD_KNOWN_ATOM(am_no_connections_available);
-NIFPP_ADD_KNOWN_ATOM(am_unsupported_protocol);
-NIFPP_ADD_KNOWN_ATOM(am_socket_option_failed);
-
-NIFPP_ADD_KNOWN_ATOM(am_tcp);
-NIFPP_ADD_KNOWN_ATOM(am_udp);
-NIFPP_ADD_KNOWN_ATOM(am_ssl);
-
 namespace arterial {
 
-//=============================================================================
-// Core Enumerations
-//=============================================================================
+using namespace nifpp;
 
-enum SlotStatus : uint32_t {
-  SLOT_EMPTY         = 0,
-  SLOT_AVAILABLE     = 1,
-  SLOT_LEASED        = 2,
-  SLOT_WRITE_POLLING = 3,
-  SLOT_CONNECTING    = 4,
-  SLOT_SSL_HANDSHAKE = 5
-};
-
-enum ProtocolType : uint32_t {
-  PROTO_UNKNOWN = 0
-  PROTO_TCP     = 1,
-  PROTO_UDP     = 2,
-  PROTO_SSL     = 3
-};
+// Forward declarations
+struct PoolStripe;
 
 // 1. The protocol dispatcher
 template <typename Visitor>
@@ -134,95 +92,75 @@ auto visit_protocol_str(const char* protocol_str, Visitor&& visitor) {
 
 
 //=============================================================================
-// Core Data Structures
+// NIF Utility Functions
 //=============================================================================
 
-struct alignas(64) ConnSlot {
-  std::atomic<uint32_t> status{SLOT_EMPTY};
-  int fd{-1};
-  unsigned int stripe_id{0};
-  unsigned int slot_id{0};
+// Resolve {PoolRef, StripeId, SlotId} to a Connection&, or nullptr if any index is out of range.
+// This is used by handle_readable/3, handle_writable/3, close_slot/3, etc.
+inline Connection* resolve_slot(
+  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[], PoolContext** out_ctx);
 
-  // Long-lived process that owns this slot's read/write-ready
-  // notifications (set once, at register_socket/4 time).
-  ErlNifPid owner_pid{};
+// Time spacing throttling check - returns true if the request was allowed
+inline bool throttle_allow(PoolContext* ctx, Connection& slot);
 
-  std::vector<char> pending_buffer;
-  size_t bytes_written{0};
+// Return true, and parse an integer or boolean term into `value`
+inline bool get_int_or_bool_option(ErlNifEnv* env, ERL_NIF_TERM opt, int& value) {
+  if (get(env, opt, value)) return true;
+  if (enif_is_identical(opt, am_true))  { value = 1; return true; }
+  if (enif_is_identical(opt, am_false)) { value = 0; return true; }
+  return false;
+}
 
-  // Throttling state: time spacing throttle for this slot
-  arterial::time_spacing_throttle throttle{0, 1000};
+//===========================================================================
+// Socket option helper functions
+//===========================================================================
 
-#ifdef HAVE_OPENSSL
-  SSL* ssl{nullptr};
-  ProtocolType protocol{PROTO_TCP};
-#endif
-};
-
-// Fixed-size: ConnSlot/PoolStripe hold std::atomic members, so they're
-// neither movable nor copyable -- a std::vector<ConnSlot> could never
-// grow/resize (every growth path needs to relocate existing elements).
-// 64 is already the hard cap (lease_mask is one uint64), so a plain
-// array costs nothing extra.
-struct PoolStripe {
-  std::atomic<uint64_t> lease_mask;  // Initialized explicitly in
-                                     // init_pool_nif
-  std::array<ConnSlot, 64> slots{};
-  size_t capacity{0};
-};
-
-struct PoolContext {
-  // unique_ptr<PoolStripe>, not PoolStripe, for the same reason: the
-  // vector itself must be able to grow (move elements) at init_pool
-  // time, which a non-movable PoolStripe can't do directly.
-  std::vector<std::unique_ptr<PoolStripe>> stripes;
-  size_t stripe_count{0};
-
-  // Throttling configuration (0 means no throttling)
-  uint32_t throttle_rate_per_sec{0};   // requests per second
-  uint32_t throttle_window_msec{0};    // time window in milliseconds
-
-  // Raw fds aren't RAII-managed by any member here, so closing them on
-  // teardown needs an explicit destructor (unlike ConnectionPool in
-  // arterial.hpp, which owns no raw resources and needs none).
-  ~PoolContext() {
-    for (auto& stripe_ptr : stripes)
-      for (auto& slot : stripe_ptr->slots)
-        if (slot.fd != -1) close(slot.fd);
+// Helper function to set socket options using string name matching
+template<typename SetOptFunc>
+inline bool set_sockopt_by_name(const char* opt_name, const char* target_name,
+                                int opt_value, SetOptFunc set_func) {
+  if (strcmp(opt_name, target_name) == 0) {
+    return set_func(opt_value) == 0;  // setsockopt returns 0 on success
   }
-};
+  return false;  // Name doesn't match - continue to next option
+}
 
-//=============================================================================
-// Utility Functions
-//=============================================================================
+} // namespace arterial
 
-// Resolve {PoolRef, StripeId, SlotId} (the shape shared by
-// handle_readable/3, handle_writable/3, close_slot/3) to a ConnSlot&, or
-// nullptr if any index is out of range.
-inline ConnSlot* resolve_slot(ErlNifEnv* env, int argc,
-                             const ERL_NIF_TERM argv[],
-                             PoolContext** out_ctx) {
+// Include implementation details after forward declarations
+#include "arterial_pool.hpp"
+#include "arterial_socket.hpp"
+
+// Implementation of functions that require complete PoolContext definition
+namespace arterial {
+
+// Resolve {PoolRef, StripeId, SlotId} to a Connection&, or nullptr if any index is out of range
+inline Connection* resolve_slot(
+  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[], PoolContext** out_ctx)
+{
   PoolContext* ctx;
   unsigned int stripe_id, slot_id;
 
-  if (argc != 3 ||
-      !get(env, argv[0], ctx) ||
-      !get(env, argv[1], stripe_id) ||
-      !get(env, argv[2], slot_id)) {
-    return nullptr;
-  }
+  assert(argc == 3);
 
-  if (stripe_id >= ctx->stripe_count) return nullptr;
+  if  (!get(env, argv[0], ctx)
+    || !ctx
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
+    || !ctx->stripes[stripe_id]
+    || !get(env, argv[2], slot_id)) [[unlikely]]
+    return nullptr;
+
   auto& stripe = *ctx->stripes[stripe_id];
-  if (slot_id >= stripe.capacity) return nullptr;
+  if (slot_id >= stripe.capacity) [[unlikely]]
+    return nullptr;
 
   *out_ctx = ctx;
   return &stripe.slots[slot_id];
 }
 
 // Time spacing throttling check - returns true if the request was allowed
-inline bool throttle_allow(PoolContext* ctx, ConnSlot& slot) {
-  return ctx->throttle_rate_per_sec == 0                // No throttling configured
+inline bool throttle_allow(PoolContext* ctx, Connection& slot) {
+  return ctx->get_throttle_rate_per_sec() == 0                // No throttling configured
       || slot.throttle.add(1, arterial::now_utc()) > 0; // check if we can add one request
 }
 

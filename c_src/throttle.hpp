@@ -1,5 +1,5 @@
 //-----------------------------------------------------------------------------
-/// \file   rate_throttler.hpp
+/// \file  throttle.hpp
 //-----------------------------------------------------------------------------
 /// \brief Efficiently calculates the throttling rate over a number of seconds.
 ///
@@ -97,6 +97,10 @@ private:
 
 inline time_val now_utc() { return time_val::universal_time(); }
 
+//===========================================================================
+// Throttling Algorithm
+//===========================================================================
+
 /// @brief Throttle given rate over a number of seconds.
 /// Implementation uses time spacing reservation algorithm where each
 /// allocation of samples reserves a fraction of space in the throttling
@@ -192,6 +196,5 @@ private:
 };
 
 using time_spacing_throttle = basic_time_spacing_throttle<>;
-
 
 } // namespace arterial

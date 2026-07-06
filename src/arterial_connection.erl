@@ -234,12 +234,12 @@ handle_call({bounce, DrainTimeoutMs}, From, #state{pool = Pool, conn_id = ConnID
   {noreply, State#state{bounce = #bounce_state{from = From, deadline = Deadline}}};
 
 handle_call(Msg, _From, #state{pfx = Pfx} = State) ->
-  ?LOG_WARNING("~s got unexpected call: ~p", [Pfx, Msg]),
+  ?LOG_NOTICE("~s got unexpected call: ~p", [Pfx, Msg]),
   {reply, {error, unexpected_call}, State}.
 
 -doc false.
 handle_cast(Msg, #state{pfx = Pfx} = State) ->
-  ?LOG_WARNING("~s got unexpected cast: ~p", [Pfx, Msg]),
+  ?LOG_NOTICE("~s got unexpected cast: ~p", [Pfx, Msg]),
   {noreply, State}.
 
 -doc false.
@@ -249,22 +249,10 @@ handle_info(reconnect, State) ->
 handle_info(bounce_check, #state{bounce = #bounce_state{}} = State) ->
   bounce_check(State);
 
-handle_info({arterial_event, ConnID, 0, read}, #state{conn_id = ConnID} = State) ->
-  handle_read_event(State);
-
-handle_info({arterial_event, ConnID, 0, write}, #state{conn_id = ConnID, pool = Pool} = State) ->
-  case arterial_observe:enabled() of
-    false ->
-      _ = arterial_nif:handle_writable(arterial_pool:pool_ref(Pool), ConnID, 0);
-    true ->
-      arterial_observe:span([nif, write], #{pool => Pool, conn_id => ConnID}, fun() ->
-        case arterial_nif:handle_writable(arterial_pool:pool_ref(Pool), ConnID, 0) of
-          ok -> {ok, #{result => ok}};
-          closed -> {closed, #{result => closed}}
-        end
-      end)
-  end,
-  {noreply, State};
+%% Reactor NIF: data arrives pre-read from C++ reactor thread.
+%% The binary is already decoded from the socket; we just decode the protocol.
+handle_info({arterial_event, ConnID, 0, read, Bin}, #state{conn_id = ConnID} = State) ->
+  append_and_decode(Bin, State);
 
 handle_info({arterial_event, ConnID, 0, closed}, #state{conn_id = ConnID} = State) ->
   disconnect(closed, State#state{buffer = <<>>});
@@ -273,7 +261,7 @@ handle_info({arterial_event, ConnID, 0, connect_result, Result}, #state{conn_id 
   handle_connect_result(Result, State);
 
 handle_info(Msg, #state{pfx = Pfx} = State) ->
-  ?LOG_WARNING("~s got unexpected msg: ~p", [Pfx, Msg]),
+  ?LOG_NOTICE("~s got unexpected msg: ~p", [Pfx, Msg]),
   {noreply, State}.
 
 -doc false.
@@ -285,7 +273,9 @@ terminate(Reason, State) ->
 %%% Internal functions: connect/reconnect
 %%%-----------------------------------------------------------------------------
 
-reconnect(#state{addresses = Addresses} = State) ->
+reconnect(#state{addresses = Addresses, pool = Pool, conn_id = ConnID} = State) ->
+  % Emit reconnect event for observability
+  arterial_observe:event([reconnect, attempt], #{pool => Pool, conn_id => ConnID}),
   try_addresses(Addresses, State).
 
 try_addresses([], State) ->
@@ -312,7 +302,11 @@ try_addresses([Entry | Rest], #state{
             % Built-in NIF protocols
             case ActualSocketOpts of
               [] ->
-                arterial_nif:connect_async_proto(PoolRef, ConnID, IP, Port, Protocol, Nodelay, self());
+                % TEMPORARY FIX: Force use of synchronous connection to work around async event system issues
+                % Add a minimal socket option to trigger synchronous mode
+                MinimalOpts = [{sndbuf, 8192}],  % Set a simple send buffer size
+                arterial_nif:connect_proto_with_opts(PoolRef, ConnID, IP, Port,
+                    State#state.conn_timeout, Protocol, Nodelay, self(), MinimalOpts);
               _ ->
                 % Use the new socket options aware function
                 arterial_nif:connect_proto_with_opts(PoolRef, ConnID, IP, Port,
@@ -332,9 +326,9 @@ try_addresses([Entry | Rest], #state{
         {ok, _SlotId} ->
           % Connection completed immediately
           arterial_pool:set_available(Pool, ConnID),
+          arterial_observe:event([reconnect, success], #{pool => Pool, conn_id => ConnID}),
           {noreply, reset_backoff(State#state{connected = true})};
         {ok, connecting, _SlotId} ->
-          % Connection in progress, wait for completion message
           ?LOG_DEBUG("~s connecting asynchronously to ~s:~p", [Pfx, inet:ntoa(IP), Port]),
           {noreply, State};
         {error, Reason} ->
@@ -342,7 +336,7 @@ try_addresses([Entry | Rest], #state{
           try_addresses(Rest, State)
       end;
     {error, Reason} ->
-      ?LOG_WARNING("~s failed to resolve host ~p: ~p", [Pfx, Address, Reason]),
+      ?LOG_NOTICE("~s failed to resolve host ~p: ~p", [Pfx, Address, Reason]),
       try_addresses(Rest, State)
   end.
 
@@ -351,8 +345,9 @@ try_addresses([Entry | Rest], #state{
 %%%-----------------------------------------------------------------------------
 
 handle_connect_result(ok, #state{pfx = Pfx, pool = Pool, conn_id = ConnID} = State) ->
-  ?LOG_INFO("~s async connect completed successfully", [Pfx]),
+  ?LOG_DEBUG("~s async connect completed successfully", [Pfx]),
   arterial_pool:set_available(Pool, ConnID),
+  arterial_observe:event([reconnect, success], #{pool => Pool, conn_id => ConnID}),
   {noreply, reset_backoff(State#state{connected = true})};
 
 handle_connect_result(Error, #state{pfx = Pfx} = State) ->
@@ -363,27 +358,8 @@ handle_connect_result(Error, #state{pfx = Pfx} = State) ->
 %%% Internal functions: read path (decode + dispatch)
 %%%-----------------------------------------------------------------------------
 
-handle_read_event(#state{pool = Pool, conn_id = ConnID} = State) ->
-  PoolRef = arterial_pool:pool_ref(Pool),
-  case arterial_observe:enabled() of
-    false ->
-      case arterial_nif:handle_readable(PoolRef, ConnID, 0) of
-        {ok, Bin} -> append_and_decode(Bin, State);
-        closed -> disconnect(closed, State#state{buffer = <<>>})
-      end;
-    true ->
-      case arterial_observe:span([nif, read], #{pool => Pool, conn_id => ConnID}, fun() ->
-        case arterial_nif:handle_readable(PoolRef, ConnID, 0) of
-          {ok, Bin} ->
-            {{ok, Bin}, #{result => ok, bytes => byte_size(Bin)}};
-          closed ->
-            {closed, #{result => closed}}
-        end
-      end) of
-        {ok, Bin} -> append_and_decode(Bin, State);
-        closed -> disconnect(closed, State#state{buffer = <<>>})
-      end
-  end.
+%% handle_read_event/1 removed: the Reactor NIF reads data in C++ and delivers
+%% it directly as {arterial_event, ConnID, 0, read, Binary} — no NIF callback.
 
 append_and_decode(Bin, #state{pfx = Pfx, pool = Pool, codec = Codec, buffer = Buffer} = State) ->
   NewBuffer = <<Buffer/binary, Bin/binary>>,
@@ -391,7 +367,7 @@ append_and_decode(Bin, #state{pfx = Pfx, pool = Pool, codec = Codec, buffer = Bu
   try decode_loop(Codec, NewBuffer, CorrTable) of
     Rest -> {noreply, State#state{buffer = Rest}}
   catch error:{codec_decode_error, Reason} ->
-    ?LOG_WARNING("~s codec decode error, dropping connection: ~p", [Pfx, Reason]),
+    ?LOG_NOTICE("~s codec decode error, dropping connection: ~p", [Pfx, Reason]),
     disconnect({codec_error, Reason}, State#state{buffer = <<>>})
   end.
 
@@ -453,11 +429,16 @@ connection_drained(Pool, ConnID) ->
 %%%-----------------------------------------------------------------------------
 
 disconnect(Reason, #state{pool = Pool, conn_id = ConnID, connected = Connected} = State) ->
-  Connected andalso begin
+  PoolRef = arterial_pool:pool_ref(Pool),
+  if Connected ->
     arterial_pool:set_unavailable(Pool, ConnID),
     notify_inflight_disconnected(Pool, ConnID),
-    _ = arterial_nif:close_slot(arterial_pool:pool_ref(Pool), ConnID, 0),
-    arterial_observe:event([disconnect], #{pool => Pool, conn_id => ConnID, reason => Reason})
+    _ = arterial_nif:close_slot(PoolRef, ConnID, 0),
+    arterial_observe:event([disconnect], #{pool => Pool, conn_id => ConnID, reason => Reason});
+  true ->
+    % Not yet connected — slot may still be leased (SLOT_CONNECTING).
+    % close_slot clears the lease bit so the next reconnect can claim it.
+    _ = arterial_nif:close_slot(PoolRef, ConnID, 0)
   end,
   {noreply, recon_timer(State#state{connected = false})}.
 
@@ -467,11 +448,11 @@ disconnect(Reason, #state{pool = Pool, conn_id = ConnID, connected = Connected} 
 %% original backend.
 notify_inflight_disconnected(Pool, ConnID) ->
   CorrTable = arterial_pool:corr_table(Pool),
-  Matches = ets:match_object(CorrTable, {'_', '_', ConnID, '_'}),
-  lists:foreach(fun({CorrId, Pid, _ConnID, _Deadline}) ->
+  Fun = fun({CorrId, Pid, _ConnID, _Deadline}) ->
     ets:delete(CorrTable, CorrId),
     Pid ! {arterial_disconnected, Pool, CorrId}
-  end, Matches).
+  end,
+  arterial_util:ets_match_for_each(CorrTable, {'_', '_', ConnID, '_'}, 32, Fun).
 
 cancel_timer(undefined) -> ok;
 cancel_timer(TimerRef)  -> erlang:cancel_timer(TimerRef), ok.

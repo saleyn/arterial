@@ -50,7 +50,7 @@ Both `connect_async_nif` and `send_and_release_nif` use consistent slot claiming
 do {
     slot_id = std::countr_zero(~current_mask);  // Find first available slot
     if (static_cast<size_t>(slot_id) >= stripe.capacity) [[unlikely]] {
-        return make(env, std::make_tuple(am_error, am_stripe_full));
+        return make_tuple(env, am_error, am_stripe_full));
     }
 
     uint64_t target_bit = (1ULL << slot_id);
@@ -122,18 +122,18 @@ The throttling system has been **moved from Erlang to C++** for better performan
 
 - **Location**: Integrated directly in `send_and_release_nif` connection selection loop
 - **Algorithm**: Uses `arterial::time_spacing_throttle` from `throttle.hpp`
-- **Per-slot throttling**: Each `ConnSlot` has its own independent throttle state
+- **Per-slot throttling**: Each `Connection` has its own independent throttle state
 
 #### Time Spacing Throttle Implementation
 
 **Algorithm**: Time spacing reservation algorithm (not token bucket):
 ```cpp
-struct ConnSlot {
+struct Connection {
     arterial::time_spacing_throttle throttle{0, 1000};  // Per-slot throttle
     // ... other fields
 };
 
-static bool throttle_allow(PoolContext* ctx, ConnSlot& slot) {
+static bool throttle_allow(PoolContext* ctx, Connection& slot) {
     if (ctx->throttle_rate_per_sec == 0) {
         return true;  // No throttling configured
     }
@@ -183,7 +183,7 @@ if (candidate_slot.status.load(std::memory_order_relaxed) == SLOT_AVAILABLE &&
 #### Performance Characteristics
 
 - **Reduced syscalls**: No separate Erlang function calls for throttling
-- **Better cache locality**: Throttle state co-located with `ConnSlot` data
+- **Better cache locality**: Throttle state co-located with `Connection` data
 - **Atomic operations**: Combined check eliminates race windows
 - **High-precision timing**: Uses `arterial::now_utc()` instead of Erlang timing
 
@@ -198,7 +198,7 @@ if (candidate_slot.status.load(std::memory_order_relaxed) == SLOT_AVAILABLE &&
 #### Memory Management
 
 - **PoolContext**: RAII wrapper with explicit destructor for fd cleanup
-- **ConnSlot**: Cache-line aligned (`alignas(64)`) for performance
+- **Connection**: Cache-line aligned (`alignas(64)`) for performance
 - **SSL resources**: Proper OpenSSL cleanup when `HAVE_OPENSSL` is defined
 
 ### Performance Characteristics
@@ -211,7 +211,7 @@ if (candidate_slot.status.load(std::memory_order_relaxed) == SLOT_AVAILABLE &&
 
 #### Memory Layout
 
-- **Cache-line alignment**: `ConnSlot` structs aligned to 64-byte boundaries
+- **Cache-line alignment**: `Connection` structs aligned to 64-byte boundaries
 - **Fixed-size arrays**: Prevents vector reallocation of non-movable atomics
 - **Inline buffers**: Small I/O vectors avoid heap allocation
 

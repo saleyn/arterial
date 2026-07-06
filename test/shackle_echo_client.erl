@@ -18,7 +18,11 @@ test fixtures.
 init(_Options) ->
   {ok, #st{}}.
 
-setup(_Socket, State) ->
+setup(Socket, State) ->
+  % shackle_server resets the socket to {active,true} without binary,
+  % reverting to list mode delivery.  Re-apply binary here to ensure
+  % shackle_telemetry:recv/2 receives a binary (it calls size/1).
+  inet:setopts(Socket, [binary]),
   {ok, State}.
 
 handle_request(Request, #st{next_id = ReqID} = State) ->
@@ -28,7 +32,7 @@ handle_request(Request, #st{next_id = ReqID} = State) ->
 handle_data(Data, #st{buf = Buf} = State) ->
   %% OTP 29 compatibility: ensure Data is binary
   DataBin = case is_binary(Data) of
-    true -> Data;
+    true  -> Data;
     false -> iolist_to_binary(Data)
   end,
   decode_all(<<Buf/binary, DataBin/binary>>, [], State).

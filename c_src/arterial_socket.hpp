@@ -1,242 +1,292 @@
 #pragma once
 
-#include "arterial_core.hpp"
-#include "arterial_protocol.hpp"
+#include "enif.hpp"
+#include "arterial_types.hpp"
 
 namespace arterial {
+
+// Forward declarations to avoid circular includes
+struct PoolContext;
+struct Connection;
+
+using namespace nifpp;
 
 //=============================================================================
 // Socket Options Management
 //=============================================================================
 
-// Apply socket options to a file descriptor
-bool apply_sock_opts(int fd, ErlNifEnv* env, ERL_NIF_TERM sock_opts_list) {
-  ERL_NIF_TERM head, tail = sock_opts_list;
+// If the {OptName, OptValue} option matches given name, set it by calling Fun(fd, value)
+template <typename Fun>
+inline bool set_int_or_bool_sockopt(
+  ErlNifEnv* env, const ERL_NIF_TERM* opts,
+  ERL_NIF_TERM name, Fun f, ERL_NIF_TERM& err)
+{
+  if (!enif_is_identical(opts[0], name)) return false;
+  int value;
+  if (get(env, opts[1], value)) goto SET;
+  if (enif_is_identical(opts[1], am_true))  { value = 1; goto SET; }
+  if (enif_is_identical(opts[1], am_false)) { value = 0; goto SET; }
 
+  err = name;
+  return false;
+
+SET:
+  auto res = f(value) == 0;  // setsockopt returns 0 on success
+  if (!res) [[unlikely]] err = name;
+  return res;
+}
+
+// If the {OptName, OptValue} option matches given name, set it
+inline bool set_int_or_bool_sockopt(
+  ErlNifEnv* env, const ERL_NIF_TERM* opts, ERL_NIF_TERM name, int fd,
+  int opt_class, int opt_type, ERL_NIF_TERM& err)
+{
+  auto f = [=](int v) {
+    return setsockopt(fd, opt_class, opt_type, &v, sizeof(v));
+  };
+  return set_int_or_bool_sockopt(env, opts, name, f, err);
+}
+
+// If the {OptName, OptValue} option matches given name, set it
+inline bool set_atom_sockopt(
+  const ERL_NIF_TERM opt, ERL_NIF_TERM name,
+  int fd, int opt_class, int opt_type, ERL_NIF_TERM& err)
+{
+  if (!enif_is_identical(opt, name)) return false;
+  static constexpr int v = 1;
+  auto res = setsockopt(fd, opt_class, opt_type, &v, sizeof(v)) == 0;
+  if (!res) [[unlikely]] err = name;
+  return res;
+}
+
+template <typename Tuple, typename Fun>
+inline bool set_tuple_sockopt(
+  ErlNifEnv* env, const ERL_NIF_TERM* opts, ERL_NIF_TERM name,
+  Fun f, ERL_NIF_TERM& err)
+{
+  if (!enif_is_identical(opts[0], name)) return false;
+  Tuple tup;
+  if (!get(env, opts[1], tup)) [[unlikely]] { err = name; return false; }
+  auto res = f(tup) == 0;
+  if (!res) [[unlikely]] err = name;
+  return res;
+}
+
+// If the {OptName, OptValue :: {{A,B,C,D}, {E,F,G,H}}} option matches given name, set it
+inline bool set_addr_sockopt(
+  ErlNifEnv* env, const ERL_NIF_TERM* opts, ERL_NIF_TERM name,
+  int fd, int opt_class, int opt_type, ERL_NIF_TERM& err)
+{
+  return set_tuple_sockopt<std::tuple<ERL_NIF_TERM, ERL_NIF_TERM>>(
+    env, opts, name,
+    [=](auto& tup) {
+      auto& maddr = std::get<0>(tup);
+      auto& iaddr = std::get<1>(tup);
+      IP4Tuple mcast_addr, if_addr;
+      if (!get(env, maddr, mcast_addr) || !get(env, iaddr, if_addr)) {
+        return false;
+      }
+      struct ip_mreq mreq;
+      auto [m0, m1, m2, m3] = mcast_addr;
+      auto [i0, i1, i2, i3] = if_addr;
+      mreq.imr_multiaddr.s_addr = htonl((m0 << 24) | (m1 << 16) | (m2 << 8) | m3);
+      mreq.imr_interface.s_addr = htonl((i0 << 24) | (i1 << 16) | (i2 << 8) | i3);
+      return setsockopt(fd, opt_class, opt_type, &mreq, sizeof(mreq)) == 0;
+    }, err);
+}
+
+//===========================================================================
+// Socket Options Application
+//===========================================================================
+
+/**
+ * @brief Applies a list of socket options to a file descriptor.
+ *
+ * This function processes an Erlang list of socket options and applies them to the
+ * specified file descriptor. It supports both atom-based options (e.g., 'keepalive')
+ * and tuple-based options (e.g., {sndbuf, 8192}) with comprehensive error handling.
+ *
+ * @param fd The file descriptor to configure
+ * @param env The NIF environment for Erlang term operations
+ * @param options_list Erlang list of socket options to apply
+ *
+ * @return true if all options were applied successfully, false on any failure
+ *
+ * ## Supported Option Formats
+ *
+ * ### Atom-based Options (boolean flags):
+ * - `keepalive` - Enable TCP keepalive (SO_KEEPALIVE)
+ * - `nodelay` - Disable Nagle algorithm (TCP_NODELAY)
+ * - `reuseaddr` - Allow address reuse (SO_REUSEADDR)
+ *
+ * ### Tuple-based Options {Option, Value}:
+ *
+ * #### Buffer Management:
+ * - `{sndbuf, Size}` - Set send buffer size (SO_SNDBUF)
+ * - `{rcvbuf, Size}` - Set receive buffer size (SO_RCVBUF)
+ * - `{rcvlowat, Size}` - Set receive low-water mark (SO_RCVLOWAT)
+ * - `{sndlowat, Size}` - Set send low-water mark (SO_SNDLOWAT)
+ *
+ * #### TCP-specific:
+ * - `{keepidle, Seconds}` - Time before keepalive probes (TCP_KEEPIDLE)
+ * - `{keepintvl, Seconds}` - Interval between keepalive probes (TCP_KEEPINTVL)
+ * - `{keepcnt, Count}` - Number of keepalive probes (TCP_KEEPCNT)
+ * - `{user_timeout, Ms}` - TCP user timeout (TCP_USER_TIMEOUT)
+ * - `{cork, Boolean}` - TCP cork option (TCP_CORK)
+ * - `{quickack, Boolean}` - TCP quick ACK (TCP_QUICKACK)
+ *
+ * #### Quality of Service:
+ * - `{priority, Level}` - Socket priority (SO_PRIORITY)
+ * - `{tos, Value}` - Type of Service field (IP_TOS)
+ *
+ * #### Connection Lifecycle:
+ * - `{linger, Seconds}` - Linger timeout on close (SO_LINGER)
+ * - `{linger, {Boolean, Seconds}}` - Linger with enable flag
+ *
+ * #### Multicast Options:
+ * - `{multicast_ttl, TTL}` - Multicast time-to-live (IP_MULTICAST_TTL)
+ * - `{multicast_loop, Boolean}` - Multicast loopback (IP_MULTICAST_LOOP)
+ * - `{multicast_if, {A,B,C,D}}` - Multicast interface address (IP_MULTICAST_IF)
+ * - `{add_membership, {{A,B,C,D}, {E,F,G,H}}}` - Join multicast group
+ * - `{drop_membership, {{A,B,C,D}, {E,F,G,H}}}` - Leave multicast group
+ *
+ * ## Examples
+ *
+ * ```erlang
+ * % Atom-based options
+ * Options1 = [keepalive, nodelay, reuseaddr],
+ *
+ * % Mixed atom and tuple options
+ * Options2 = [
+ *   nodelay,
+ *   {sndbuf, 65536},
+ *   {rcvbuf, 65536},
+ *   {keepidle, 7200}
+ * ],
+ *
+ * % Advanced multicast configuration
+ * Options3 = [
+ *   {multicast_ttl, 1},
+ *   {multicast_if, {192, 168, 1, 100}},
+ *   {add_membership, {{224, 0, 0, 1}, {192, 168, 1, 100}}}
+ * ].
+ * ```
+ *
+ * ## Error Handling
+ *
+ * The function uses short-circuit evaluation with chained boolean operators.
+ * If any option fails to apply (setsockopt returns error), the entire function
+ * returns false immediately. This ensures atomic application - either all
+ * options succeed or none are applied.
+ *
+ * ## Implementation Notes
+ *
+ * - Uses helper functions like `set_atom_sockopt()` and `set_int_or_bool_sockopt()`
+ *   for type-safe option parsing and application
+ * - Supports lambda functions for complex options like linger and multicast TTL
+ * - Handles both IPv4 addresses as 4-tuples and structured data types
+ * - Empty option list is treated as success (no-op)
+ *
+ * ## Platform Compatibility
+ *
+ * Some socket options may not be available on all platforms:
+ * - TCP_USER_TIMEOUT: Linux-specific
+ * - TCP_CORK: Linux-specific
+ * - TCP_QUICKACK: Linux-specific
+ * - Multicast options: May vary by OS and network stack
+ *
+ * @see arterial::set_atom_sockopt() for atom option handling
+ * @see arterial::set_int_or_bool_sockopt() for tuple option handling
+ * @see arterial::set_tuple_sockopt() for complex tuple options
+ * @see setsockopt(2) for underlying socket option semantics
+ */
+bool apply_sock_opts(int fd, ErlNifEnv* env, ERL_NIF_TERM options_list, ERL_NIF_TERM& err) {
+  err = 0;
+
+  if (enif_is_empty_list(env, options_list))
+    return true; // No options to apply
+
+  ERL_NIF_TERM head, tail = options_list;
   while (enif_get_list_cell(env, tail, &head, &tail)) {
+    // Parse each option - can be atom or tuple-based options {Option, Value}
     const ERL_NIF_TERM* tuple_elements;
-    int tuple_arity;
+    int                 tuple_arity;
 
     if (enif_is_atom(env, head)) {
-      // Handle atom-only options like 'keepalive', 'nodelay', 'reuseaddr'
-      char atom_name[64];
-      if (!enif_get_atom(env, head, atom_name, sizeof(atom_name), ERL_NIF_LATIN1)) {
-        continue; // Skip invalid atoms
+      // Handle common atom-based options - try each one until one matches
+      if  (arterial::set_atom_sockopt(head, am_keepalive, fd, SOL_SOCKET,  SO_KEEPALIVE, err)
+        || arterial::set_atom_sockopt(head, am_nodelay,   fd, IPPROTO_TCP, TCP_NODELAY, err)
+        || arterial::set_atom_sockopt(head, am_reuseaddr, fd, SOL_SOCKET,  SO_REUSEADDR, err)
+      ) {
+        // One of the options matched and was set successfully
+        continue;
+      } else {
+        // If none of the atom options matched, that's an error
+        err = am_invalid_option;
+        return false;
       }
-
-      if (strcmp(atom_name, "keepalive") == 0) {
-        int val = 1;
-        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val));
-      } else if (strcmp(atom_name, "nodelay") == 0) {
-        int val = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
-      } else if (strcmp(atom_name, "reuseaddr") == 0) {
-        int val = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
+    } else if (enif_get_tuple(env, head, &tuple_arity, &tuple_elements) && tuple_arity == 2 &&
+               enif_is_atom(env, tuple_elements[0])) {
+      // Handle tuple-based options {Option, Value} - try each one until one matches
+      if  (arterial::set_int_or_bool_sockopt(env, tuple_elements, am_keepalive, fd, SOL_SOCKET,  SO_KEEPALIVE, err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_nodelay,   fd, IPPROTO_TCP, TCP_NODELAY, err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_linger,
+            [fd](int v) {
+              struct linger l = {.l_onoff = 1, .l_linger = v /* seconds */};
+              return setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
+            }, err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_reuseaddr,     fd, SOL_SOCKET,  SO_REUSEADDR,     err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_sndbuf,        fd, SOL_SOCKET,  SO_SNDBUF,        err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_rcvbuf,        fd, SOL_SOCKET,  SO_RCVBUF,        err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_recvbuf,       fd, SOL_SOCKET,  SO_RCVBUF,        err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_priority,      fd, SOL_SOCKET,  SO_PRIORITY,      err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_tos,           fd, IPPROTO_IP,  IP_TOS,           err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_user_timeout,  fd, IPPROTO_TCP, TCP_USER_TIMEOUT, err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_cork,          fd, IPPROTO_TCP, TCP_CORK,         err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_quickack,      fd, IPPROTO_TCP, TCP_QUICKACK,     err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_rcvlowat,      fd, SOL_SOCKET,  SO_RCVLOWAT,      err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_sndlowat,      fd, SOL_SOCKET,  SO_SNDLOWAT,      err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_keepidle,      fd, IPPROTO_TCP, TCP_KEEPIDLE,     err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_keepintvl,     fd, IPPROTO_TCP, TCP_KEEPINTVL,    err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_keepcnt,       fd, IPPROTO_TCP, TCP_KEEPCNT,      err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_multicast_ttl,
+            [fd](int v) {
+              unsigned char ttl = (unsigned char)v;
+              return setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+            }, err)
+        || arterial::set_int_or_bool_sockopt(env, tuple_elements, am_multicast_loop, fd, IPPROTO_IP, IP_MULTICAST_LOOP, err)
+        || arterial::set_tuple_sockopt<std::tuple<bool, int>>(env, tuple_elements, am_linger,
+            [fd](const std::tuple<bool, int>& tup) {
+              struct linger l = {.l_onoff = std::get<0>(tup) ? 1 : 0, .l_linger = std::get<1>(tup) /* seconds */};
+              return setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
+            }, err)
+        // Handle {multicast_if, {A, B, C, D}} format for interface address
+        || set_tuple_sockopt<IP4Tuple>
+            (env, tuple_elements, am_multicast_if,
+            [fd](const auto& arg) {
+              auto& [o0, o1, o2, o3] = arg;
+              struct in_addr interface_addr;
+              interface_addr.s_addr = htonl((o0 << 24) | (o1 << 16) | (o2 << 8) | o3);
+              return setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &interface_addr, sizeof(interface_addr));
+            }, err)
+        // Handle {add_membership, {{A,B,C,D}, {E,F,G,H}}} format
+        || set_addr_sockopt(env, tuple_elements, am_add_membership, fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, err)
+        // Handle {drop_membership, {{A,B,C,D}, {E,F,G,H}}} format
+        || set_addr_sockopt(env, tuple_elements, am_drop_membership, fd, IPPROTO_IP, IP_DROP_MEMBERSHIP, err)
+      ) {
+        // One of the options matched and was set successfully
+        continue;
+      } else {
+        // If none of the tuple options matched, that's an error
+        err = am_invalid_option;
+        return false;
       }
-      // Add other atom options as needed
-
-    } else if (enif_get_tuple(env, head, &tuple_arity, &tuple_elements) && tuple_arity == 2) {
-      // Handle {Option, Value} tuples
-      char option_name[64];
-      if (!enif_get_atom(env, tuple_elements[0], option_name, sizeof(option_name), ERL_NIF_LATIN1)) {
-        continue; // Skip invalid option names
-      }
-
-      if (strcmp(option_name, "keepalive") == 0) {
-        char bool_val[8];
-        int val = 0;
-        if (enif_get_atom(env, tuple_elements[1], bool_val, sizeof(bool_val), ERL_NIF_LATIN1) &&
-            strcmp(bool_val, "true") == 0) {
-          val = 1;
-        }
-        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val));
-
-      } else if (strcmp(option_name, "sndbuf") == 0) {
-        int val;
-        if (enif_get_int(env, tuple_elements[1], &val) && val > 0) {
-          setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &val, sizeof(val));
-        }
-
-      } else if (strcmp(option_name, "recvbuf") == 0 || strcmp(option_name, "rcvbuf") == 0) {
-        int val;
-        if (enif_get_int(env, tuple_elements[1], &val) && val > 0) {
-          setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &val, sizeof(val));
-        }
-
-      } else if (strcmp(option_name, "priority") == 0) {
-        int val;
-        if (enif_get_int(env, tuple_elements[1], &val) && val >= 0 && val <= 6) {
-          setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &val, sizeof(val));
-        }
-
-      } else if (strcmp(option_name, "tos") == 0) {
-        int val;
-        if (enif_get_int(env, tuple_elements[1], &val)) {
-          setsockopt(fd, IPPROTO_IP, IP_TOS, &val, sizeof(val));
-        }
-
-      } else if (strcmp(option_name, "linger") == 0) {
-        const ERL_NIF_TERM* linger_tuple;
-        int linger_arity;
-        if (enif_get_tuple(env, tuple_elements[1], &linger_arity, &linger_tuple) && linger_arity == 2) {
-          struct linger ling = {0};
-          char bool_val[8];
-          if (enif_get_atom(env, linger_tuple[0], bool_val, sizeof(bool_val), ERL_NIF_LATIN1) &&
-              strcmp(bool_val, "true") == 0) {
-            ling.l_onoff = 1;
-          }
-          enif_get_int(env, linger_tuple[1], &ling.l_linger);
-          setsockopt(fd, SOL_SOCKET, SO_LINGER, &ling, sizeof(ling));
-        }
-
-      } else if (strcmp(option_name, "multicast_ttl") == 0) {
-        int ttl;
-        if (enif_get_int(env, tuple_elements[1], &ttl) && ttl >= 0 && ttl <= 255) {
-          setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
-        }
-
-      } else if (strcmp(option_name, "multicast_loop") == 0) {
-        char bool_val[8];
-        unsigned char loop = 0;
-        if (enif_get_atom(env, tuple_elements[1], bool_val, sizeof(bool_val), ERL_NIF_LATIN1) &&
-            strcmp(bool_val, "true") == 0) {
-          loop = 1;
-        }
-        setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
-
-      } else if (strcmp(option_name, "multicast_if") == 0) {
-        const ERL_NIF_TERM* addr_tuple;
-        int addr_arity;
-        if (enif_get_tuple(env, tuple_elements[1], &addr_arity, &addr_tuple) && addr_arity == 4) {
-          struct in_addr addr;
-          int a, b, c, d;
-          if (enif_get_int(env, addr_tuple[0], &a) && enif_get_int(env, addr_tuple[1], &b) &&
-              enif_get_int(env, addr_tuple[2], &c) && enif_get_int(env, addr_tuple[3], &d)) {
-            addr.s_addr = htonl((a << 24) | (b << 16) | (c << 8) | d);
-            setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &addr, sizeof(addr));
-          }
-        }
-
-      } else if (strcmp(option_name, "add_membership") == 0 || strcmp(option_name, "drop_membership") == 0) {
-        const ERL_NIF_TERM* membership_tuple;
-        int membership_arity;
-        if (enif_get_tuple(env, tuple_elements[1], &membership_arity, &membership_tuple) && membership_arity == 2) {
-          const ERL_NIF_TERM* mcast_addr_tuple;
-          const ERL_NIF_TERM* iface_addr_tuple;
-          int mcast_arity, iface_arity;
-
-          if (enif_get_tuple(env, membership_tuple[0], &mcast_arity, &mcast_addr_tuple) && mcast_arity == 4 &&
-              enif_get_tuple(env, membership_tuple[1], &iface_arity, &iface_addr_tuple) && iface_arity == 4) {
-
-            struct ip_mreq mreq;
-            int ma, mb, mc, md, ia, ib, ic, id;
-
-            if (enif_get_int(env, mcast_addr_tuple[0], &ma) && enif_get_int(env, mcast_addr_tuple[1], &mb) &&
-                enif_get_int(env, mcast_addr_tuple[2], &mc) && enif_get_int(env, mcast_addr_tuple[3], &md) &&
-                enif_get_int(env, iface_addr_tuple[0], &ia) && enif_get_int(env, iface_addr_tuple[1], &ib) &&
-                enif_get_int(env, iface_addr_tuple[2], &ic) && enif_get_int(env, iface_addr_tuple[3], &id)) {
-
-              mreq.imr_multiaddr.s_addr = htonl((ma << 24) | (mb << 16) | (mc << 8) | md);
-              mreq.imr_interface.s_addr = htonl((ia << 24) | (ib << 16) | (ic << 8) | id);
-
-              int opt = (strcmp(option_name, "add_membership") == 0) ? IP_ADD_MEMBERSHIP : IP_DROP_MEMBERSHIP;
-              setsockopt(fd, IPPROTO_IP, opt, &mreq, sizeof(mreq));
-            }
-          }
-        }
-      }
-      // Add other {Option, Value} options as needed
+    } else {
+      return false;
     }
   }
 
-  return true; // Continue gracefully even if some options fail
-}
-
-//=============================================================================
-// Socket Operations
-//=============================================================================
-
-// Set up the event notification system for a slot
-void arm_read(ErlNifEnv* env, PoolContext* ctx, ConnSlot& slot) {
-  enif_select(env, slot.fd, ERL_NIF_SELECT_READ | ERL_NIF_SELECT_CUSTOM_MSG,
-              ctx, &slot.owner_pid, am_arterial_event);
-}
-
-void arm_write(ErlNifEnv* env, PoolContext* ctx, ConnSlot& slot) {
-  enif_select(env, slot.fd, ERL_NIF_SELECT_WRITE | ERL_NIF_SELECT_CUSTOM_MSG,
-              ctx, &slot.owner_pid, am_arterial_event);
-}
-
-void arm_connect(ErlNifEnv* env, PoolContext* ctx, ConnSlot& slot) {
-  enif_select(env, slot.fd, ERL_NIF_SELECT_WRITE | ERL_NIF_SELECT_CUSTOM_MSG,
-              ctx, &slot.owner_pid, am_arterial_event);
-}
-
-// Message generation for connection results
-TERM make_connect_result_msg(nifpp::msg_env& msg_env, unsigned int stripe_id,
-                            unsigned int slot_id, TERM result) {
-  return make(msg_env, std::make_tuple(am_arterial_event, stripe_id, slot_id,
-                                       am_connect_result, result));
-}
-
-// Cleanup a slot and notify of closure
-void notify_and_close(ErlNifEnv* env, PoolContext* ctx, ConnSlot& slot) {
-  nifpp::msg_env msg_env;
-  auto msg = make(msg_env, std::make_tuple(am_arterial_event,
-                                          slot.stripe_id, slot.slot_id, am_closed));
-  enif_send(env, &slot.owner_pid, msg_env, msg);
-
-  if (slot.fd != -1) {
-    close(slot.fd);
-    slot.fd = -1;
-  }
-
-  slot.pending_buffer.clear();
-  slot.bytes_written = 0;
-  slot.status.store(SLOT_EMPTY, std::memory_order_release);
-
-  auto& stripe = *ctx->stripes[slot.stripe_id];
-  stripe.lease_mask.fetch_or(1ULL << slot.slot_id, std::memory_order_release);
-}
-
-// Claim the first unregistered slot in `stripe` for `fd`/`owner_pid` via
-// CAS on its lease mask, arm its first read-readiness notification, and
-// return the claimed slot id
-ERL_NIF_TERM claim_slot(ErlNifEnv* env, PoolContext* ctx,
-                       PoolStripe& stripe, int fd,
-                       ErlNifPid owner_pid) {
-  uint64_t current_mask = stripe.lease_mask.load(std::memory_order_relaxed);
-  while (true) {
-    int slot_id = std::countr_zero(~current_mask);
-    if (static_cast<size_t>(slot_id) >= stripe.capacity) [[unlikely]]
-      return make(env, std::make_tuple(am_error, am_stripe_full));
-
-    auto& slot = stripe.slots[slot_id];
-    if (slot.fd > -1) {
-      current_mask |= (1ULL << slot_id);
-      continue;
-    }
-
-    slot.fd = fd;
-    slot.owner_pid = owner_pid;
-    slot.status.store(SLOT_AVAILABLE, std::memory_order_relaxed);
-
-    uint64_t target_bit = (1ULL << slot_id);
-    uint64_t new_mask   = current_mask | target_bit;
-
-    if (stripe.lease_mask.compare_exchange_weak(
-          current_mask, new_mask,
-          std::memory_order_release,
-          std::memory_order_relaxed)) {
-      arm_read(env, ctx, slot);
-      return make(env, std::make_tuple(am_ok,
-                                      static_cast<unsigned int>(slot_id)));
-    }
-
-    slot.fd = -1;
-    slot.status.store(SLOT_EMPTY, std::memory_order_relaxed);
-  }
+  return true;
 }
 
 } // namespace arterial

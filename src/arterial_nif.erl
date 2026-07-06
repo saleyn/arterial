@@ -42,10 +42,14 @@ group membership management. See `connect_proto_with_opts/9`.
 """.
 
 -export([init/0]).
--export([init_pool/2, configure_throttle/3, register_socket/4, connect/7, connect_async/6, connect_proto/8, connect_async_proto/7, send_and_release/3]).
+-export([init_pool/2, configure_throttle/3, register_socket/4, connect/7, connect_async/6, connect_proto/8, connect_async_proto/7, send_and_release/3, send_on_slot/4]).
 -export([connect_with_opts/8, connect_proto_with_opts/9]).
--export([handle_readable/3, handle_writable/3, close_slot/3]).
+-export([handle_readable/3, handle_writable/3, close_slot/3, handle_connection_timeout/3]).
+-export([reactor_listen/2, reactor_accept/3, reactor_close_fd/2, reactor_register_client/4]).
 -export([is_slot_available/3, set_slot_available/3, set_slot_unavailable/3]).
+-export([reserve_fifo_connection/3, send_fifo_request/6, release_fifo_connection/4, fifo_connection_status/3, handle_fifo_reply/4]).
+-export([reserve_send_fifo_request/5]). % New combined function (#3)
+-export([info/0]).
 
 -on_load(init/0).
 
@@ -241,39 +245,125 @@ connect_async_proto(_PoolRef, _StripeId, _IP, _Port, _Protocol, _Nodelay, _Owner
   ?NOT_LOADED_ERROR.
 
 -doc """
-Write `IoList` (a list of binaries) to any currently idle slot of stripe
-`StripeId`, chosen automatically (lock-free CAS over the stripe's lease
-bitmask) -- the calling process never picks (or even learns, in advance)
-which physical socket it lands on.
+Write `IoList` (a list of binaries) to **any** currently idle slot of stripe
+`StripeId`, chosen automatically via a lock-free CAS over the stripe's
+lease bitmask.
 
-Runs the `write(2)`/`writev(2)` syscall synchronously inside the calling
-process. If the kernel socket buffer can't accept all of `IoList`
-immediately, the remainder is buffered and flushed later via
-`handle_writable/3` (called by the slot's owner, not this caller) --
-either way, `{ok, SlotId}` is returned as soon as the bytes are *accepted*
-(by the kernel or this NIF's own pending buffer), not once a peer
-necessarily receives them. The returned `SlotId` is the caller's only way
-to know which physical connection carried this write (e.g. to record
-alongside a request's correlation id for later disconnect-notification
-bookkeeping, see `arterial_connection`).
+The calling process does not pick which slot is used and does not learn it
+in advance. The returned `SlotId` is the only way to discover which physical
+connection carried the write — useful when recording a correlation-id for
+later disconnect-notification bookkeeping (see `arterial_connection`).
 
-`{error, no_connections_available}` if every slot in `StripeId` is
-currently unregistered or already leased (busy writing/flushing) --
-callers are expected to retry against a different `StripeId` themselves
-(see `arterial_client`); this NIF never spreads one logical request
-across stripes.
+`writev(2)` runs synchronously inside the calling process. If the kernel
+buffer cannot accept all bytes immediately, the remainder is buffered and
+flushed asynchronously by the slot owner's `handle_writable/3` call;
+`{ok, SlotId}` is returned as soon as the bytes are accepted by the kernel
+or the NIF's own pending buffer.
+
+Returns `{error, pool_busy}` when every slot in the stripe is currently
+leased or not yet registered. Callers are expected to retry against a
+different stripe (see `arterial_client`); this NIF never spreads one
+request across stripes.
+
+## When to use
+
+Use `send_and_release/3` for the **server-side echo / fan-out** pattern,
+where many slots exist in a stripe and any idle connection can carry the
+next outbound message:
+
+- The stripe acts as an anonymous connection pool.
+- The caller does not care *which* connection is used.
+- At most one Erlang process per slot (the slot owner) is waiting for an
+  inbound event on that slot, so routing is unambiguous regardless of which
+  slot is chosen.
+
+A typical server echo loop looks like:
+
+```erlang
+handle({arterial_event, StripeId, _SlotId, read, Bin}) ->
+    {ok, _} = arterial_nif:send_and_release(PoolRef, StripeId, [Bin]).
+```
+
+**Do not use** `send_and_release/3` when multiple independent Erlang
+processes each own a distinct slot in the same stripe and each must receive
+its own reply. In that case use `send_on_slot/4`.
 
 ## Examples
 
 ```
 1> arterial_nif:send_and_release(PoolRef, 0, [<<1,2,3>>]).
-{ok, SlotId}
+{ok, 0}
 ```
 """.
 -spec send_and_release(pool_ref(), non_neg_integer(), [binary()]) ->
   {ok, non_neg_integer()} |
-  {error, no_connections_available | write_failed}.
+  {error, pool_busy | write_failed}.
 send_and_release(_PoolRef, _StripeId, _IoList) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Write `IoList` to a **specific** slot identified by `{StripeId, SlotId}`.
+
+Unlike `send_and_release/3`, this function targets a named slot directly
+rather than scanning the stripe for any idle connection. The lease bit for
+`SlotId` is claimed atomically, the data is written synchronously via
+`writev(2)`, and the bit is released on completion. A partial write
+(EAGAIN on a non-loopback socket) buffers the remainder and arms a writable
+callback exactly as `send_and_release/3` does.
+
+Returns `ok` (not `{ok, SlotId}`) because the slot identity is already
+known to the caller.
+
+Returns `{error, pool_busy}` when the target slot is currently leased by
+another writer (e.g. a concurrent partial-write flush is in progress).
+
+## When to use
+
+Use `send_on_slot/4` for the **client-side request** pattern, where each
+Erlang process owns a dedicated slot and must ensure its request travels
+over its own TCP connection so the reply is delivered back to it:
+
+- Multiple worker processes share a single stripe (fewer stripes than
+  connections, i.e. `STRIPES < CONNS`).
+- Each process connected via `connect_proto_with_opts/9` and received a
+  specific `SlotId`.
+- The process must call `send_on_slot` with that `SlotId` so the server
+  echo comes back to the correct `owner_pid`.
+
+A typical NIF client worker looks like:
+
+```erlang
+nif_client_worker(PoolRef, StripeId, SlotId, Msg) ->
+    ok = arterial_nif:send_on_slot(PoolRef, StripeId, SlotId, [Msg]),
+    receive
+        {arterial_event, StripeId, SlotId, read, Reply} -> Reply
+    after 5000 -> error(timeout)
+    end.
+```
+
+If you used `send_and_release/3` here instead, the write could land on a
+*different* slot owned by another worker process. That process would receive
+the server's reply while the original caller blocks forever — a deadlock
+that only manifests when two or more slots share a stripe.
+
+## When `send_and_release/3` is safe for clients
+
+`send_and_release/3` is safe for client sends when every stripe holds
+**exactly one slot** (i.e. `init_pool(NConns, 1)`). There is no ambiguity
+because there is only one connection to pick. This is the default pool shape
+when `STRIPES=0` (one stripe per connection) and is why the bug only
+appears with `STRIPES < CONNS`.
+
+## Examples
+
+```
+1> arterial_nif:send_on_slot(PoolRef, 0, 1, [<<1,2,3>>]).
+ok
+```
+""".
+-spec send_on_slot(pool_ref(), non_neg_integer(), non_neg_integer(), [binary()]) ->
+  ok | {error, pool_busy | write_failed}.
+send_on_slot(_PoolRef, _StripeId, _SlotId, _IoList) ->
   ?NOT_LOADED_ERROR.
 
 -doc """
@@ -344,6 +434,29 @@ ok
 """.
 -spec close_slot(pool_ref(), non_neg_integer(), non_neg_integer()) -> ok.
 close_slot(_PoolRef, _StripeId, _SlotId) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Handle connection timeout by cleaning up the connection slot and releasing resources.
+This function should be called when a connection timeout message is received.
+
+## Parameters
+- `PoolRef`: Reference to the connection pool
+- `StripeId`: Stripe identifier
+- `SlotId`: Slot identifier
+
+## Returns
+`ok` on successful cleanup.
+
+## Examples
+```
+% Called when timeout message received
+1> arterial_nif:handle_connection_timeout(PoolRef, StripeId, SlotId).
+ok
+```
+""".
+-spec handle_connection_timeout(pool_ref(), non_neg_integer(), non_neg_integer()) -> ok.
+handle_connection_timeout(_PoolRef, _StripeId, _SlotId) ->
   ?NOT_LOADED_ERROR.
 
 -doc """
@@ -462,6 +575,121 @@ ok
 -spec set_slot_unavailable(pool_ref(), non_neg_integer(), non_neg_integer()) -> ok.
 set_slot_unavailable(_PoolRef, _StripeId, _SlotId) ->
   ?NOT_LOADED_ERROR.
+
+%%%-----------------------------------------------------------------------------
+%%% FIFO Mode 3 functions
+%%%-----------------------------------------------------------------------------
+
+-doc """
+Reserve a connection slot for FIFO Mode 3 operation. Atomically reserves
+a connection slot for exclusive use by the calling process, with a timeout.
+
+Returns `{ok, SlotId, ConnectionInfo}` if a slot is successfully reserved,
+or `{error, Reason}` if no slots are available or other error occurs.
+""".
+-spec reserve_fifo_connection(pool_ref(), non_neg_integer(),
+                             non_neg_integer()) ->
+  {ok, non_neg_integer(), term()} | {error, term()}.
+reserve_fifo_connection(_PoolRef, _StripeId, _TimeoutMs) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Send request data through a reserved FIFO connection slot.
+
+The slot must have been previously reserved with `reserve_fifo_connection/3`.
+Returns `{ok, BytesSent}` on success or `{error, Reason}` on failure.
+""".
+-spec send_fifo_request(pool_ref(), non_neg_integer(), non_neg_integer(),
+                       [binary()], non_neg_integer(), pid()) ->
+  {ok, non_neg_integer()} | {error, term()}.
+send_fifo_request(_PoolRef, _StripeId, _SlotId, _IoList, _TimeoutMs, _RequesterPid) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Release a reserved FIFO connection slot back to the pool.
+
+Should be called after processing the response from a FIFO request.
+Returns `ok` on success.
+""".
+-spec release_fifo_connection(pool_ref(), non_neg_integer(),
+                             non_neg_integer(), term()) ->
+  ok | {error, term()}.
+release_fifo_connection(_PoolRef, _StripeId, _SlotId, _Result) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Get the status and statistics of a FIFO connection slot.
+
+Returns information about the current state of the slot including
+whether it's reserved, connection status, and timing statistics.
+""".
+-spec fifo_connection_status(pool_ref(), non_neg_integer(),
+                            non_neg_integer()) ->
+  {ok, term()} | {error, term()}.
+fifo_connection_status(_PoolRef, _StripeId, _SlotId) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Handle incoming reply data for a FIFO request.
+
+Called when data is received on a FIFO connection slot to route
+the reply to the appropriate waiting process.
+""".
+-spec handle_fifo_reply(pool_ref(), non_neg_integer(), non_neg_integer(),
+                       binary()) ->
+  ok | {error, term()}.
+handle_fifo_reply(_PoolRef, _StripeId, _SlotId, _ReplyData) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Combined reserve and send FIFO request operation (#3 - NIF call optimization).
+
+This function combines connection reservation and request sending into a single
+NIF call to reduce overhead. It reserves a connection (with queuing/waiting if
+necessary), sends the request, and returns the reservation info for later release.
+
+This is a performance optimization that reduces the Reserve -> Send pattern
+from 2 NIF calls to 1, while maintaining the ability to release separately
+for error handling flexibility.
+
+## Parameters
+
+- `PoolRef`: Pool context reference
+- `StripeId`: Which stripe to reserve from (0-based)
+- `RequestData`: List of binaries containing request data to send
+- `ReservationTimeoutMs`: Timeout for connection reservation
+- `RequestTimeoutMs`: Timeout for sending the request
+
+## Returns
+
+- `{ok, fifo_request_sent, StripeId, SlotId, ReservationId}`: Success
+- `{error, pool_busy}`: All connections busy (after waiting)
+- `{error, write_failed}`: Failed to write to socket
+- `{error, timeout}`: Timeout during reservation or send
+""".
+-spec reserve_send_fifo_request(pool_ref(), non_neg_integer(), [binary()],
+                               non_neg_integer(), non_neg_integer()) ->
+  {ok, fifo_request_sent, non_neg_integer(), non_neg_integer(), non_neg_integer()} |
+  {error, atom()}.
+reserve_send_fifo_request(_PoolRef, _StripeId, _RequestData, _ReservationTimeoutMs, _RequestTimeoutMs) ->
+  ?NOT_LOADED_ERROR.
+
+%% --- Reactor server NIFs ---
+
+-doc "Create a non-blocking TCP listen socket. Returns {ok, {Fd, ActualPort}}.".
+reactor_listen(_PoolRef, _Port) -> ?NOT_LOADED_ERROR.
+
+-doc "Register ListenFd with the reactor; sends {arterial_accept, Lfd, Cfd, IP, Port} to OwnerPid on each new connection.".
+reactor_accept(_PoolRef, _ListenFd, _OwnerPid) -> ?NOT_LOADED_ERROR.
+
+-doc "Remove Fd from the reactor and close it.".
+reactor_close_fd(_PoolRef, _Fd) -> ?NOT_LOADED_ERROR.
+
+-doc "Register a client fd with the NIF pool for read events. Returns {ok, SlotId}.".
+reactor_register_client(_PoolRef, _StripeId, _ClientFd, _OwnerPid) -> ?NOT_LOADED_ERROR.
+
+-doc "Return NIF library info.".
+info() -> ?NOT_LOADED_ERROR.
 
 %%%-----------------------------------------------------------------------------
 %%% NIF loading

@@ -7,18 +7,22 @@ Comprehensive test suite for socket options support in arterial_nif.
 Tests both basic socket options and multicast-specific options.
 """.
 
+%% EUnit entry point — runs all sub-tests sequentially.
+socket_options_test() ->
+  run_all_socket_option_tests().
+
 %% Test basic socket options that should work with TCP
-basic_tcp_socket_options_test() ->
+do_basic_tcp_socket_options() ->
   application:ensure_all_started(arterial),
   {ok, PoolRef} = arterial_nif:init_pool(1, 1),
 
   BasicOptions = [
     keepalive,
-    {keepalive, true},
-    {sndbuf, 32768},
-    {recvbuf, 32768},
-    {priority, 3},
-    {tos, 16},
+    {keepalive,    true},
+    {sndbuf,      32768},
+    {recvbuf,     32768},
+    {priority,        3},
+    {tos,            16},
     {linger, {true, 30}}
   ],
 
@@ -30,6 +34,13 @@ basic_tcp_socket_options_test() ->
   % We expect either success or connect_failed (since nothing is listening
   % on 12345) but NOT socket_option_failed
   case Result of
+    {ok, connecting, _SlotId} ->
+      receive
+        {arterial_event, 0, _, connect_result, _} -> ok;
+        {arterial_event, 0, _, timeout} -> ok
+      after 2000 -> ok
+      end,
+      io:format("Basic TCP socket options test: CONNECTION IN PROGRESS~n");
     {ok, _SlotId} ->
       io:format("Basic TCP socket options test: SUCCESS~n");
     {error, connect_failed} ->
@@ -47,7 +58,7 @@ basic_tcp_socket_options_test() ->
   end.
 
 %% Test UDP-specific socket options including multicast
-udp_socket_options_test() ->
+do_udp_socket_options() ->
   application:ensure_all_started(arterial),
   {ok, PoolRef} = arterial_nif:init_pool(1, 1),
 
@@ -62,6 +73,13 @@ udp_socket_options_test() ->
                                                 self(), UDPOptions),
 
   case Result of
+    {ok, connecting, _SlotId} ->
+      receive
+        {arterial_event, 0, _, connect_result, _} -> ok;
+        {arterial_event, 0, _, timeout} -> ok
+      after 2000 -> ok
+      end,
+      io:format("Basic UDP socket options test: CONNECTION IN PROGRESS~n");
     {ok, _SlotId} ->
       io:format("Basic UDP socket options test: SUCCESS~n");
     {error, connect_failed} ->
@@ -76,7 +94,7 @@ udp_socket_options_test() ->
   end.
 
 %% Test multicast socket options
-multicast_socket_options_test() ->
+do_multicast_socket_options() ->
   application:ensure_all_started(arterial),
   {ok, PoolRef} = arterial_nif:init_pool(1, 1),
 
@@ -93,6 +111,13 @@ multicast_socket_options_test() ->
                                                 self(), MulticastOptions),
 
   case Result of
+    {ok, connecting, _SlotId} ->
+      receive
+        {arterial_event, 0, _, connect_result, _} -> ok;
+        {arterial_event, 0, _, timeout} -> ok
+      after 2000 -> ok
+      end,
+      io:format("Multicast socket options test: CONNECTION IN PROGRESS~n");
     {ok, _SlotId} ->
       io:format("Multicast socket options test: SUCCESS~n");
     {error, connect_failed} ->
@@ -107,7 +132,7 @@ multicast_socket_options_test() ->
   end.
 
 %% Test that multicast options are rejected on TCP
-multicast_tcp_rejection_test() ->
+do_multicast_tcp_rejection() ->
   application:ensure_all_started(arterial),
   {ok, PoolRef} = arterial_nif:init_pool(1, 1),
 
@@ -124,6 +149,14 @@ multicast_tcp_rejection_test() ->
                                                 self(), BadOptions),
 
   case Result of
+    {ok, connecting, _SlotId} ->
+      receive
+        {arterial_event, 0, _, connect_result, _} -> ok;
+        {arterial_event, 0, _, timeout} -> ok
+      after 2000 -> ok
+      end,
+      io:format("Multicast on TCP test: Unexpectedly succeeded "
+               "(implementation allows it)~n");
     {ok, _SlotId} ->
       io:format("Multicast on TCP test: Unexpectedly succeeded "
                "(implementation allows it)~n");
@@ -138,7 +171,7 @@ multicast_tcp_rejection_test() ->
   end.
 
 %% Test error handling with invalid socket options
-invalid_socket_options_test() ->
+do_invalid_socket_options() ->
   application:ensure_all_started(arterial),
   {ok, PoolRef} = arterial_nif:init_pool(1, 1),
 
@@ -155,6 +188,14 @@ invalid_socket_options_test() ->
                                                 self(), BadOptions),
 
   case Result of
+    {ok, connecting, _SlotId} ->
+      receive
+        {arterial_event, 0, _, connect_result, _} -> ok;
+        {arterial_event, 0, _, timeout} -> ok
+      after 2000 -> ok
+      end,
+      io:format("Invalid options test: NIF accepted malformed options "
+               "(graceful degradation behavior)~n");
     {ok, _SlotId} ->
       io:format("Invalid options test: NIF accepted malformed options "
                "(graceful degradation behavior)~n");
@@ -168,7 +209,7 @@ invalid_socket_options_test() ->
   end.
 
 %% Test comprehensive socket option combinations
-comprehensive_options_test() ->
+do_comprehensive_options() ->
   application:ensure_all_started(arterial),
   {ok, PoolRef} = arterial_nif:init_pool(1, 1),
 
@@ -187,6 +228,13 @@ comprehensive_options_test() ->
                                                 self(), ComprehensiveOptions),
 
   case Result of
+    {ok, connecting, _SlotId} ->
+      receive
+        {arterial_event, 0, _, connect_result, _} -> ok;
+        {arterial_event, 0, _, timeout} -> ok
+      after 2000 -> ok
+      end,
+      io:format("Comprehensive options test: SUCCESS~n");
     {ok, _SlotId} ->
       io:format("Comprehensive options test: SUCCESS~n");
     {error, connect_failed} ->
@@ -204,12 +252,12 @@ comprehensive_options_test() ->
 run_all_socket_option_tests() ->
   io:format("=== Running Socket Options Test Suite ===~n"),
   try
-    basic_tcp_socket_options_test(),
-    udp_socket_options_test(),
-    multicast_socket_options_test(),
-    multicast_tcp_rejection_test(),
-    invalid_socket_options_test(),
-    comprehensive_options_test(),
+    do_basic_tcp_socket_options(),
+    do_udp_socket_options(),
+    do_multicast_socket_options(),
+    do_multicast_tcp_rejection(),
+    do_invalid_socket_options(),
+    do_comprehensive_options(),
     io:format("=== All socket option tests completed ===~n"),
     ok
   catch

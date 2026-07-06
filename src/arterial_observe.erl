@@ -81,6 +81,12 @@ pool name, `t:arterial_pool:name/0`) is always present in metadata.
 * `[arterial, disconnect]` -- emitted whenever
   `arterial_connection:disconnect/2` runs (planned bounce or
   unplanned/error-triggered). Metadata: `pool`, `conn_id`, `reason`.
+* `[arterial, reconnect, attempt]` -- emitted when `arterial_connection`
+  begins a reconnection attempt after a disconnect or connection failure.
+  Metadata: `pool`, `conn_id`.
+* `[arterial, reconnect, success]` -- emitted when a reconnection attempt
+  succeeds and the connection becomes available for requests.
+  Metadata: `pool`, `conn_id`.
 * `[arterial, sweep, stop]` -- one event per `sweep_timeouts/1` call.
   Measurements: `expired_count` (how many in-flight requests timed out
   this sweep). Metadata: `pool`.
@@ -168,7 +174,8 @@ server_init(Module, Options) ->
 server_loop(Module) ->
   receive
     {'EXIT', _Pid, Reason} when Reason == normal; Reason == shutdown ->
-      stop(Module);
+      stop(Module),
+      exit(Reason);
     {'EXIT', _Pid, Reason} ->
       stop(Module),
       erlang:error(Reason);
@@ -177,23 +184,27 @@ server_loop(Module) ->
   end.
 
 -spec stop(atom()) -> ok.
+stop(nil) -> ok;
 stop(Module) ->
-  (Module =/= nil) andalso Module:stop(),
-  persistent_term:erase(?MODULE).
+  try
+    case erlang:function_exported(Module, stop, 0) of
+      true  -> Module:stop();
+      false -> ok
+    end
+  after
+    persistent_term:erase(?MODULE)
+  end.
 
 %% Resolve module names to actual implementation modules
-resolve_module(Module) ->
-  case Module of
-    undefined -> nil;
-    nil -> nil;
-    ok -> nil;  % Handle weird supervisor restart cases
-    telemetry -> arterial_observe_telemetry;
-    prometheus -> arterial_observe_prometheus;
-    arterial_observe_telemetry -> arterial_observe_telemetry;
-    arterial_observe_prometheus -> arterial_observe_prometheus;
-    Mod when is_atom(Mod) -> Mod;
-    _ -> nil  % Invalid input, disable observability
-  end.
+resolve_module(undefined)                   -> nil;
+resolve_module(nil)                         -> nil;
+resolve_module(ok)                          -> nil;  % Handle weird supervisor restart cases
+resolve_module(telemetry)                   -> arterial_observe_telemetry;
+resolve_module(prometheus)                  -> arterial_observe_prometheus;
+resolve_module(arterial_observe_telemetry)  -> arterial_observe_telemetry;
+resolve_module(arterial_observe_prometheus) -> arterial_observe_prometheus;
+resolve_module(Mod) when is_atom(Mod)       -> Mod;
+resolve_module(_)                           -> nil. % Invalid input, disable observability
 
 -doc """
 Runs `Fun/0` (expected to return `{Result, StopMetadata}` or `{Result,
