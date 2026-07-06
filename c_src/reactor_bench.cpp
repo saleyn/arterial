@@ -88,14 +88,14 @@ public:
   EchoServer()
   {
     m_lfd = make_listen(m_port);
-    m_r.Start();
-    m_r.AddFd(m_lfd,
+    m_r.start();
+    m_r.add_fd(m_lfd,
       [this](int lfd, void*) -> int {
         for (;;) {
           int cfd = ::accept4(lfd, nullptr, nullptr, SOCK_NONBLOCK);
           if (cfd < 0) break;
           set_nodelay(cfd);
-          m_r.AddFd(cfd,
+          m_r.add_fd(cfd,
             [this](int fd, void*) -> int {
               char buf[65536];
               for (;;) {
@@ -112,7 +112,7 @@ public:
       },
       [](int,void*){});
   }
-  ~EchoServer() { m_r.Stop(); ::close(m_lfd); }
+  ~EchoServer() { m_r.stop(); ::close(m_lfd); }
   int port() const { return m_port; }
 
 private:
@@ -176,7 +176,7 @@ Result bench_client(int server_port, int nconns, int nreqs)
   std::atomic<int>  done{0};
   std::atomic<long> errs{0};
   Reactor r{"bench_client"};
-  r.Start();
+  r.start();
 
   struct sockaddr_in addr{};
   addr.sin_family      = AF_INET;
@@ -208,7 +208,7 @@ Result bench_client(int server_port, int nconns, int nreqs)
         c->lats.push_back(
           std::chrono::duration<double,std::micro>(clk::now()-c->ts).count());
         ++done; --c->rem;
-        if (c->rem == 0) { r.RemoveFd(fd); return 0; }
+        if (c->rem == 0) { r.remove_fd(fd); return 0; }
         ++c->seq;
         uint32_t s = htonl(c->seq);
         memcpy(c->sb.data(), &s, 4); memset(c->sb.data()+4, 0xAB, g_msg_size-4);
@@ -219,18 +219,18 @@ Result bench_client(int server_port, int nconns, int nreqs)
     };
     auto on_err = [c, &errs, &r](int fd, void*) {
       errs += c->rem > 0 ? c->rem : 1;
-      r.RemoveFd(fd);
+      r.remove_fd(fd);
     };
 
-    // Use Reactor::Connect so that EINPROGRESS / immediate-success /
+    // Use Reactor::connect so that EINPROGRESS / immediate-success /
     // connection-error are all handled correctly without a race between
-    // AddFd and ArmWrite.  The on_writable callback fires once on connection
+    // add_fd and arm_write.  The on_writable callback fires once on connection
     // completion; on_readable handles all subsequent data.
     //
     // We pass a dummy ErlNifPid — the benchmark doesn't use Erlang messaging;
     // the connect result is observed indirectly via send_first being called.
     ErlNifPid dummy{};
-    r.Connect(fd, addr, 0 /*no timeout*/, dummy, 0, 0,
+    r.connect(fd, addr, 0 /*no timeout*/, dummy, 0, 0,
       on_read,
       // on_writable: connection established → send first request
       [c](int fd, void*) -> int {
@@ -256,7 +256,7 @@ Result bench_client(int server_port, int nconns, int nreqs)
   }
 
   auto t1 = clk::now();
-  r.Stop();
+  r.stop();
 
   std::vector<double> all;
   all.reserve(total);

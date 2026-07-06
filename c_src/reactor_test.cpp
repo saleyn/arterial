@@ -19,7 +19,7 @@
 //   7. Reactor  — per-fd timeout fires
 //   8. Reactor  — timeout cancelled when fd removed before firing
 //   9. Reactor  — multiple fds registered simultaneously
-//  10. Reactor  — RemoveFd stops further notifications
+//  10. Reactor  — remove_fd stops further notifications
 //-----------------------------------------------------------------------------
 
 // Stub out enif_* so we can link without ERTS.
@@ -261,33 +261,33 @@ static void test_reactor_lifecycle()
   begin("4. Reactor Start/Stop lifecycle");
 
   Reactor r("test_lifecycle");
-  ASSERT(!r.Running());
-  r.Start();
-  ASSERT(r.Running());
-  r.Stop();
-  ASSERT(!r.Running());
+  ASSERT(!r.running());
+  r.start();
+  ASSERT(r.running());
+  r.stop();
+  ASSERT(!r.running());
   // Double-stop must be safe.
-  r.Stop();
+  r.stop();
 
   end();
 }
 
 //=============================================================================
-// 5. Reactor AddFd — readable notification via pipe
+// 5. Reactor add_fd — readable notification via pipe
 //=============================================================================
 static void test_reactor_readable()
 {
-  begin("5. Reactor AddFd — readable notification (pipe)");
+  begin("5. Reactor add_fd — readable notification (pipe)");
 
   Reactor r("test_readable");
-  r.Start();
+  r.start();
 
   int fds[2];
   ASSERT_EQ(make_pipe(fds), 0);
 
   std::atomic<int> read_count{0};
 
-  r.AddFd(
+  r.add_fd(
     fds[0],
     [&](int fd, void*) -> int {
       char buf[64];
@@ -310,26 +310,26 @@ static void test_reactor_readable()
   ASSERT_EQ(read_count.load(), 2);
 
   ::close(fds[1]);
-  r.RemoveFd(fds[0]);  // reactor closes fds[0]
-  // Give reactor thread time to process RemoveFd before Stop.
+  r.remove_fd(fds[0]);  // reactor closes fds[0]
+  // Give reactor thread time to process remove_fd before stop.
   std::this_thread::sleep_for(20ms);
-  r.Stop();
+  r.stop();
 
   end();
 }
 
 //=============================================================================
-// 6. Reactor ArmWrite — one-shot write notification (socketpair)
+// 6. Reactor arm_write — one-shot write notification (socketpair)
 //
-// ArmWrite only makes sense on bidirectional fds (sockets) since a pipe
+// arm_write only makes sense on bidirectional fds (sockets) since a pipe
 // read-end never becomes writable.  We use a socketpair() here.
 //=============================================================================
 static void test_reactor_arm_write()
 {
-  begin("6. Reactor ArmWrite — one-shot write notification (socket)");
+  begin("6. Reactor arm_write — one-shot write notification (socket)");
 
   Reactor r("test_write");
-  r.Start();
+  r.start();
 
   // Use a socketpair so both ends are readable AND writable.
   int sv[2];
@@ -337,7 +337,7 @@ static void test_reactor_arm_write()
 
   std::atomic<int> write_count{0};
 
-  r.AddFd(
+  r.add_fd(
     sv[0],
     [](int fd, void*) -> int {
       char buf[64];
@@ -352,7 +352,7 @@ static void test_reactor_arm_write()
   );
 
   // Arm write — sv[0] is immediately writable (empty send buffer).
-  r.ArmWrite(sv[0]);
+  r.arm_write(sv[0]);
   ASSERT(wait_for([&]{ return write_count.load() >= 1; }));
   ASSERT_EQ(write_count.load(), 1);
 
@@ -361,27 +361,27 @@ static void test_reactor_arm_write()
   ASSERT_EQ(write_count.load(), 1);
 
   // Re-arm → fires once more.
-  r.ArmWrite(sv[0]);
+  r.arm_write(sv[0]);
   ASSERT(wait_for([&]{ return write_count.load() >= 2; }));
   ASSERT_EQ(write_count.load(), 2);
 
   ::close(sv[1]);
-  r.RemoveFd(sv[0]);
+  r.remove_fd(sv[0]);
   std::this_thread::sleep_for(20ms);
-  r.Stop();
+  r.stop();
 
   end();
 }
 
 //=============================================================================
-// 7. Reactor SetTimeout — fires after the given delay
+// 7. Reactor set_timeout — fires after the given delay
 //=============================================================================
 static void test_reactor_timeout_fires()
 {
-  begin("7. Reactor SetTimeout — fires after ~50 ms");
+  begin("7. Reactor set_timeout — fires after ~50 ms");
 
   Reactor r("test_timeout");
-  r.Start();
+  r.start();
 
   int fds[2];
   ASSERT_EQ(make_pipe(fds), 0);
@@ -390,7 +390,7 @@ static void test_reactor_timeout_fires()
   auto             t0 = std::chrono::steady_clock::now();
   int64_t          elapsed_ms = -1;
 
-  r.AddFd(
+  r.add_fd(
     fds[0],
     [](int fd, void*) -> int {
       char buf[64];
@@ -406,7 +406,7 @@ static void test_reactor_timeout_fires()
     }
   );
 
-  r.SetTimeout(fds[0], 50);
+  r.set_timeout(fds[0], 50);
   ASSERT(wait_for([&]{ return timeout_count.load() >= 1; }, 500));
   ASSERT_EQ(timeout_count.load(), 1);
 
@@ -418,29 +418,29 @@ static void test_reactor_timeout_fires()
   ASSERT_EQ(timeout_count.load(), 1);
 
   ::close(fds[1]);
-  r.RemoveFd(fds[0]);
+  r.remove_fd(fds[0]);
   std::this_thread::sleep_for(20ms);
-  r.Stop();
+  r.stop();
 
   end();
 }
 
 //=============================================================================
-// 8. Reactor SetTimeout — cancelled before firing
+// 8. Reactor set_timeout — cancelled before firing
 //=============================================================================
 static void test_reactor_timeout_cancel()
 {
-  begin("8. Reactor SetTimeout — cancel before firing");
+  begin("8. Reactor set_timeout — cancel before firing");
 
   Reactor r("test_cancel");
-  r.Start();
+  r.start();
 
   int fds[2];
   ASSERT_EQ(make_pipe(fds), 0);
 
   std::atomic<int> timeout_count{0};
 
-  r.AddFd(
+  r.add_fd(
     fds[0],
     [](int fd, void*) -> int {
       char buf[64];
@@ -452,19 +452,19 @@ static void test_reactor_timeout_cancel()
     [&](int, void*) { ++timeout_count; }
   );
 
-  r.SetTimeout(fds[0], 200);
+  r.set_timeout(fds[0], 200);
   // Cancel before it fires.
   std::this_thread::sleep_for(30ms);
-  r.SetTimeout(fds[0], 0);  // 0 = cancel
+  r.set_timeout(fds[0], 0);  // 0 = cancel
 
   // Wait past what the timeout would have been.
   std::this_thread::sleep_for(250ms);
   ASSERT_EQ(timeout_count.load(), 0);
 
   ::close(fds[1]);
-  r.RemoveFd(fds[0]);
+  r.remove_fd(fds[0]);
   std::this_thread::sleep_for(20ms);
-  r.Stop();
+  r.stop();
 
   end();
 }
@@ -477,7 +477,7 @@ static void test_reactor_multiple_fds()
   begin("9. Multiple fds registered simultaneously");
 
   Reactor r("test_multi");
-  r.Start();
+  r.start();
 
   static constexpr int N = 8;
   int pipe_fds[N][2];
@@ -486,7 +486,7 @@ static void test_reactor_multiple_fds()
     counts[i] = 0;
     ASSERT_EQ(make_pipe(pipe_fds[i]), 0);
     int idx = i;
-    r.AddFd(
+    r.add_fd(
       pipe_fds[i][0],
       [&counts, idx](int fd, void*) -> int {
         char buf[64];
@@ -510,31 +510,31 @@ static void test_reactor_multiple_fds()
   for (int i = 0; i < N; ++i) {
     ASSERT_EQ(counts[i].load(), 1);
     ::close(pipe_fds[i][1]);
-    r.RemoveFd(pipe_fds[i][0]);
+    r.remove_fd(pipe_fds[i][0]);
   }
 
   std::this_thread::sleep_for(20ms);
-  r.Stop();
+  r.stop();
 
   end();
 }
 
 //=============================================================================
-// 10. RemoveFd — no further notifications after removal
+// 10. remove_fd — no further notifications after removal
 //=============================================================================
 static void test_reactor_remove_fd()
 {
-  begin("10. RemoveFd — no further notifications after removal");
+  begin("10. remove_fd — no further notifications after removal");
 
   Reactor r("test_remove");
-  r.Start();
+  r.start();
 
   int fds[2];
   ASSERT_EQ(make_pipe(fds), 0);
 
   std::atomic<int> read_count{0};
 
-  r.AddFd(
+  r.add_fd(
     fds[0],
     [&](int fd, void*) -> int {
       char buf[64];
@@ -549,7 +549,7 @@ static void test_reactor_remove_fd()
   ::write(fds[1], &c, 1);
   ASSERT(wait_for([&]{ return read_count.load() >= 1; }));
 
-  r.RemoveFd(fds[0]);  // reactor closes fds[0]
+  r.remove_fd(fds[0]);  // reactor closes fds[0]
   // Give reactor time to process the command.
   std::this_thread::sleep_for(30ms);
 
@@ -561,27 +561,27 @@ static void test_reactor_remove_fd()
   ASSERT_EQ(read_count.load(), count_after_remove);
 
   ::close(fds[1]);
-  r.Stop();
+  r.stop();
 
   end();
 }
 
 //=============================================================================
-// 11. Stress — rapid SetTimeout resets
+// 11. Stress — rapid set_timeout resets
 //=============================================================================
 static void test_reactor_timeout_reset_stress()
 {
   begin("11. Stress — rapid timeout resets (no crash, correct final fire)");
 
   Reactor r("test_stress");
-  r.Start();
+  r.start();
 
   int fds[2];
   ASSERT_EQ(make_pipe(fds), 0);
 
   std::atomic<int> timeout_count{0};
 
-  r.AddFd(
+  r.add_fd(
     fds[0],
     [](int fd, void*) -> int {
       char buf[64];
@@ -596,7 +596,7 @@ static void test_reactor_timeout_reset_stress()
   // Repeatedly reset a 50 ms timeout 20 times with 10 ms spacing.
   // The timeout should only fire ONCE after the final arm.
   for (int i = 0; i < 20; ++i) {
-    r.SetTimeout(fds[0], 50);
+    r.set_timeout(fds[0], 50);
     std::this_thread::sleep_for(10ms);
   }
 
@@ -609,19 +609,19 @@ static void test_reactor_timeout_reset_stress()
   ASSERT(timeout_count.load() >= 1);
 
   ::close(fds[1]);
-  r.RemoveFd(fds[0]);
+  r.remove_fd(fds[0]);
   std::this_thread::sleep_for(20ms);
-  r.Stop();
+  r.stop();
 
   end();
 }
 
 //=============================================================================
-// 12. Reactor::Connect — successful connect to a local listener
+// 12. Reactor::connect — successful connect to a local listener
 //=============================================================================
 static void test_reactor_connect_success()
 {
-  begin("12. Reactor::Connect — success to local listener");
+  begin("12. Reactor::connect — success to local listener");
 
   // Create a listening socket on an ephemeral port.
   int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -638,7 +638,7 @@ static void test_reactor_connect_success()
   ::getsockname(lfd, (sockaddr*)&laddr, &slen);
 
   Reactor r("test_connect_ok");
-  r.Start();
+  r.start();
 
   // Create a non-blocking socket (do NOT call connect — reactor does it).
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -652,7 +652,7 @@ static void test_reactor_connect_success()
   // which arrives via send_connect_result → Erlang send, stubbed to no-op).
   // Track via on_writable (post-connect I/O) to confirm state transitions.
   ErlNifPid dummy_pid{};
-  r.Connect(fd, laddr, 1000, dummy_pid, 0, 0,
+  r.connect(fd, laddr, 1000, dummy_pid, 0, 0,
     [&](int cfd, void*) -> int {  // on_readable — data after connect
       char buf[64];
       while (::read(cfd, buf, sizeof(buf)) > 0) {}
@@ -678,22 +678,22 @@ static void test_reactor_connect_success()
 
   ::close(afd);
   ::close(lfd);
-  r.RemoveFd(fd);  // reactor closes fd
+  r.remove_fd(fd);  // reactor closes fd
   std::this_thread::sleep_for(20ms);
-  r.Stop();
+  r.stop();
 
   end();
 }
 
 //=============================================================================
-// 13. Reactor::Connect — timeout when nothing is listening
+// 13. Reactor::connect — timeout when nothing is listening
 //=============================================================================
 static void test_reactor_connect_timeout()
 {
-  begin("13. Reactor::Connect — timeout (non-routable addr)");
+  begin("13. Reactor::connect — timeout (non-routable addr)");
 
   Reactor r("test_connect_to");
-  r.Start();
+  r.start();
 
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   ASSERT(fd >= 0);
@@ -709,7 +709,7 @@ static void test_reactor_connect_timeout()
   std::atomic<bool> timed_out{false};
   ErlNifPid dummy_pid{};
 
-  r.Connect(fd, addr, 80 /*ms*/, dummy_pid, 0, 0,
+  r.connect(fd, addr, 80 /*ms*/, dummy_pid, 0, 0,
     [](int, void*) -> int { return 0; },
     [](int, void*) -> int { return 0; },
     [](int, void*) {},
@@ -720,9 +720,9 @@ static void test_reactor_connect_timeout()
   ASSERT(wait_for([&]{ return timed_out.load(); }, 500));
   ASSERT(timed_out.load());
 
-  // fd was already closed by the timeout handler — don't call RemoveFd.
+  // fd was already closed by the timeout handler — don't call remove_fd.
   std::this_thread::sleep_for(20ms);
-  r.Stop();
+  r.stop();
 
   end();
 }
