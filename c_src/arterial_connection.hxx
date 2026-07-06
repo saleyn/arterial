@@ -133,7 +133,9 @@ Connection::handle_readable(ErlNifEnv* env, PoolContext* ctx)
   }
 
   if (static_cast<size_t>(n) < bin.size && !bin.realloc(n)) {
+    #ifdef HAVE_OPENSSL
     cleanup_slot_ssl(*this);
+    #endif
     return ReadResultData(ReadResult::CLOSED);
   }
 
@@ -164,7 +166,8 @@ Connection::handle_readable(ErlNifEnv* env, PoolContext* ctx)
 }
 
 inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, PoolContext* ctx) {
-  if (fd == -1) return WriteResultData(WriteResult::CLOSED);
+  if (fd == -1) [[unlikely]]
+    return WriteResultData(WriteResult::CLOSED);
 
   uint32_t current_status = status.load(std::memory_order_acquire);
 
@@ -175,10 +178,7 @@ inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, P
     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &len) == -1 || so_err != 0) {
       // Connection failed - cancel timeout using RAII cleanup
       cancel_connection_timeout(*this);
-      WriteResultData result(WriteResult::CONNECT_FAILED);
-      result.send_connect_msg = true;
-      result.connect_result = am_connect_failed;
-      return result;
+      return WriteResultData(WriteResult::CONNECT_FAILED, true, am_connect_failed);
     } else {
       // Connection succeeded - cancel timeout using RAII cleanup
       cancel_connection_timeout(*this);
@@ -186,10 +186,7 @@ inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, P
 #ifdef HAVE_OPENSSL
       if (protocol == PROTO_SSL) {
         if (!setup_ssl_on_socket(*this, fd)) {
-          WriteResultData result(WriteResult::CONNECT_FAILED);
-          result.send_connect_msg = true;
-          result.connect_result = am_connect_failed;
-          return result;
+          return WriteResultData(WriteResult::CONNECT_FAILED, true, am_connect_failed);
         }
 
         // Start non-blocking SSL handshake
@@ -203,10 +200,7 @@ inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, P
           stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
           arm_read(env, ctx); // TODO: error handling?
 
-          WriteResultData result(WriteResult::CONNECT_OK);
-          result.send_connect_msg = true;
-          result.connect_result = am_ok;
-          return result;
+          return WriteResultData(WriteResult::CONNECT_OK, true, am_ok);
         } else if (handshake_result == 0) {
           // Handshake needs READ - set status and arm read event
           status.store(SLOT_SSL_HANDSHAKE, std::memory_order_release);
@@ -220,10 +214,7 @@ inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, P
         } else {
           // Handshake failed
           cleanup_slot_ssl(*this);
-          WriteResultData result(WriteResult::CONNECT_FAILED);
-          result.send_connect_msg = true;
-          result.connect_result = am_connect_failed;
-          return result;
+          return WriteResultData(WriteResult::CONNECT_FAILED, true, am_connect_failed);
         }
       } else
 #endif
@@ -234,10 +225,7 @@ inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, P
         stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
         arm_read(env, ctx); // TODO: error handling?
 
-        WriteResultData result(WriteResult::CONNECT_OK);
-        result.send_connect_msg = true;
-        result.connect_result = am_ok;
-        return result;
+        return WriteResultData(WriteResult::CONNECT_OK, true, am_ok);
       }
     }
   }
@@ -255,10 +243,7 @@ inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, P
         stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
         arm_read(env, ctx); // TODO: error handling?
 
-        WriteResultData result(WriteResult::CONNECT_OK);
-        result.send_connect_msg = true;
-        result.connect_result = am_ok;
-        return result;
+        return WriteResultData(WriteResult::CONNECT_OK, true, am_ok);
       }
       case 0:
         // Still needs READ - arm read event
@@ -272,10 +257,7 @@ inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, P
       {
         // Handshake failed
         cleanup_slot_ssl(*this);
-        WriteResultData result(WriteResult::CONNECT_FAILED);
-        result.send_connect_msg = true;
-        result.connect_result = am_connect_failed;
-        return result;
+        return WriteResultData(WriteResult::CONNECT_FAILED, true, am_connect_failed);
       }
     }
   }
@@ -321,18 +303,21 @@ inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, P
     } else
 #endif
     {
-      while ((n = write(fd, pending_buffer.data() + bytes_written, remaining)) < 0 && errno == EINTR);
+    RETRYW:
+      n = write(fd, pending_buffer.data() + bytes_written, remaining);
       if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
           arm_write(env, ctx); // TODO: handle errors
           return WriteResultData(WriteResult::OK);
         }
+        if (errno == EINTR) [[unlikely]]
+          goto RETRYW;
         return WriteResultData(WriteResult::CLOSED);
       }
     }
 
     bytes_written += static_cast<size_t>(n);
-    remaining -= static_cast<size_t>(n);
+    remaining     -= static_cast<size_t>(n);
   }
 
   pending_buffer.clear();
@@ -375,11 +360,11 @@ Connection::connect_proto(ErlNifEnv* env, PoolContext* ctx,
     return ConnectResultData(ConnectResult::CONFIG_FAILED, -1, am_failed_to_set_nonblocking);
   }
 
-  struct sockaddr_in server_addr{};
   auto [o0, o1, o2, o3] = octets;
-  server_addr.sin_family = AF_INET;
-  server_addr.sin_port = htons(static_cast<uint16_t>(port));
   uint32_t ip_host = (o0 << 24) | (o1 << 16) | (o2 << 8) | o3;
+  struct sockaddr_in server_addr{};
+  server_addr.sin_family      = AF_INET;
+  server_addr.sin_port        = htons(static_cast<uint16_t>(port));
   server_addr.sin_addr.s_addr = htonl(ip_host);
 
   // For UDP, "connecting" just sets the default destination
@@ -482,10 +467,10 @@ Connection::connect_proto(ErlNifEnv* env, PoolContext* ctx,
     }
 
     return ConnectResultData(ConnectResult::CONNECTING, slot_id);
-  } else {
-    // Connection failed immediately - RAII handles cleanup automatically
-    return ConnectResultData(ConnectResult::FAILED, -1, am_connect_failed);
   }
+
+  // Connection failed immediately - RAII handles cleanup automatically
+  return ConnectResultData(ConnectResult::FAILED, -1, am_connect_failed);
 }
 
 inline Connection::ConnectResultData
@@ -515,20 +500,19 @@ Connection::connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
   }
 
   auto [o0, o1, o2, o3] = octets;
-  struct sockaddr_in server_addr{};
-  server_addr.sin_family = AF_INET;
-  server_addr.sin_port = htons(static_cast<uint16_t>(port));
   uint32_t ip_host = (o0 << 24) | (o1 << 16) | (o2 << 8) | o3;
+  struct sockaddr_in server_addr{};
+  server_addr.sin_family      = AF_INET;
+  server_addr.sin_port        = htons(static_cast<uint16_t>(port));
   server_addr.sin_addr.s_addr = htonl(ip_host);
 
   int rc = connect(socket_fd.get(), (struct sockaddr*)&server_addr, sizeof(server_addr));
 
   if (protocol == PROTO_UDP) {
     // UDP "connect" sets default destination, but can still fail
-    if (rc != 0) {
+    if (rc != 0)
       // No manual close() needed - RAII handles cleanup automatically
       return ConnectResultData(ConnectResult::FAILED, -1, am_connect_failed);
-    }
 
     // UDP connect succeeded, set up the connection immediately
     auto& stripe = *ctx->stripes[stripe_id];
@@ -621,10 +605,8 @@ Connection::connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
     auto slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
 
     // Check if slot claiming failed
-    if (slot_id < 0) {
-      // No manual close() needed - RAII handles cleanup automatically
+    if (slot_id < 0) // No manual close() needed - RAII handles cleanup automatically
       return ConnectResultData(ConnectResult::STRIPE_FULL, -1, am_stripe_full);
-    }
 
     auto& conn = stripe.slots[slot_id];
 #ifdef HAVE_OPENSSL
@@ -646,10 +628,10 @@ Connection::connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
     }
 
     return ConnectResultData(ConnectResult::CONNECTING, slot_id);
-  } else {
-    // Connection failed immediately - RAII handles cleanup automatically
-    return ConnectResultData(ConnectResult::FAILED, -1, am_connect_failed);
   }
+
+  // Connection failed immediately - RAII handles cleanup automatically
+  return ConnectResultData(ConnectResult::FAILED, -1, am_connect_failed);
 }
 
 //=============================================================================
@@ -695,13 +677,18 @@ Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
         throttle_allow(ctx, candidate_slot))
       break; // Success - slot is leased and passes throttling
 
-    // Slot doesn't pass throttling or isn't available - release it and try next
+    // Slot doesn't pass throttling or isn't available - release it and try next.
+    // Mark the bit in our local view so countr_zero advances past this slot;
+    // without this, reloading the mask (which now has the bit cleared) would
+    // cause the next iteration to pick the same slot again.
     stripe.lease_mask.fetch_and(~target_bit, std::memory_order_release);
     current_mask = stripe.lease_mask.load(std::memory_order_relaxed);
 
     retry_count++;
     if (retry_count >= max_retries) [[unlikely]]
       return SendResultData(SendResult::POOL_BUSY, -1, am_pool_busy);
+
+    current_mask |= target_bit;  // skip this slot on the next scan
   } while (true);
 
   auto& conn = stripe.slots[slot_id];
@@ -710,10 +697,10 @@ Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
   unsigned int list_len = 0;
   enif_get_list_length(env, data_list, &list_len);
 
-  // Inline storage for the common case (arterial_client2 always calls
+  // Inline storage for the common case (arterial_client always calls
   // this with a single-element list) -- avoids a heap allocation on
   // every write; only lists longer than this fall back to the heap.
-  constexpr size_t s_inline_iov_size = 8;
+  constexpr size_t s_inline_iov_size = 16;
   std::array<struct iovec, s_inline_iov_size> inline_iov;
   std::vector<struct iovec> heap_iov;
   struct iovec* iov;
@@ -724,21 +711,20 @@ Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
     iov = heap_iov.data();
   }
 
-  ERL_NIF_TERM head, tail = data_list;
   unsigned int i = 0;
   size_t total_bytes = 0;
 
-  while (enif_get_list_cell(env, tail, &head, &tail)) {
+  list_for_each(env, data_list, [&](ERL_NIF_TERM item) {
     ErlNifBinary bin;
-    if (enif_inspect_binary(env, head, &bin)) {
+    if (enif_inspect_binary(env, item, &bin)) {
       iov[i].iov_base = bin.data;
       iov[i].iov_len = bin.size;
       total_bytes += bin.size;
       i++;
     }
-  }
+  }); 
 
-  ssize_t written = 0;
+  ssize_t  written = 0;
   uint64_t target_bit = (1ULL << slot_id);
 
   // Handle pending buffer data - combine with new data if necessary
@@ -956,22 +942,20 @@ Connection::connect_with_opts(ErlNifEnv* env, PoolContext* ctx,
     setsockopt(socket_fd.get(), IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
   }
 
-  struct sockaddr_in addr{};
   auto [o0, o1, o2, o3] = octets;
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(port);
+  struct sockaddr_in addr{};
+  addr.sin_family      = AF_INET;
+  addr.sin_port        = htons(static_cast<uint16_t>(port));
   addr.sin_addr.s_addr = htonl((o0 << 24) | (o1 << 16) | (o2 << 8) | o3);
 
   int result = connect(socket_fd.get(), (struct sockaddr*)&addr, sizeof(addr));
-  if (result == -1) {
-    if (errno != EINPROGRESS)
-      return ConnectResultData(ConnectResult::FAILED, -1, am_connect_failed);
-    // For EINPROGRESS, connection is in progress - proceed with slot claiming
-    // The slot will be marked as SLOT_CONNECTING and completion will be
-    // handled via enif_select write-ready notifications
-  }
+  if (result == -1 && errno != EINPROGRESS)
+    return ConnectResultData(ConnectResult::FAILED, -1, am_connect_failed);
 
-  // Get the stripe for claiming
+  // For EINPROGRESS, connection is in progress - proceed with slot claiming
+  // The slot will be marked as SLOT_CONNECTING and completion will be
+  // handled via enif_select write-ready notifications
+
   if (stripe_id >= ctx->stripe_count)
     return ConnectResultData(ConnectResult::FAILED, -1, am_connect_failed);
 
@@ -1027,10 +1011,9 @@ Connection::connect_proto_with_opts(ErlNifEnv* env, PoolContext* ctx,
     return ConnectResultData(ConnectResult::SOCKET_FAILED, -1, am_socket_failed);
 
   // Configure socket for protocol (sets non-blocking)
-  if (!configure_socket_for_protocol(socket_fd.get(), protocol, false)) {  // nodelay handled separately
+  if (!configure_socket_for_protocol(socket_fd.get(), protocol, false))
     // No manual close() needed - RAII handles cleanup automatically
     return ConnectResultData(ConnectResult::CONFIG_FAILED, -1, am_failed_to_set_nonblocking);
-  }
 
   ERL_NIF_TERM err;
 
@@ -1048,9 +1031,9 @@ Connection::connect_proto_with_opts(ErlNifEnv* env, PoolContext* ctx,
 
   auto [o0, o1, o2, o3] = octets;
   struct sockaddr_in addr{};
-  addr.sin_family       = AF_INET;
-  addr.sin_port         = htons(port);
-  addr.sin_addr.s_addr  = htonl((o0 << 24) | (o1 << 16) | (o2 << 8) | o3);
+  addr.sin_family      = AF_INET;
+  addr.sin_port        = htons(static_cast<uint16_t>(port));
+  addr.sin_addr.s_addr = htonl((o0 << 24) | (o1 << 16) | (o2 << 8) | o3);
 
   int result        = -1;
   int connect_errno = 0;  // Save errno from connect() call
@@ -1073,7 +1056,9 @@ Connection::connect_proto_with_opts(ErlNifEnv* env, PoolContext* ctx,
     return ConnectResultData(ConnectResult::STRIPE_FULL, -1, am_stripe_full);
 
   auto& conn = stripe.slots[slot_id];
+  #ifdef HAVE_OPENSSL
   conn.protocol = protocol;
+  #endif
 
   // Transfer socket ownership first so conn.fd is live before timerfd_create.
   // This ensures timerfd_create cannot reuse the socket's fd number.
@@ -1175,13 +1160,11 @@ Connection::reserve_send_fifo_request(ErlNifEnv* env, PoolContext* ctx,
 
   while (retry_count < max_retries) {
     int slot_id = std::countr_zero(~current_mask);
-    if (static_cast<size_t>(slot_id) >= stripe.capacity) {
-      // No immediate slots - try queuing
+    if (static_cast<size_t>(slot_id) >= stripe.capacity) // No immediate slots - try queuing
       break;
-    }
 
     uint64_t target_bit = (1ULL << slot_id);
-    uint64_t new_mask = current_mask | target_bit;
+    uint64_t new_mask   = current_mask | target_bit;
 
     if (stripe.lease_mask.compare_exchange_weak(
           current_mask, new_mask,
@@ -1202,9 +1185,9 @@ Connection::reserve_send_fifo_request(ErlNifEnv* env, PoolContext* ctx,
 
       // Generate reservation ID
       static std::atomic<uint64_t> reservation_counter{1000000};
-      uint64_t reservation_id = reservation_counter.fetch_add(1, std::memory_order_relaxed);
+      uint64_t id = reservation_counter.fetch_add(1, std::memory_order_relaxed);
 
-      if (!conn.set_fifo_request(caller_pid, reservation_id)) {
+      if (!conn.set_fifo_request(caller_pid, id)) {
         // Failed to set request - release conn
         stripe.lease_mask.fetch_and(~target_bit, std::memory_order_release);
         return FifoResultData(FifoResult::SLOT_BUSY, -1, 0, am_fifo_slot_busy);
@@ -1286,13 +1269,13 @@ Connection::reserve_send_fifo_request(ErlNifEnv* env, PoolContext* ctx,
         conn.arm_read(env, ctx);
 
         // Return success - the write will complete asynchronously
-        return FifoResultData(FifoResult::REQUEST_SENT, slot_id, reservation_id);
+        return FifoResultData(FifoResult::REQUEST_SENT, slot_id, id);
       }
 
       conn.status.store(SLOT_FIFO_REQUEST_SENT, std::memory_order_release);
 
       // Return success with reservation info for later release
-      return FifoResultData(FifoResult::REQUEST_SENT, slot_id, reservation_id);
+      return FifoResultData(FifoResult::REQUEST_SENT, slot_id, id);
     }
     retry_count++;
   }

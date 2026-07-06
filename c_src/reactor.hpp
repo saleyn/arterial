@@ -149,24 +149,27 @@ struct ReactorCmd {
 // Simple wait-free MPSC ring (single consumer = reactor thread).
 // Capacity must be power-of-2.
 //------------------------------------------------------------------------------
-template <typename T, unsigned Cap>
+template <typename T>
 class MpscRing {
-  static_assert((Cap & (Cap-1)) == 0, "Cap must be a power of 2");
-  static constexpr unsigned kMask = Cap - 1;
-
   struct Slot {
     std::atomic<unsigned> seq;
     T                     val;
   };
 
+  unsigned                          m_cap;
+  unsigned                          m_mask;
   alignas(64) std::atomic<unsigned> m_head{0};
   alignas(64) std::atomic<unsigned> m_tail{0};
-  alignas(64) Slot                  m_slots[Cap];
+  std::unique_ptr<Slot[]>           m_slots;
 
 public:
-  MpscRing()
+  explicit MpscRing(unsigned cap = 4096)
   {
-    for (unsigned i = 0; i < Cap; ++i)
+    cap    = upper_power_of_two(cap);
+    m_cap  = cap;
+    m_mask = cap - 1;
+    m_slots.reset(new Slot[cap]);
+    for (unsigned i = 0; i < m_cap; ++i)
       m_slots[i].seq.store(i, std::memory_order_relaxed);
   }
 
@@ -174,7 +177,7 @@ public:
   {
     unsigned head = m_head.load(std::memory_order_relaxed);
     for (;;) {
-      auto&   s = m_slots[head & kMask];
+      auto&   s = m_slots[head & m_mask];
       auto  seq = s.seq.load(std::memory_order_acquire);
       auto diff = (int)seq - (int)head;
       if (diff == 0) {
@@ -194,13 +197,13 @@ public:
   bool pop(T& v)
   {
     unsigned tail = m_tail.load(std::memory_order_relaxed);
-    Slot& s = m_slots[tail & kMask];
+    Slot& s = m_slots[tail & m_mask];
     unsigned seq = s.seq.load(std::memory_order_acquire);
     int diff = (int)seq - (int)(tail + 1);
     if (diff != 0) return false;
     v = s.val;
-    m_tail.store(tail +  1, std::memory_order_relaxed);
-    s.seq.store(tail + Cap, std::memory_order_release);
+    m_tail.store(tail + 1, std::memory_order_relaxed);
+    s.seq.store(tail + m_cap, std::memory_order_release);
     return true;
   }
 };
@@ -223,14 +226,16 @@ public:
   ///                    for fds < fd_vec_size).  Fds ≥ fd_vec_size spill into
   ///                    a mutex-guarded overflow map.  Default: 64k entries.
   //----------------------------------------------------------------------------
-  explicit Reactor(std::string ident = "arterial_reactor",
-                   int fd_vec_size   = kDefaultFdVec)
+  explicit Reactor(std::string ident         = "arterial_reactor",
+                   int         fd_vec_size   = kDefaultFdVec,
+                   unsigned    cmds_ring_cap = 4096)
     : m_ident(std::move(ident))
     , m_handle(reactor_create())
     , m_wakeup_rd(reactor_eventfd_create())
     , m_wakeup_wr(reactor_eventfd_write_fd(m_wakeup_rd))
     , m_running(false)
     , m_entries(fd_vec_size)  // value-init: each FdEntry has fd=-1
+    , m_cmds(cmds_ring_cap)
   {
     // Register the wakeup fd for read events (persistent, edge-triggered).
     reactor_add(m_handle, m_wakeup_rd, REACTOR_EV_IN | REACTOR_EV_ET);
@@ -967,13 +972,13 @@ private:
   //----------------------------------------------------------------------------
   // State
   //----------------------------------------------------------------------------
-  std::string       m_ident;
-  reactor_handle_t  m_handle;
-  int               m_wakeup_rd;  ///< eventfd read end
-  int               m_wakeup_wr;  ///< eventfd write end (== wakeup_rd on Linux)
-  std::atomic<bool> m_running;
-  std::thread       m_thread;
-  ErlNifPid         m_owner_pid{};  ///< receives exit notification on abnormal stop
+  std::string             m_ident;
+  reactor_handle_t        m_handle;
+  int                     m_wakeup_rd;  ///< eventfd read end
+  int                     m_wakeup_wr;  ///< eventfd write end (== wakeup_rd on Linux)
+  std::atomic<bool>       m_running;
+  std::thread             m_thread;
+  ErlNifPid               m_owner_pid{};  ///< receives exit notification on abnormal stop
 
   // Ready-signal: start() blocks until the reactor thread sets m_ready=true,
   // guaranteeing the caller can post commands without a startup race.
@@ -981,13 +986,11 @@ private:
   std::condition_variable m_ready_cv;
   bool                    m_ready{false};
 
-  MpscRing<ReactorCmd, kCmdRingCap> m_cmds;
-
-  // Fast path: fixed-size heap array, allocated once at construction —
-  // no locking needed for in-range fds.  Heap allocation avoids placing
   // Pre-sized vector, sized at construction and never resized.
   // No locking needed for fds in [0, size()).  Default: 64k entries.
-  std::vector<FdEntry> m_entries;  // m_entries[fd].fd == -1 → slot free
+  std::vector<FdEntry>    m_entries;  // m_entries[fd].fd == -1 → slot free
+
+  MpscRing<ReactorCmd>    m_cmds;
 
   // Slow path: fds >= m_entries.size().  Protected by its own mutex.
   std::mutex                         m_entries_overflow_mu;

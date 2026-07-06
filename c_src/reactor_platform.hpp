@@ -153,6 +153,22 @@ static constexpr uint32_t REACTOR_EV_ONESHOT = 0x0040u;
 // unconditionally on all backends without a compile-time guard.
 static constexpr uint32_t REACTOR_EV_CONNECT = 0x8000'0000u;
 
+/// Round up to the nearest power of 2.  Returns 1 for 0.
+inline unsigned upper_power_of_two(unsigned n)
+{
+  if (n == 0) return 1;
+  if (n & (n - 1)) {
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n++;
+  }
+  return n;
+}
+
 inline bool reactor_is_error   (uint32_t m) { return m & (REACTOR_EV_ERR | REACTOR_EV_HUP); }
 inline bool reactor_is_readable(uint32_t m) { return m & REACTOR_EV_IN;  }
 inline bool reactor_is_writable(uint32_t m) { return m & REACTOR_EV_OUT; }

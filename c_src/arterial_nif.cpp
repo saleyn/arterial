@@ -1097,11 +1097,10 @@ static ERL_NIF_TERM set_slot_unavailable_nif(
 
   // Set slot status to indicate unavailability (but preserve specific states like CONNECTING)
   uint32_t current_status = conn.status.load(std::memory_order_acquire);
-  if (current_status == SLOT_AVAILABLE) {
+  if (current_status == SLOT_AVAILABLE)
     conn.status.store(SLOT_EMPTY, std::memory_order_release);
-  }
-  // If conn is CONNECTING, SSL_HANDSHAKE, etc., leave those states intact
 
+  // If conn is CONNECTING, SSL_HANDSHAKE, etc., leave those states intact
   return am_ok;
 }
 
@@ -1173,10 +1172,9 @@ static ERL_NIF_TERM reserve_fifo_connection_nif(
         continue;
       }
 
-      return make(env, std::make_tuple(
-        am_ok, am_fifo_reserved,
+      return make_tuple(env, am_ok, am_fifo_reserved,
         stripe_id, static_cast<unsigned int>(slot_id), reservation_id
-      ));
+      );
     }
     attempt++;
   }
@@ -1187,21 +1185,18 @@ static ERL_NIF_TERM reserve_fifo_connection_nif(
 
   for (size_t i = 0; i < stripe.capacity; i++) {
     auto slot_status = stripe.slots[i].status.load(std::memory_order_acquire);
-    if (slot_status == SLOT_CONNECTING) {
+    if (slot_status == SLOT_CONNECTING)
       has_connecting_slots = true;
-    } else if (slot_status == SLOT_EMPTY && stripe.slots[i].fd == -1) {
+    else if (slot_status == SLOT_EMPTY && stripe.slots[i].fd == -1)
       has_failed_slots = true;
-    }
   }
 
   // If no slots are connecting and we have failed connections, return error immediately
-  if (!has_connecting_slots && has_failed_slots) {
-    return make_tuple(env, am_error, am_pool_busy);
-  }
-
   // If we have connecting slots, we could wait, but for now return timeout
   // to avoid hanging tests. A real implementation would use async notification.
-  return make_tuple(env, am_error, am_timeout);
+  return !has_connecting_slots && has_failed_slots
+       ? make_tuple(env, am_error, am_pool_busy)
+       : make_tuple(env, am_error, am_timeout);
 }
 
 //-----------------------------------------------------------------------------
@@ -1413,8 +1408,6 @@ static ERL_NIF_TERM handle_fifo_reply_nif(
   // Clean up the FIFO request
   conn.clear_fifo_request();
 
-  // Set conn to draining state, then back to available
-  conn.status.store(SLOT_FIFO_DRAINING, std::memory_order_release);
   conn.status.store(SLOT_AVAILABLE, std::memory_order_release);
 
   // Release the conn lease
@@ -1448,12 +1441,12 @@ static ERL_NIF_TERM reserve_send_fifo_request_nif(
   switch (result.result) {
     case Connection::FifoResult::OK:
     case Connection::FifoResult::REQUEST_SENT:
-      return make(env, std::make_tuple(
+      return make_tuple(env,
         am_ok, am_fifo_request_sent,
-        stripe_id,                             // Use the stripe_id parameter
+        stripe_id,
         static_cast<unsigned int>(result.slot_id),
         result.reservation_id
-      ));
+      );
 
     case Connection::FifoResult::POOL_BUSY:
     case Connection::FifoResult::SLOT_BUSY:
