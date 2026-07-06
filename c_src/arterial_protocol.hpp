@@ -235,33 +235,6 @@ struct ProtocolHandler<PROTO_SSL> {
 // Protocol Dispatch Functions
 //=============================================================================
 
-// Zero-cost protocol dispatch using template specialization
-template<typename Func>
-auto dispatch_protocol(ProtocolType protocol, Func&& func) {
-  switch (protocol) {
-    case PROTO_TCP:
-      return func(ProtocolHandler<PROTO_TCP>{});
-    case PROTO_UDP:
-      return func(ProtocolHandler<PROTO_UDP>{});
-#ifdef HAVE_OPENSSL
-    case PROTO_SSL:
-      return func(ProtocolHandler<PROTO_SSL>{});
-#endif
-    default:
-      // Return error - this should be handled by caller
-      static_assert(std::is_same_v<decltype(func(ProtocolHandler<PROTO_TCP>{})), int>,
-                    "Protocol dispatch functions must return int");
-      return -1;
-  }
-}
-
-// Helper macro for protocol dispatch with error handling
-#define DISPATCH_PROTOCOL(protocol, handler_var, code) \
-  dispatch_protocol(protocol, [&](auto handler_var) -> int { \
-    using HandlerType = decltype(handler_var); \
-    code \
-  })
-
 // Helper function to create socket for a specific protocol
 static int create_socket_for_protocol(ProtocolType protocol) {
   switch (protocol) {
@@ -290,6 +263,8 @@ static bool configure_socket_for_protocol(int fd, ProtocolType protocol, bool no
     case PROTO_UDP:
       // UDP doesn't need nodelay, already connectionless
       break;
+    default:
+      return false;
   }
   return true;
 }
