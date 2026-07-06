@@ -1,13 +1,18 @@
 #pragma once
 
+#include <algorithm>
+#include <cstring>
+#include <type_traits>
 #include <cstdint>
 #include <cstddef>
 #include <utility>  // for std::exchange
 #include <unistd.h> // for close()
 #include "enif.hpp"
+#include "arterial_types.hpp"
 
 namespace arterial {
 
+using namespace nifpp;
 using IP4Tuple =
   std::tuple<unsigned int, unsigned int, unsigned int, unsigned int>;
 
@@ -30,10 +35,64 @@ enum SlotStatus : uint32_t {
 };
 
 enum ProtocolType : uint32_t {
-  PROTO_TCP,
-  PROTO_UDP,
-  PROTO_SSL
+  PROTO_UNKNOWN = 0,
+  PROTO_TCP     = 1,
+  PROTO_UDP     = 2,
+  PROTO_SSL     = 3
 };
+
+//=============================================================================
+// The protocol dispatcher
+//=============================================================================
+/*
+template <typename Visitor>
+void visit_protocol(ProtocolType proto, Visitor&& visitor) {
+  switch (proto) {
+    case PROTO_SSL: 
+      return visitor(std::integral_constant<ProtocolType, PROTO_SSL>{}); 
+    case PROTO_UDP: 
+      return visitor(std::integral_constant<ProtocolType, PROTO_UDP>{}); 
+    default:        
+      return visitor(std::integral_constant<ProtocolType, PROTO_TCP>{}); 
+  }
+}
+
+// A tiny helper mapping struct
+struct ProtocolMap {
+  atom         name;
+  ProtocolType type;
+};
+
+// The dispatcher loop
+template <typename Visitor>
+auto visit_protocol_by_name(atom protocol_name, Visitor&& visitor) {
+  // 1. Define the supported protocols in a clean data table
+  static constexpr ProtocolMap mapping[] = {
+    {am_tcp, PROTO_TCP},
+    {am_udp, PROTO_UDP},
+    #ifdef HAVE_OPENSSL
+    {am_ssl, PROTO_SSL},
+    #endif
+  };
+
+  // 2. Search for a matching string
+  for (const auto& entry : mapping) {
+    if (protocol_name == entry.name) {
+      // Found it! Execute the template logic via runtime-to-compile-time switch
+      switch (entry.type) {
+        case PROTO_TCP: return visitor(std::integral_constant<ProtocolType, PROTO_TCP>{});
+        case PROTO_UDP: return visitor(std::integral_constant<ProtocolType, PROTO_UDP>{});
+        #ifdef HAVE_OPENSSL
+        case PROTO_SSL: return visitor(std::integral_constant<ProtocolType, PROTO_SSL>{});
+        #endif
+      }
+    }
+  }
+
+  // 3. Fallback sentinel object (empty/null variant indicator)
+  return visitor(std::integral_constant<ProtocolType, PROTO_UNKNOWN>{});
+}
+*/
 
 //=============================================================================
 // RAII File Descriptor Wrapper
