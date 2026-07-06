@@ -110,20 +110,14 @@ public:
   }
 
   /// @brief Check if timeout is currently active
-  bool is_active() const noexcept {
-    return m_timeout_fd >= 0;
-  }
+  bool is_active() const noexcept { return m_timeout_fd >= 0; }
 
   /// @brief Get the timeout file descriptor (for enif_select)
   /// @return File descriptor, or -1 if inactive
-  int get_fd() const noexcept {
-    return m_timeout_fd;
-  }
+  int get_fd() const noexcept { return m_timeout_fd; }
 
   /// @brief Explicitly cancel timeout (optional - destructor will do this)
-  void cancel() noexcept {
-    cleanup();
-  }
+  void cancel() noexcept { cleanup(); }
 
   /// @brief Release ownership of the timeout fd (advanced usage)
   /// @return The file descriptor (caller takes ownership)
@@ -202,14 +196,10 @@ public:
   }
 
   /// @brief Check if timeout is active and not dismissed
-  bool is_active() const noexcept {
-    return m_active && !m_dismissed;
-  }
+  bool is_active() const noexcept { return m_active && !m_dismissed; }
 
   /// @brief Get the timeout file descriptor
-  int get_fd() const noexcept {
-    return m_timeout_fd;
-  }
+  int get_fd() const noexcept { return m_timeout_fd; }
 
 private:
   Connection& m_conn;

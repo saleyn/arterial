@@ -281,7 +281,8 @@ struct alignas(64) Connection {
     bool send_connect_msg;     // Whether to send connection result message
     TERM connect_result;       // am_ok or am_connect_failed
 
-    WriteResultData(WriteResult r) : result(r), send_connect_msg(false) {}
+    WriteResultData(WriteResult r, bool send_msg = false, TERM result = am_unknown)
+      : result(r), send_connect_msg(send_msg), connect_result(result) {}
   };
 
   // Handle readable events - contains all the business logic
@@ -397,9 +398,9 @@ struct alignas(64) Connection {
 
   struct FifoResultData {
     FifoResult result;
-    int slot_id;                // Valid slot ID for successful operations
-    uint64_t reservation_id;    // Reservation ID for FIFO operations
-    TERM error_reason;          // Specific error atom for failures
+    int        slot_id;         // Valid slot ID for successful operations
+    uint64_t   reservation_id;  // Reservation ID for FIFO operations
+    TERM       error_reason;    // Specific error atom for failures
 
     FifoResultData(FifoResult r, int slot = -1, uint64_t res_id = 0)
       : result(r), slot_id(slot), reservation_id(res_id), error_reason(am_unknown) {}

@@ -50,7 +50,7 @@ Both `connect_async_nif` and `send_and_release_nif` use consistent slot claiming
 do {
     slot_id = std::countr_zero(~current_mask);  // Find first available slot
     if (static_cast<size_t>(slot_id) >= stripe.capacity) [[unlikely]] {
-        return make(env, std::make_tuple(am_error, am_stripe_full));
+        return make_tuple(env, am_error, am_stripe_full));
     }
 
     uint64_t target_bit = (1ULL << slot_id);
