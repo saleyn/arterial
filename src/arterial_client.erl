@@ -50,16 +50,7 @@ carried this request dies before a reply arrives (see
 -spec call(arterial_pool:name(), term(), non_neg_integer() | infinity) ->
   {ok, arterial:response()} | {error, term()}.
 call(Pool, Request, Timeout) ->
-  case arterial_observe:enabled() of
-    false ->
-      do_call(Pool, Request, Timeout);
-    true ->
-      arterial_observe:span([call], #{pool => Pool}, fun() ->
-        Result = do_call(Pool, Request, Timeout),
-        Outcome = case Result of {ok, _} -> ok; _ -> error end,
-        {Result, #{pool => Pool, result => Outcome}}
-      end)
-  end.
+  (arterial_observe:dispatcher()):call(Pool, fun() -> do_call(Pool, Request, Timeout) end).
 
 do_call(Pool, Request, Timeout) ->
   CorrId = new_corr_id(),
@@ -91,16 +82,7 @@ ok
 """.
 -spec cast(arterial_pool:name(), term()) -> ok | {error, term()}.
 cast(Pool, Request) ->
-  case arterial_observe:enabled() of
-    false ->
-      do_cast(Pool, Request);
-    true ->
-      arterial_observe:span([cast], #{pool => Pool}, fun() ->
-        Result = do_cast(Pool, Request),
-        Outcome = case Result of ok -> ok; _ -> error end,
-        {Result, #{pool => Pool, result => Outcome}}
-      end)
-  end.
+  (arterial_observe:dispatcher()):cast(Pool, fun() -> do_cast(Pool, Request) end).
 
 do_cast(Pool, Request) ->
   CorrId = new_corr_id(),
@@ -153,22 +135,9 @@ try_send(Pool, ConnID, CorrId, Data, Timeout) ->
   %% lack of a matching entry yet.
   ets:insert(CorrTable, {CorrId, self(), ConnID, Deadline}),
   PoolRef = arterial_pool:pool_ref(Pool),
-  case arterial_observe:enabled() of
-    false ->
-      case arterial_nif:send_and_release(PoolRef, ConnID, [Data]) of
-        {ok, _SlotId} -> ok;
-        {error, _Reason} -> ets:delete(CorrTable, CorrId), retry
-      end;
-    true ->
-      case arterial_observe:span([nif, send], #{pool => Pool, conn_id => ConnID}, fun() ->
-        case arterial_nif:send_and_release(PoolRef, ConnID, [Data]) of
-          {ok, SlotId} -> {{ok, SlotId}, #{result => ok, slot_id => SlotId}};
-          {error, Reason} -> {{error, Reason}, #{result => error, reason => Reason}}
-        end
-      end) of
-        {ok, _SlotId} -> ok;
-        {error, _Reason} -> ets:delete(CorrTable, CorrId), retry
-      end
+  case (arterial_observe:dispatcher()):send_and_release(Pool, PoolRef, ConnID, Data) of
+    {ok, _SlotId}    -> ok;
+    {error, _Reason} -> ets:delete(CorrTable, CorrId), retry
   end.
 
 send_cast_to_any(_Pool, Size, Tried, _Data) when length(Tried) >= Size ->
@@ -179,22 +148,9 @@ send_cast_to_any(Pool, Size, Tried, Data) ->
       {error, no_connection};
     ConnID ->
       PoolRef = arterial_pool:pool_ref(Pool),
-      case arterial_observe:enabled() of
-        false ->
-          case arterial_nif:send_and_release(PoolRef, ConnID, [Data]) of
-            {ok, _SlotId}    -> ok;
-            {error, _Reason} -> send_cast_to_any(Pool, Size, [ConnID | Tried], Data)
-          end;
-        true ->
-          case arterial_observe:span([nif, send], #{pool => Pool, conn_id => ConnID}, fun() ->
-            case arterial_nif:send_and_release(PoolRef, ConnID, [Data]) of
-              {ok, SlotId} -> {{ok, SlotId}, #{result => ok, slot_id => SlotId}};
-              {error, Reason} -> {{error, Reason}, #{result => error, reason => Reason}}
-            end
-          end) of
-            {ok, _SlotId}    -> ok;
-            {error, _Reason} -> send_cast_to_any(Pool, Size, [ConnID | Tried], Data)
-          end
+      case (arterial_observe:dispatcher()):send_and_release(Pool, PoolRef, ConnID, Data) of
+        {ok, _SlotId}    -> ok;
+        {error, _Reason} -> send_cast_to_any(Pool, Size, [ConnID | Tried], Data)
       end
   end.
 

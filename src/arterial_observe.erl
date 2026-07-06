@@ -120,7 +120,7 @@ Perform finalization of an observability component.
 """.
 -callback stop() -> ok.
 
--export([start_link/2, span/3, event/2, event/3, enabled/0]).
+-export([start_link/2, span/3, event/2, event/3, enabled/0, dispatcher/0]).
 
 -doc """
 Start (and register locally as `?MODULE`) the singleton process that owns
@@ -264,6 +264,20 @@ already paid to produce the arguments.
 -spec enabled() -> boolean().
 enabled() ->
   backend() =/= nil.
+
+-doc """
+Returns the dispatcher module for the current observability configuration.
+`arterial_observe_noop` when no backend is configured (functions pass through
+directly); `arterial_observe_span` when a backend is active (functions are
+wrapped in `arterial_observe:span/3`). Callers on hot paths use this once and
+call the returned module directly, avoiding a repeated `enabled/0` branch.
+""".
+-spec dispatcher() -> arterial_observe_noop | arterial_observe_span.
+dispatcher() ->
+  case backend() of
+    nil -> arterial_observe_noop;
+    _   -> arterial_observe_span
+  end.
 
 -doc "Equivalent to `event/3` with `Measurements = #{}`.".
 -spec event([atom()], map()) -> ok.
