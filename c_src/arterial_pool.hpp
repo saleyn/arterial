@@ -355,7 +355,7 @@ struct PoolContext {
   // Sends {arterial_event, StripeId, SlotId, closed} to owner_pid (unless
   // owner is the caller), clears slot state, and tells the reactor to
   // remove the fd (which closes it on the reactor thread — race-free).
-  int notify_and_close(ErlNifEnv* env, Connection& slot);
+  int notify_and_close(ErlNifEnv* env, Connection& slot, bool notify = true);
 
   // Claim the first unregistered slot in `stripe` for `fd`/`owner_pid`
   // Returns: -1 = Stripe full, N = Connection slot

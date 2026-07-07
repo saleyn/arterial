@@ -241,27 +241,28 @@ struct ReactorUringCtx {
   // TCP sockets fails with EBADF.  To avoid this, all fd readiness polling is
   // done through this epoll instance instead of io_uring POLL_ADD.  io_uring is
   // only used for async operations: CONNECT (with linked LINK_TIMEOUT).
-  int             epoll_fd = -1;
+  int epoll_fd = -1;
 
   ReactorUringCtx() { memset(&ring, 0, sizeof(ring)); }
   ~ReactorUringCtx()
   {
     if (ring.ring_fd > 0) io_uring_queue_exit(&ring);
-    if (epoll_fd  >= 0)   ::close(epoll_fd);
+    if (epoll_fd >= 0)    ::close(epoll_fd);
   }
 };
 
 namespace detail {
-// Fixed-size handle table.  In tests many pools are created across a single
-// BEAM VM without explicit teardown between tests (GC drives cleanup), so
-// 256 gives enough headroom for the full test suite without growing unbounded.
-static constexpr int kMaxRings = 256;
-inline ReactorUringCtx** uring_table()
-{
-  static ReactorUringCtx* t[kMaxRings] = {};
-  return t;
-}
-inline std::mutex& uring_mutex() { static std::mutex m; return m; }
+  // Fixed-size handle table.  In tests many pools are created across a single
+  // BEAM VM without explicit teardown between tests (GC drives cleanup), so
+  // 256 gives enough headroom for the full test suite without growing unbounded.
+  static constexpr int s_max_rings = 256;
+  inline ReactorUringCtx** uring_table()
+  {
+    static ReactorUringCtx* t[s_max_rings] = {};
+    return t;
+  }
+
+  inline std::mutex& uring_mutex() { static std::mutex m; return m; }
 } // namespace detail
 
 /// Create an io_uring-backed reactor handle.
@@ -288,7 +289,7 @@ inline reactor_handle_t reactor_create(unsigned entries = 4096,
     throw std::runtime_error(std::string("epoll_create1 (companion): ") + strerror(errno));
 
   std::lock_guard<std::mutex> lg(detail::uring_mutex());
-  for (int i = 0; i < detail::kMaxRings; ++i) {
+  for (int i = 0; i < detail::s_max_rings; ++i) {
     auto& tab = detail::uring_table()[i];
     if (!tab) {
       tab = ctx.release();
@@ -300,7 +301,7 @@ inline reactor_handle_t reactor_create(unsigned entries = 4096,
 
 inline void reactor_destroy(reactor_handle_t h)
 {
-  if (h < 0 || h >= detail::kMaxRings) return;
+  if (h < 0 || h >= detail::s_max_rings) return;
   std::lock_guard<std::mutex> lg(detail::uring_mutex());
   delete detail::uring_table()[h];
   detail::uring_table()[h] = nullptr;
@@ -308,13 +309,14 @@ inline void reactor_destroy(reactor_handle_t h)
 
 inline ReactorUringCtx& reactor_ctx(reactor_handle_t h)
 {
+  assert(size_t(h) < detail::s_max_rings);
   return *detail::uring_table()[h];
 }
 
 /// Get the raw io_uring for submitting custom SQEs.
 inline struct io_uring* reactor_uring(reactor_handle_t h)
 {
-  return &detail::uring_table()[h]->ring;
+  return &reactor_ctx(h).ring;
 }
 
 // ---- fd interest tracking — all fds through the companion epoll -----------

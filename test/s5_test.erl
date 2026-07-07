@@ -4,22 +4,21 @@
 
 s5_test() ->
   application:ensure_all_started(arterial),
-  %% Start NIF server
+  %% Flush any stale arterial_event messages left by previous tests that ran
+  %% in this process.  Tests sharing a process (EUnit default) can leave
+  %% unreceived {arterial_event, ..., connect_result, connect_failed} messages
+  %% in the mailbox when their connections close asynchronously after the test.
+  flush_mailbox(),
   {ok, SPort, ServerState} = start_nif_server(),
-  io:format(standard_error, "NIF server port: ~p~n", [SPort]),
-  timer:sleep(50),
   %% Connect NIF client
   {ok, CPool} = arterial_nif:init_pool(1, 1),
   SlotId = connect(CPool, 0, {127,0,0,1}, SPort),
-  io:format(standard_error, "client slot: ~p~n", [SlotId]),
   %% Ping-pong
   {ok, _} = arterial_nif:send_and_release(CPool, 0, [<<0:32/big, 0:32>>]),
   receive
     {arterial_event, 0, SlotId, read, Bin} ->
-      io:format(standard_error, "reply: ~p~n", [Bin]),
       ?assert(byte_size(Bin) >= 8)
   after ?TIMEOUT ->
-    io:format(standard_error, "TIMEOUT~n", []),
     ?assert(false)
   end,
   stop_nif_server(ServerState).
@@ -82,3 +81,6 @@ connect(Pool, Idx, Addr, Port) ->
       end;
     {ok, S} -> S
   end.
+
+flush_mailbox() ->
+  receive _ -> flush_mailbox() after 0 -> ok end.

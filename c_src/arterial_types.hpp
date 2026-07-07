@@ -175,7 +175,7 @@ public:
   void reset(int fd = INVALID_FD) noexcept { close(); m_fd = fd; }
 
   /// @brief Manual close (safe to call multiple times)
-  void close() noexcept { if (m_fd >= 0) reset(); }
+  void close() noexcept { if (m_fd >= 0) { ::close(m_fd); m_fd = INVALID_FD; } }
 
 private:
   static constexpr int INVALID_FD = -1;

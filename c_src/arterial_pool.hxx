@@ -336,17 +336,15 @@ inline PoolUtilization PoolContext::calculate_pool_utilization() {
 // (conn.fd=-1 set before SELECT_STOP), closes via the event parameter.
 // One-shot heads-up to the owner that this slot's connection just died.
 // The reactor closes the fd on its own thread — no enif_select(STOP) needed.
-int PoolContext::notify_and_close(ErlNifEnv* env, Connection& slot) {
+int PoolContext::notify_and_close(ErlNifEnv* env, Connection& slot, bool notify) {
   // Remove the owner monitor first to prevent a concurrent on_down from
   // re-entering notify_and_close for the same slot.
   demonitor_owner(env, slot);
 
-  ErlNifPid self_pid;
-  enif_self(env, &self_pid);
-  if (enif_compare_pids(&self_pid, &slot.owner_pid) != 0) {
+  if (notify) {
     nifpp::msg_env msg_env;
     auto msg = slot.make_event_msg(msg_env, am_closed);
-    enif_send(env, &slot.owner_pid, msg_env, msg);
+    enif_send(nullptr, &slot.owner_pid, msg_env, msg);
   }
 
   // Clear status and lease bit immediately so claim_slot can reuse this slot.
@@ -435,7 +433,7 @@ int PoolContext::monitor_owner(ErlNifEnv* env, Connection& conn)
       auto& c = ref->ctx->stripes[ref->stripe_id]->slots[ref->slot_id];
       // Guard against slot reuse: demonitor_owner nulls slot_ref before reset().
       if (c.slot_ref == ref)
-        ref->ctx->notify_and_close(denv, c);
+        ref->ctx->notify_and_close(denv, c, /*notify=*/false);
     }
   };
 

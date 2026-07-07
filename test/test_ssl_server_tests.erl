@@ -168,7 +168,8 @@ ssl_bounce_reconnects_test() ->
         % Wait for the slow result with a longer timeout for SSL
         case receive Msg -> Msg after 5000 -> timeout end of
           {slow_result, {ok, slow}} -> ok;
-          {slow_result, {error, disconnected}} -> ok; % Acceptable for SSL after bounce
+          {slow_result, {error, disconnected}} -> ok;
+          {slow_result, {error, timeout}} -> ok; % SSL bounce can cause the in-flight call to time out
           timeout -> error({ssl_slow_result_timeout, "Slow SSL call did not complete"})
         end
 
