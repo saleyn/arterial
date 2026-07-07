@@ -6,7 +6,7 @@ calls through directly without any span wrapping or event emission.
 Returned by `arterial_observe:dispatcher/0` when `enabled/0` is false.
 """.
 
--export([call/2, cast/2, send_and_release/4]).
+-export([call/2, cast/2, send_and_release/4, register_and_send/7]).
 
 -doc "Run `Fun/0` and return its result directly, no span wrapping.".
 -spec call(arterial_pool:name(), fun(() -> Result)) -> Result when Result :: term().
@@ -23,3 +23,10 @@ cast(_Pool, Fun) ->
   {ok, non_neg_integer()} | {error, term()}.
 send_and_release(_Pool, PoolRef, ConnID, Data) ->
   arterial_nif:send_and_release(PoolRef, ConnID, [Data]).
+
+-doc "Call `arterial_nif:register_and_send/6` directly, no span wrapping.".
+-spec register_and_send(arterial_pool:name(), arterial_nif:pool_ref(), non_neg_integer(),
+                        non_neg_integer(), pid(), integer(), iodata()) ->
+  {ok, non_neg_integer()} | {error, term()}.
+register_and_send(_Pool, PoolRef, ConnID, CorrId, CallerPid, DeadlineUs, Data) ->
+  arterial_nif:register_and_send(PoolRef, ConnID, CorrId, CallerPid, DeadlineUs, [Data]).

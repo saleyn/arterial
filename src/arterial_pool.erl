@@ -84,8 +84,13 @@ theoretically create more connections by increasing slots per stripe.
 -export([start_link/2, stop/1]).
 -export([init/1]).
 -export([sup_name/1]).
--export([pool_ref/1, codec/1, size/1, default_timeout_ms/1, throttle/1]).
+-export([pool_meta/1, pool_ref/1, codec/1, size/1, default_timeout_ms/1, throttle/1]).
 -export([set_available/2, set_unavailable/2, is_available/2, wait_connected/2, wait_connected/3]).
+
+-include("arterial_pool.hrl").
+
+-type pool_meta() :: #pool_meta{}.
+-export_type([pool_meta/0]).
 
 -doc "The atom identifying a pool; shared with `arterial_nif:pool_ref/0`'s owner.".
 -type name() :: atom().
@@ -290,10 +295,7 @@ stop(Name) ->
     undefined -> ok;
     Pid       -> _ = supervisor:stop(Pid)
   end,
-  lists:foreach(fun(Key) -> persistent_term:erase(Key) end, [
-    pool_key(Name), codec_key(Name), size_key(Name),
-    timeout_key(Name), throttle_key(Name)
-  ]),
+  persistent_term:erase(meta_key(Name)),
   ok.
 
 %%%-----------------------------------------------------------------------------
@@ -325,11 +327,6 @@ init([Name, Opts]) ->
     end
   end),
 
-  persistent_term:put(pool_key(Name),    PoolRef),
-  persistent_term:put(codec_key(Name),   Codec),
-  persistent_term:put(size_key(Name),    Size),
-  persistent_term:put(timeout_key(Name), DefaultTimeoutMs),
-
   % Configure throttling in the NIF if enabled
   ThrottleState = case Throttle of
     undefined ->
@@ -345,7 +342,13 @@ init([Name, Opts]) ->
       ok    = arterial_nif:configure_throttle(PoolRef, RPS, WinMS),
       {RPS, WinMS}
   end,
-  persistent_term:put(throttle_key(Name), ThrottleState),
+  persistent_term:put(meta_key(Name), #pool_meta{
+    pool_ref           = PoolRef,
+    codec              = Codec,
+    size               = Size,
+    default_timeout_ms = DefaultTimeoutMs,
+    throttle           = ThrottleState
+  }),
   %% Connection availability is now managed entirely by the NIF layer
 
   ConnOpts = maps:without(?POOL_OPT_KEYS, Opts),
@@ -395,46 +398,51 @@ init([Name, Opts]) ->
 -spec sup_name(name()) -> atom().
 sup_name(Name) -> list_to_atom("arterial_pool_" ++ atom_to_list(Name)).
 
+-doc "All client-hot-path metadata for `Name` in a single `persistent_term` lookup.".
+-spec pool_meta(name()) -> pool_meta().
+pool_meta(Name) ->
+  case persistent_term:get(meta_key(Name), nil) of
+    nil  -> error({unknown_pool, Name});
+    Meta -> Meta
+  end.
+
 -doc "`Name`'s `arterial_nif` resource.".
 -spec pool_ref(name()) -> arterial_nif:pool_ref().
-pool_ref(Name) -> get_pt(pool_key(Name), Name).
+pool_ref(Name) -> (pool_meta(Name))#pool_meta.pool_ref.
 
 -doc "`Name`'s configured `c:arterial_codec` callback module.".
 -spec codec(name()) -> module().
-codec(Name) -> get_pt(codec_key(Name), Name).
+codec(Name) -> (pool_meta(Name))#pool_meta.codec.
 
 -doc "`Name`'s configured connection count (and stripe count).".
 -spec size(name()) -> pos_integer().
-size(Name) -> get_pt(size_key(Name), Name).
+size(Name) -> (pool_meta(Name))#pool_meta.size.
 
 -doc "`Name`'s default `call/3` timeout.".
 -spec default_timeout_ms(name()) -> pos_integer().
-default_timeout_ms(Name) -> get_pt(timeout_key(Name), Name).
+default_timeout_ms(Name) -> (pool_meta(Name))#pool_meta.default_timeout_ms.
 
 -doc "`Name`'s throttle state, or `undefined` if throttling is disabled. Returns `{RatePerSec, WindowMsec}`.".
 -spec throttle(name()) -> undefined | {pos_integer(), pos_integer()}.
-throttle(Name) -> get_pt(throttle_key(Name), Name).
+throttle(Name) -> (pool_meta(Name))#pool_meta.throttle.
 
 -doc "Mark connection `ConnID` of `Name` available for new sends.".
 -spec set_available(name(), non_neg_integer()) -> ok.
 set_available(Name, ConnID) ->
-  StripeId = ConnID,  % ConnID maps directly to StripeId for single connection per stripe
-  PoolRef = pool_ref(Name),
-  ok = arterial_nif:set_slot_available(PoolRef, StripeId, 0).
+  #pool_meta{pool_ref = PoolRef} = pool_meta(Name),
+  ok = arterial_nif:set_slot_available(PoolRef, ConnID, 0).
 
 -doc "Mark connection `ConnID` of `Name` unavailable for new sends.".
 -spec set_unavailable(name(), non_neg_integer()) -> ok.
 set_unavailable(Name, ConnID) ->
-  StripeId = ConnID,  % ConnID maps directly to StripeId for single connection per stripe
-  PoolRef = pool_ref(Name),
-  ok = arterial_nif:set_slot_unavailable(PoolRef, StripeId, 0).
+  #pool_meta{pool_ref = PoolRef} = pool_meta(Name),
+  ok = arterial_nif:set_slot_unavailable(PoolRef, ConnID, 0).
 
 -doc "Whether connection `ConnID` of `Name` is currently available for new sends.".
 -spec is_available(name(), non_neg_integer()) -> boolean().
 is_available(Name, ConnID) ->
-  StripeId = ConnID,  % ConnID maps directly to StripeId for single connection per stripe
-  PoolRef = pool_ref(Name),
-  arterial_nif:is_slot_available(PoolRef, StripeId, 0).
+  #pool_meta{pool_ref = PoolRef} = pool_meta(Name),
+  arterial_nif:is_slot_available(PoolRef, ConnID, 0).
 
 -doc """
 Block until `all` connections or the first `N` connections in pool `Name` are available.
@@ -508,21 +516,4 @@ check_connections_available(Name, N) ->
 %%% Internal functions
 %%%-----------------------------------------------------------------------------
 
-%% persistent_term:get/2's Default argument is evaluated eagerly (Erlang
-%% has no laziness), so `persistent_term:get(Key, error(...))` would
-%% always raise regardless of whether Key exists -- a sentinel value
-%% (guaranteed never to be a real stored value, see throttle/1's own
-%% legitimate `undefined`) plus a case is the correct lazy-default idiom.
-get_pt(Key, Name) ->
-  case persistent_term:get(Key, nil) of
-    nil   -> error({unknown_pool, Name});
-    Value -> Value
-  end.
-
-%% Throttle initialization is now handled directly in the NIF via configure_throttle/3
-
-pool_key(Name)     -> {?MODULE, Name, pool_ref}.
-codec_key(Name)    -> {?MODULE, Name, codec}.
-size_key(Name)     -> {?MODULE, Name, size}.
-timeout_key(Name)  -> {?MODULE, Name, default_timeout_ms}.
-throttle_key(Name) -> {?MODULE, Name, throttle}.
+meta_key(Name) -> {?MODULE, Name}.

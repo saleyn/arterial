@@ -49,8 +49,8 @@ group membership management. See `connect_proto_with_opts/9`.
 -export([is_slot_available/3, set_slot_available/3, set_slot_unavailable/3]).
 -export([reserve_fifo_connection/3, send_fifo_request/6, release_fifo_connection/4, fifo_connection_status/3, handle_fifo_reply/4]).
 -export([reserve_send_fifo_request/5]). % New combined function (#3)
--export([register_corr/6, unregister_corr/3, lookup_and_remove_corr/3,
-         corr_count/2, drain_corr_map/3, sweep_corr_map/2]).
+-export([register_corr/6, register_and_send/6, unregister_corr/3,
+         lookup_and_remove_corr/3, corr_count/2, drain_corr_map/3, sweep_corr_map/2]).
 -export([info/0]).
 
 -on_load(init/0).
@@ -701,6 +701,18 @@ is `os:system_time(microsecond) + TimeoutUs` (used by `sweep_corr_map/2`).
 -spec register_corr(pool_ref(), non_neg_integer(), non_neg_integer(),
                     pid(), non_neg_integer(), integer()) -> ok.
 register_corr(_PoolRef, _StripeId, _CorrId, _CallerPid, _ConnId, _DeadlineUs) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Register the correlation entry and send `Data` in a single NIF call.
+Equivalent to `register_corr/6` followed by `send_and_release/3`, but
+avoids the second NIF boundary crossing.  On send failure the correlation
+entry is removed automatically before the error is returned.
+""".
+-spec register_and_send(pool_ref(), non_neg_integer(), non_neg_integer(),
+                        pid(), integer(), iolist()) ->
+  {ok, non_neg_integer()} | {error, term()}.
+register_and_send(_PoolRef, _StripeId, _CorrId, _CallerPid, _DeadlineUs, _Data) ->
   ?NOT_LOADED_ERROR.
 
 -doc "Remove a previously registered corr entry (on send failure before a reply arrives).".

@@ -1547,6 +1547,52 @@ static ERL_NIF_TERM register_corr_nif(
 }
 
 //-----------------------------------------------------------------------------
+// register_and_send(PoolRef, StripeId, CorrId, CallerPid, DeadlineUs, DataList)
+//   → {ok, SlotId} | {error, Reason}
+//
+// Atomically inserts the correlation entry and then sends the data in one NIF
+// call, replacing the two-call sequence register_corr + send_and_release on
+// the hot path.  On send failure the correlation entry is removed before
+// returning the error so the caller does not need to call unregister_corr.
+//-----------------------------------------------------------------------------
+static ERL_NIF_TERM register_and_send_nif(
+  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
+{
+  PoolContext* ctx;
+  unsigned int stripe_id, corr_id;
+  ErlNifPid    caller_pid;
+  ErlNifSInt64 deadline_us;
+
+  assert(argc == 6);
+
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count - 1))
+    || !get(env, argv[2], corr_id)
+    || !enif_get_local_pid(env, argv[3], &caller_pid)
+    || !enif_get_int64(env, argv[4], &deadline_us)
+    || !enif_is_list(env, argv[5])) [[unlikely]]
+    return enif_make_badarg(env);
+
+  auto& ct = ctx->stripes[stripe_id]->corr_table;
+  if (!ct.insert(corr_id, caller_pid,
+                 static_cast<uint32_t>(stripe_id),
+                 static_cast<int64_t>(deadline_us))) [[unlikely]]
+    return make_tuple(env, am_error, enif_make_atom(env, "table_full"));
+
+  auto result = Connection::send_and_release(env, ctx, stripe_id, argv[5]);
+
+  switch (result.result) {
+    case Connection::SendResult::OK:
+    case Connection::SendResult::PARTIAL:
+      return make_tuple(env, am_ok, result.slot_id);
+
+    default:
+      ct.erase(corr_id);
+      return make_tuple(env, am_error, result.error_reason);
+  }
+}
+
+//-----------------------------------------------------------------------------
 // unregister_corr(PoolRef, StripeId, CorrId) → ok
 //-----------------------------------------------------------------------------
 static ERL_NIF_TERM unregister_corr_nif(

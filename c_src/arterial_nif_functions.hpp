@@ -87,6 +87,7 @@ static ERL_NIF_TERM reserve_send_fifo_request_nif(ErlNifEnv* env, int argc, cons
 //=============================================================================
 
 static ERL_NIF_TERM register_corr_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM register_and_send_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM unregister_corr_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM lookup_and_remove_corr_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM corr_count_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
@@ -158,6 +159,7 @@ static ErlNifFunc nif_funcs[] = {
 
   // Corr-map NIFs
   {"register_corr",               6, register_corr_nif,             0},
+  {"register_and_send",           6, register_and_send_nif,         0},
   {"unregister_corr",             3, unregister_corr_nif,           0},
   {"lookup_and_remove_corr",      3, lookup_and_remove_corr_nif,    0},
   {"corr_count",                  2, corr_count_nif,                0},

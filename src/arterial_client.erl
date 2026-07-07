@@ -17,6 +17,8 @@ decodes the matching reply off the wire.
 -export([call/2, call/3, cast/2]).
 -export([new_corr_id/0]).
 
+-include("arterial_pool.hrl").
+
 %%%-----------------------------------------------------------------------------
 %%% Public API
 %%%-----------------------------------------------------------------------------
@@ -54,11 +56,9 @@ call(Pool, Request, Timeout) ->
   Dispatcher:call(Pool, fun() -> do_call(Pool, Request, Timeout, Dispatcher) end).
 
 do_call(Pool, Request, Timeout, Dispatcher) ->
-  CorrId  = new_corr_id(),
-  Codec   = arterial_pool:codec(Pool),
-  Data    = iolist_to_binary(Codec:encode_request(CorrId, Request)),
-  PoolRef = arterial_pool:pool_ref(Pool),
-  Size    = arterial_pool:size(Pool),
+  #pool_meta{pool_ref = PoolRef, codec = Codec, size = Size} = arterial_pool:pool_meta(Pool),
+  CorrId = new_corr_id(),
+  Data   = iolist_to_binary(Codec:encode_request(CorrId, Request)),
   case send_to_any(Pool, PoolRef, Size, [], CorrId, Data, Timeout, Dispatcher) of
     {ok, ConnID} ->
       await_reply(PoolRef, CorrId, ConnID, Timeout);
@@ -88,11 +88,9 @@ cast(Pool, Request) ->
   Dispatcher:cast(Pool, fun() -> do_cast(Pool, Request, Dispatcher) end).
 
 do_cast(Pool, Request, Dispatcher) ->
-  CorrId  = new_corr_id(),
-  Codec   = arterial_pool:codec(Pool),
-  Data    = iolist_to_binary(Codec:encode_request(CorrId, Request)),
-  PoolRef = arterial_pool:pool_ref(Pool),
-  Size    = arterial_pool:size(Pool),
+  #pool_meta{pool_ref = PoolRef, codec = Codec, size = Size} = arterial_pool:pool_meta(Pool),
+  CorrId = new_corr_id(),
+  Data   = iolist_to_binary(Codec:encode_request(CorrId, Request)),
   send_cast_to_any(Pool, PoolRef, Size, [], Data, Dispatcher).
 
 -doc """
@@ -130,15 +128,10 @@ send_to_any(Pool, PoolRef, Size, Tried, CorrId, Data, Timeout, Dispatcher) ->
   end.
 
 try_send(Pool, PoolRef, ConnID, CorrId, Data, Timeout, Dispatcher) ->
-  TS       = os:system_time(microsecond),
-  Deadline = arterial_util:calc_expiration(TS, Timeout),
-  %% Registered before sending: a reply or disconnect can only be observed
-  %% by arterial_connection after the write below returns, so there is no
-  %% risk of a lookup racing ahead of the insert.
-  arterial_nif:register_corr(PoolRef, ConnID, CorrId, self(), 0, Deadline),
-  case Dispatcher:send_and_release(Pool, PoolRef, ConnID, Data) of
+  Deadline = arterial_util:calc_expiration(os:system_time(microsecond), Timeout),
+  case Dispatcher:register_and_send(Pool, PoolRef, ConnID, CorrId, self(), Deadline, Data) of
     {ok,    _SlotId} -> ok;
-    {error, _Reason} -> arterial_nif:unregister_corr(PoolRef, ConnID, CorrId), retry
+    {error, _Reason} -> retry
   end.
 
 send_cast_to_any(_Pool, _PoolRef, Size, Tried, _Data, _Dispatcher) when length(Tried) >= Size ->
@@ -158,28 +151,8 @@ await_reply(PoolRef, CorrId, ConnID, Timeout) ->
   receive
     {arterial_reply,        CorrId, Reply} -> {ok, Reply};
     {arterial_disconnected, CorrId}        -> {error, disconnected};
-    {arterial_timeout,      CorrId}        -> {error, timeout};
-    {telemetry_event, _, _, _} ->
-      await_reply(PoolRef, CorrId, ConnID, Timeout);
-    {'EXIT', _Pid, _Reason} ->
-      await_reply(PoolRef, CorrId, ConnID, Timeout);
-    {arterial_event, _StripeId, _SlotId, _Event} ->
-      await_reply(PoolRef, CorrId, ConnID, Timeout);
-    {arterial_reply, _OtherCorrId, _Reply} ->
-      await_reply(PoolRef, CorrId, ConnID, Timeout);
-    {arterial_disconnected, _OtherCorrId} ->
-      await_reply(PoolRef, CorrId, ConnID, Timeout);
-    {arterial_timeout, _OtherCorrId} ->
-      await_reply(PoolRef, CorrId, ConnID, Timeout);
-    {slow_result, _Result} ->
-      await_reply(PoolRef, CorrId, ConnID, Timeout);
-    {result, _N, _Result} ->
-      await_reply(PoolRef, CorrId, ConnID, Timeout);
-    Other ->
-      error({invalid_reply, Other, #{corr_id => CorrId}})
+    {arterial_timeout,      CorrId}        -> {error, timeout}
   after Timeout ->
-    %% Eagerly remove the NIF entry so the sweeper doesn't send a
-    %% redundant {arterial_timeout, CorrId} into a stale mailbox.
     arterial_nif:unregister_corr(PoolRef, ConnID, CorrId),
     {error, timeout}
   end.
