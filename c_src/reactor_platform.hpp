@@ -13,21 +13,15 @@
 /// Default selection:
 ///   Linux:  REACTOR_BACKEND_URING if <liburing.h> is present and
 ///           REACTOR_NO_URING is not defined, else REACTOR_BACKEND_EPOLL.
+///           The build system sets REACTOR_NO_URING automatically on WSL
+///           (detected via /proc/version at make time) so the epoll backend
+///           is always used on WSL without any runtime branching.
 ///   macOS/BSD: always REACTOR_BACKEND_KQUEUE.
 ///
-/// Runtime WSL detection (REACTOR_BACKEND_URING only):
-///   On WSL the io_uring backend automatically falls back to pure epoll at
-///   runtime.  reactor_create() reads /proc/version; if "Microsoft" or "WSL"
-///   appears in the string it builds an epoll handle instead of an io_uring
-///   handle.  All reactor_add/mod/del/wait calls transparently dispatch to
-///   the epoll path when the handle is an epoll fd.  No code changes needed
-///   in callers; the io_uring code path (IORING_OP_POLL_ADD for readiness,
-///   IORING_OP_CONNECT for connect) is used on native Linux only.
-///
-/// io_uring backend (native Linux):
+/// io_uring backend:
 ///   Uses IORING_OP_POLL_ADD for all fd readiness (sockets, timerfd, wakeup
 ///   eventfd).  Uses IORING_OP_CONNECT + linked IORING_OP_LINK_TIMEOUT for
-///   async connect.  No companion epoll — pure io_uring throughout.
+///   async connect.  Pure io_uring — no companion epoll.
 ///
 /// Public API (same on all platforms):
 ///
@@ -45,7 +39,7 @@
 ///     void             reactor_add    (reactor_handle_t, int fd, uint32_t ev)
 ///     void             reactor_mod    (reactor_handle_t, int fd, uint32_t ev)
 ///     void             reactor_del    (reactor_handle_t, int fd)
-///     int              reactor_wait   (reactor_handle_t, reactor_event_t*, int, int ms)
+///     int              reactor_wait   (reactor_handle_t, reactor_event_t*, int ms)
 ///     int              reactor_ev_fd  (const reactor_event_t&)
 ///     uint32_t         reactor_ev_mask(const reactor_event_t&)
 ///
@@ -64,9 +58,6 @@
 ///
 /// io_uring-specific (only when REACTOR_BACKEND_URING):
 ///   struct io_uring* reactor_uring(reactor_handle_t) — get the raw ring
-///                                                       (nullptr on WSL)
-///   bool             reactor_is_epoll(reactor_handle_t) — true when the
-///                    handle is a pure-epoll fallback (WSL or no io_uring)
 ///
 /// All inline; no separate .cpp file required.
 //-----------------------------------------------------------------------------
@@ -113,7 +104,7 @@
 // Backend-specific includes
 //------------------------------------------------------------------------------
 #if defined(REACTOR_BACKEND_URING)
-#  include <sys/epoll.h>
+#  include <sys/epoll.h>    // epoll_event used as reactor_event_t
 #  include <sys/eventfd.h>
 #  include <sys/timerfd.h>
 #  include <liburing.h>
@@ -216,38 +207,28 @@ inline uint32_t reactor_ev_mask(const reactor_event_t& ev)
 //==============================================================================
 // io_uring backend
 // ---------------------------------------------------------------------------
-// Uses IORING_OP_POLL_ADD for all fd readiness (sockets, timerfd, wakeup
-// eventfd) and IORING_OP_CONNECT + linked IORING_OP_LINK_TIMEOUT for async
-// connect.  No companion epoll — pure io_uring throughout.
+// Pure io_uring: IORING_OP_POLL_ADD for all fd readiness, IORING_OP_CONNECT
+// + linked IORING_OP_LINK_TIMEOUT for async connect.  No epoll at all.
 //
-// Runtime WSL fallback: reactor_create() reads /proc/version at first call.
-// If the string contains "Microsoft" or "WSL", the handle table slot is left
-// null and a plain epoll fd is returned as a negative-offset handle instead
-// (see URING_EPOLL_BIAS below).  All API functions check reactor_is_epoll()
-// and route to plain epoll_ctl / epoll_wait on that path.
-//
-// user_data encoding (64-bit) for io_uring SQEs:
+// user_data encoding (64-bit):
 //   bits 63-32  fd  (int32_t, -1 for non-fd ops like timeout)
 //   bits 31-0   op  (ReactorOp enum)
 //==============================================================================
 #if defined(REACTOR_BACKEND_URING)
 
 enum class ReactorOp : uint32_t {
-  PollAdd   = 0,  // io_uring_prep_poll_add — fd readiness
-  PollMod   = 1,  // io_uring_prep_poll_update
-  Connect   = 2,  // io_uring_prep_connect (main SQE of a linked pair)
-  Recv      = 3,  // io_uring_prep_recv
-  Send      = 4,  // io_uring_prep_send
-  Timeout   = 5,  // io_uring_prep_link_timeout (linked to Connect)
-  Cancel    = 6,  // io_uring_prep_cancel
+  PollAdd = 0,  // io_uring_prep_poll_add — fd readiness (one-shot)
+  Connect = 1,  // io_uring_prep_connect (main SQE of a linked pair)
+  Timeout = 2,  // io_uring_prep_link_timeout (linked to Connect)
+  Cancel  = 3,  // io_uring_prep_cancel
 };
 
 inline uint64_t reactor_userdata(int fd, ReactorOp op) noexcept
 {
   return (uint64_t(uint32_t(fd)) << 32) | uint32_t(op);
 }
-inline int        reactor_userdata_fd(uint64_t ud) noexcept { return int(int32_t(ud >> 32)); }
-inline ReactorOp  reactor_userdata_op(uint64_t ud) noexcept { return ReactorOp(uint32_t(ud));  }
+inline int       reactor_userdata_fd(uint64_t ud) noexcept { return int(int32_t(ud >> 32)); }
+inline ReactorOp reactor_userdata_op(uint64_t ud) noexcept { return ReactorOp(uint32_t(ud)); }
 
 //------------------------------------------------------------------------------
 // Per-handle io_uring context
@@ -262,12 +243,6 @@ struct ReactorUringCtx {
   }
 };
 
-// Handles in the range [URING_EPOLL_BIAS, URING_EPOLL_BIAS + max_epoll_fd)
-// represent pure-epoll fallback handles (used on WSL).  We encode them as
-// (epoll_fd + URING_EPOLL_BIAS) so reactor_is_epoll() can distinguish them
-// from io_uring table indices [0, s_max_rings) by a single comparison.
-static constexpr int URING_EPOLL_BIAS = 0x4000'0000;
-
 namespace detail {
   static constexpr int s_max_rings = 256;
   inline ReactorUringCtx** uring_table()
@@ -276,46 +251,12 @@ namespace detail {
     return t;
   }
   inline std::mutex& uring_mutex() { static std::mutex m; return m; }
-
-  /// Returns true if this process is running on WSL.
-  /// Result is cached after the first call.
-  inline bool is_wsl()
-  {
-    static int cached = -1;
-    if (cached >= 0) return cached != 0;
-    cached = 0;
-    char buf[512] = {};
-    int fd = ::open("/proc/version", O_RDONLY | O_CLOEXEC);
-    if (fd >= 0) {
-      ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
-      ::close(fd);
-      if (n > 0) {
-        buf[n] = '\0';
-        if (::strstr(buf, "Microsoft") || ::strstr(buf, "WSL"))
-          cached = 1;
-      }
-    }
-    return cached != 0;
-  }
 } // namespace detail
 
-/// Returns true when the handle represents a pure-epoll fallback (WSL).
-inline bool reactor_is_epoll(reactor_handle_t h) { return h >= URING_EPOLL_BIAS; }
-/// Extract the underlying epoll fd from an epoll-fallback handle.
-inline int  reactor_epoll_fd(reactor_handle_t h) { return h - URING_EPOLL_BIAS; }
-
-/// Create an io_uring-backed reactor handle (or a pure-epoll handle on WSL).
+/// Create an io_uring-backed reactor handle.
 inline reactor_handle_t reactor_create(unsigned entries = 4096,
-                                       unsigned /*epoll_entries*/ = 4096)
+                                       unsigned /*unused*/ = 0)
 {
-  // On WSL, io_uring POLL_ADD is unreliable — use plain epoll.
-  if (detail::is_wsl()) {
-    int epfd = ::epoll_create1(EPOLL_CLOEXEC);
-    if (epfd < 0)
-      throw std::runtime_error(std::string("epoll_create1 (WSL fallback): ") + strerror(errno));
-    return URING_EPOLL_BIAS + epfd;
-  }
-
   std::unique_ptr<ReactorUringCtx> ctx(new ReactorUringCtx());
 
   struct io_uring_params params{};
@@ -324,21 +265,14 @@ inline reactor_handle_t reactor_create(unsigned entries = 4096,
 
   std::lock_guard<std::mutex> lg(detail::uring_mutex());
   for (int i = 0; i < detail::s_max_rings; ++i) {
-    auto& tab = detail::uring_table()[i];
-    if (!tab) {
-      tab = ctx.release();
-      return i;
-    }
+    auto& slot = detail::uring_table()[i];
+    if (!slot) { slot = ctx.release(); return i; }
   }
   throw std::runtime_error("reactor_create: too many rings");
 }
 
 inline void reactor_destroy(reactor_handle_t h)
 {
-  if (reactor_is_epoll(h)) {
-    ::close(reactor_epoll_fd(h));
-    return;
-  }
   if (h < 0 || h >= detail::s_max_rings) return;
   std::lock_guard<std::mutex> lg(detail::uring_mutex());
   delete detail::uring_table()[h];
@@ -347,51 +281,30 @@ inline void reactor_destroy(reactor_handle_t h)
 
 inline ReactorUringCtx& reactor_ctx(reactor_handle_t h)
 {
-  assert(!reactor_is_epoll(h));
-  assert(size_t(h) < detail::s_max_rings);
+  assert(h >= 0 && h < detail::s_max_rings);
   return *detail::uring_table()[h];
 }
 
-/// Get the raw io_uring for submitting custom SQEs (nullptr on WSL/epoll path).
+/// Get the raw io_uring for submitting custom SQEs.
 inline struct io_uring* reactor_uring(reactor_handle_t h)
 {
-  if (reactor_is_epoll(h)) return nullptr;
   return &reactor_ctx(h).ring;
 }
 
-// ---- Pure epoll helpers used by the WSL fallback path ----------------------
-
-inline void reactor_epoll_add(int epfd, int fd, uint32_t ev)
-{
-  epoll_event e{}; e.events = ev | EPOLLONESHOT; e.data.fd = fd;
-  if (::epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &e) < 0) {
-    if (errno == EEXIST)
-      ::epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &e);
-  }
-}
-
-inline void reactor_epoll_del(int epfd, int fd)
-{
-  ::epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-}
-
-// ---- io_uring POLL_ADD helpers for pure-uring path ------------------------
-
-inline void reactor_poll_add(reactor_handle_t h, int fd, uint32_t ev)
+// Submit a POLL_ADD SQE for fd.  One-shot: fires once, must be re-armed.
+inline void reactor_add(reactor_handle_t h, int fd, uint32_t ev)
 {
   struct io_uring* ring = &reactor_ctx(h).ring;
-  // Cancel any existing poll for this fd before adding a new one.
   struct io_uring_sqe* sqe = io_uring_get_sqe(ring);
   if (!sqe) { io_uring_submit(ring); sqe = io_uring_get_sqe(ring); }
-  if (!sqe) return; // ring full, drop
-  // IORING_POLL_UPDATE_EVENTS: update interest without cancel+re-add cost.
-  // We always cancel+re-add for simplicity (one-shot semantics).
+  if (!sqe) return;
   io_uring_prep_poll_add(sqe, fd, ev);
-  sqe->flags |= IOSQE_ASYNC;  // avoid busy-poll
+  sqe->flags |= IOSQE_ASYNC;
   io_uring_sqe_set_data64(sqe, reactor_userdata(fd, ReactorOp::PollAdd));
 }
 
-inline void reactor_poll_remove(reactor_handle_t h, int fd)
+// Cancel any outstanding POLL_ADD for fd (e.g. before closing or re-arming).
+inline void reactor_del(reactor_handle_t h, int fd)
 {
   struct io_uring* ring = &reactor_ctx(h).ring;
   struct io_uring_sqe* sqe = io_uring_get_sqe(ring);
@@ -401,72 +314,32 @@ inline void reactor_poll_remove(reactor_handle_t h, int fd)
   io_uring_sqe_set_data64(sqe, reactor_userdata(fd, ReactorOp::Cancel));
 }
 
-// ---- Unified add/mod/del/wait — dispatch to uring or epoll ----------------
-
-inline void reactor_add(reactor_handle_t h, int fd, uint32_t ev)
-{
-  if (reactor_is_epoll(h)) {
-    reactor_epoll_add(reactor_epoll_fd(h), fd, ev);
-    return;
-  }
-  // io_uring: POLL_ADD for fd readiness (one-shot; re-arm after each event).
-  reactor_poll_add(h, fd, ev);
-}
-
-inline void reactor_del(reactor_handle_t h, int fd)
-{
-  if (reactor_is_epoll(h)) {
-    reactor_epoll_del(reactor_epoll_fd(h), fd);
-    return;
-  }
-  reactor_poll_remove(h, fd);
-}
-
+// mod = cancel + re-add with new interest mask.
 inline void reactor_mod(reactor_handle_t h, int fd, uint32_t ev)
 {
-  // For both backends, mod = cancel existing interest + re-add with new mask.
+  reactor_del(h, fd);
   reactor_add(h, fd, ev);
 }
 
-// reactor_add_wakeup is identical to reactor_add.  It exists so reactor.hpp
-// can use a single call site for wakeup fd registration.
 inline void reactor_add_wakeup(reactor_handle_t h, int fd, uint32_t ev)
 {
   reactor_add(h, fd, ev);
 }
 
-/// Wait for fd readiness events and async connect completions.
+/// Wait for CQEs.  Submits pending SQEs, blocks until at least one CQE
+/// arrives or timeout_ms elapses, then drains all available CQEs.
 ///
-/// On WSL (epoll path): blocks in epoll_wait.
-///
-/// On native Linux (io_uring path): submits pending SQEs, then blocks until
-/// at least one CQE arrives or timeout elapses.  PollAdd CQEs are translated
-/// into synthetic epoll_event entries.  Connect CQEs get REACTOR_EV_CONNECT.
-/// Cancel/Timeout CQEs are silently consumed.  All seen CQEs are advanced.
+/// PollAdd CQEs → synthetic epoll_event with the poll mask in .events.
+/// Connect CQEs → synthetic epoll_event with REACTOR_EV_CONNECT flag.
+/// Cancel/Timeout CQEs → silently consumed.
 inline int reactor_wait(reactor_handle_t h, reactor_event_t* buf, int maxev,
-                        int timeout_ms,
-                        struct io_uring_cqe** /*unused*/ = nullptr,
-                        int*                 /*unused*/ = nullptr)
+                        int timeout_ms)
 {
-  if (reactor_is_epoll(h)) {
-    RETRY_WAIT:
-    int n = ::epoll_wait(reactor_epoll_fd(h), buf, maxev, timeout_ms);
-    if (n < 0) {
-      if (errno == EINTR) [[unlikely]]
-        goto RETRY_WAIT;
-      return 0;
-    }
-    return n;
-  }
+  auto& ring = reactor_ctx(h).ring;
 
-  auto& ctx  = reactor_ctx(h);
-  auto& ring = ctx.ring;
-
-  // Submit all pending SQEs (POLL_ADD + any CONNECT).
   io_uring_submit(&ring);
 
-  // Block until at least one CQE arrives or timeout elapses.
-  struct __kernel_timespec  ts{};
+  struct __kernel_timespec ts{};
   struct __kernel_timespec* tsp = nullptr;
   if (timeout_ms >= 0) {
     ts.tv_sec  = timeout_ms / 1000;
@@ -475,14 +348,12 @@ inline int reactor_wait(reactor_handle_t h, reactor_event_t* buf, int maxev,
   }
 
   struct io_uring_cqe* cqe;
-  int wait_ret = io_uring_wait_cqe_timeout(&ring, &cqe, tsp);
-  if (wait_ret < 0) {
-    if (wait_ret == -ETIME || wait_ret == -EINTR) return 0;
+  int ret = io_uring_wait_cqe_timeout(&ring, &cqe, tsp);
+  if (ret < 0) {
+    if (ret == -ETIME || ret == -EINTR) return 0;
     return -1;
   }
 
-  // Drain all available CQEs.  io_uring_peek_cqe / cqe_seen advances one at
-  // a time; we count each seen CQE and accumulate events for the caller.
   int nev = 0;
   while (io_uring_peek_cqe(&ring, &cqe) == 0) {
     uint64_t  ud = io_uring_cqe_get_data64(cqe);
@@ -491,8 +362,6 @@ inline int reactor_wait(reactor_handle_t h, reactor_event_t* buf, int maxev,
 
     if (nev < maxev) {
       if (op == ReactorOp::PollAdd && cqe->res > 0) {
-        // PollAdd CQE res encodes the poll event mask (POLLIN/POLLOUT/etc.).
-        // The kernel uses poll(2) bit values which match EPOLLIN/EPOLLOUT.
         buf[nev].data.fd = fd;
         buf[nev].events  = (uint32_t)cqe->res;
         ++nev;
@@ -501,14 +370,14 @@ inline int reactor_wait(reactor_handle_t h, reactor_event_t* buf, int maxev,
         if (cqe->res == 0)
           buf[nev].events = REACTOR_EV_CONNECT;
         else if (cqe->res == -ECANCELED)
-          buf[nev].events = REACTOR_EV_CONNECT | REACTOR_EV_HUP;   // timed out
+          buf[nev].events = REACTOR_EV_CONNECT | REACTOR_EV_HUP;  // timed out
         else
-          buf[nev].events = REACTOR_EV_CONNECT | REACTOR_EV_ERR;   // refused/reset
+          buf[nev].events = REACTOR_EV_CONNECT | REACTOR_EV_ERR;  // refused/reset
         ++nev;
       }
-      // PollAdd with res <= 0 (cancelled/error), Timeout, Cancel: silently drop.
+      // PollAdd with res<=0 (cancelled/closed), Timeout, Cancel: silently drop.
     }
-    io_uring_cqe_seen(&ring, cqe);  // advance ring regardless
+    io_uring_cqe_seen(&ring, cqe);
   }
   return nev;
 }
@@ -516,7 +385,7 @@ inline int reactor_wait(reactor_handle_t h, reactor_event_t* buf, int maxev,
 #endif // REACTOR_BACKEND_URING
 
 //==============================================================================
-// epoll backend (Linux fallback / compile-time selection)
+// epoll backend (Linux — used on WSL and when liburing is absent)
 //==============================================================================
 #if defined(REACTOR_BACKEND_EPOLL)
 
@@ -539,7 +408,7 @@ inline void reactor_mod(reactor_handle_t h, int fd, uint32_t ev)
   epoll_event e{}; e.events = ev; e.data.fd = fd;
   if (::epoll_ctl(h, EPOLL_CTL_MOD, fd, &e) < 0) {
     if (errno == ENOENT)
-      ::epoll_ctl(h, EPOLL_CTL_ADD, fd, &e);  // first registration
+      ::epoll_ctl(h, EPOLL_CTL_ADD, fd, &e);
     else
       throw std::runtime_error(std::string("epoll_ctl MOD fd=") + std::to_string(fd) + ": " + strerror(errno));
   }
@@ -550,13 +419,14 @@ inline void reactor_del(reactor_handle_t h, int fd)
 }
 inline int reactor_wait(reactor_handle_t h, reactor_event_t* buf, int maxev, int timeout_ms)
 {
-  return ::epoll_wait(h, buf, maxev, timeout_ms);
+  int n = ::epoll_wait(h, buf, maxev, timeout_ms);
+  return (n < 0 && errno == EINTR) ? 0 : n;
 }
 
 #endif // REACTOR_BACKEND_EPOLL
 
 //==============================================================================
-// Linux shared: eventfd + timerfd  (used by both epoll and io_uring)
+// Linux shared: eventfd + timerfd  (both epoll and io_uring backends)
 //==============================================================================
 #if defined(REACTOR_OS_LINUX)
 
@@ -566,13 +436,13 @@ inline int reactor_eventfd_create()
   if (fd < 0) throw std::runtime_error(std::string("eventfd: ") + strerror(errno));
   return fd;
 }
-inline int  reactor_eventfd_write_fd(int efd)     { return efd; }
-inline void reactor_eventfd_close(int efd)         { if (efd >= 0) ::close(efd); }
+inline int  reactor_eventfd_write_fd(int efd)      { return efd; }
+inline void reactor_eventfd_close(int efd)          { if (efd >= 0) ::close(efd); }
 inline int  reactor_eventfd_read(int efd, uint64_t& val)
 {
   return (::read(efd, &val, 8) == 8) ? 0 : -1;
 }
-inline int reactor_eventfd_write(int wfd, uint64_t val)
+inline int  reactor_eventfd_write(int wfd, uint64_t val)
 {
   return (::write(wfd, &val, 8) == 8) ? 0 : -1;
 }
@@ -583,21 +453,21 @@ inline int reactor_timerfd_create()
   if (fd < 0) throw std::runtime_error(std::string("timerfd_create: ") + strerror(errno));
   return fd;
 }
-inline int reactor_timerfd_arm(
-    reactor_handle_t /*kq*/, int timer_id, uint64_t initial_ms, uint64_t interval_ms)
+inline int reactor_timerfd_arm(reactor_handle_t /*h*/, int tid,
+                               uint64_t initial_ms, uint64_t interval_ms)
 {
   itimerspec ts{};
   ts.it_value.tv_sec     = initial_ms  / 1000;
   ts.it_value.tv_nsec    = (initial_ms  % 1000) * 1'000'000L;
   ts.it_interval.tv_sec  = interval_ms / 1000;
   ts.it_interval.tv_nsec = (interval_ms % 1000) * 1'000'000L;
-  return ::timerfd_settime(timer_id, 0, &ts, nullptr);
+  return ::timerfd_settime(tid, 0, &ts, nullptr);
 }
 inline int  reactor_timerfd_read(int tid, uint64_t& exp)
 {
   return (::read(tid, &exp, 8) == 8) ? 0 : -1;
 }
-inline void reactor_timerfd_close(reactor_handle_t /*kq*/, int tid)
+inline void reactor_timerfd_close(reactor_handle_t /*h*/, int tid)
 {
   if (tid >= 0) ::close(tid);
 }

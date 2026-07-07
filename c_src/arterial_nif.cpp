@@ -113,10 +113,11 @@ static ERL_NIF_TERM init_pool_nif(
   }
 
   // Start the reactor — it runs on its own thread for this pool's lifetime.
-  ErlNifPid owner_pid;
-  enif_self(env, &owner_pid);
+  // No owner_pid: the reactor exit message would go to the supervisor (the
+  // init_pool caller), which has no handle_info and would log a spurious
+  // "unexpected message" warning on every normal pool stop.
   ctx->reactor_ptr = std::make_unique<arterial::Reactor>("arterial_pool");
-  ctx->reactor_ptr->start(owner_pid);
+  ctx->reactor_ptr->start();
 
   return make_tuple(env, am_ok, ctx);
 }

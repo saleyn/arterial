@@ -50,16 +50,18 @@ carried this request dies before a reply arrives (see
 -spec call(arterial_pool:name(), term(), non_neg_integer() | infinity) ->
   {ok, arterial:response()} | {error, term()}.
 call(Pool, Request, Timeout) ->
-  (arterial_observe:dispatcher()):call(Pool, fun() -> do_call(Pool, Request, Timeout) end).
+  Dispatcher = arterial_observe:dispatcher(),
+  Dispatcher:call(Pool, fun() -> do_call(Pool, Request, Timeout, Dispatcher) end).
 
-do_call(Pool, Request, Timeout) ->
-  CorrId = new_corr_id(),
-  Codec  = arterial_pool:codec(Pool),
-  Data   = iolist_to_binary(Codec:encode_request(CorrId, Request)),
-  Size   = arterial_pool:size(Pool),
-  case send_to_any(Pool, Size, [], CorrId, Data, Timeout) of
+do_call(Pool, Request, Timeout, Dispatcher) ->
+  CorrId  = new_corr_id(),
+  Codec   = arterial_pool:codec(Pool),
+  Data    = iolist_to_binary(Codec:encode_request(CorrId, Request)),
+  PoolRef = arterial_pool:pool_ref(Pool),
+  Size    = arterial_pool:size(Pool),
+  case send_to_any(Pool, PoolRef, Size, [], CorrId, Data, Timeout, Dispatcher) of
     {ok, ConnID} ->
-      await_reply(Pool, CorrId, ConnID, Timeout);
+      await_reply(PoolRef, CorrId, ConnID, Timeout);
     {error, _} = Error ->
       Error
   end.
@@ -82,14 +84,16 @@ ok
 """.
 -spec cast(arterial_pool:name(), term()) -> ok | {error, term()}.
 cast(Pool, Request) ->
-  (arterial_observe:dispatcher()):cast(Pool, fun() -> do_cast(Pool, Request) end).
+  Dispatcher = arterial_observe:dispatcher(),
+  Dispatcher:cast(Pool, fun() -> do_cast(Pool, Request, Dispatcher) end).
 
-do_cast(Pool, Request) ->
-  CorrId = new_corr_id(),
-  Codec = arterial_pool:codec(Pool),
-  Data = iolist_to_binary(Codec:encode_request(CorrId, Request)),
-  Size = arterial_pool:size(Pool),
-  send_cast_to_any(Pool, Size, [], Data).
+do_cast(Pool, Request, Dispatcher) ->
+  CorrId  = new_corr_id(),
+  Codec   = arterial_pool:codec(Pool),
+  Data    = iolist_to_binary(Codec:encode_request(CorrId, Request)),
+  PoolRef = arterial_pool:pool_ref(Pool),
+  Size    = arterial_pool:size(Pool),
+  send_cast_to_any(Pool, PoolRef, Size, [], Data, Dispatcher).
 
 -doc """
 A fresh wire-level correlation id, truncated to 32 bits (the width
@@ -112,73 +116,71 @@ new_corr_id() ->
 %%% Internal functions
 %%%-----------------------------------------------------------------------------
 
-send_to_any(_Pool, Size, Tried, _CorrId, _Data, _Timeout) when length(Tried) >= Size ->
+send_to_any(_Pool, _PoolRef, Size, Tried, _CorrId, _Data, _Timeout, _Dispatcher) when length(Tried) >= Size ->
   {error, no_connection};
-send_to_any(Pool, Size, Tried, CorrId, Data, Timeout) ->
+send_to_any(Pool, PoolRef, Size, Tried, CorrId, Data, Timeout, Dispatcher) ->
   case next_candidate(Pool, Size, Tried) of
     none ->
       {error, no_connection};
     ConnID ->
-      case try_send(Pool, ConnID, CorrId, Data, Timeout) of
+      case try_send(Pool, PoolRef, ConnID, CorrId, Data, Timeout, Dispatcher) of
         ok    -> {ok, ConnID};
-        retry -> send_to_any(Pool, Size, [ConnID | Tried], CorrId, Data, Timeout)
+        retry -> send_to_any(Pool, PoolRef, Size, [ConnID | Tried], CorrId, Data, Timeout, Dispatcher)
       end
   end.
 
-try_send(Pool, ConnID, CorrId, Data, Timeout) ->
-  PoolRef  = arterial_pool:pool_ref(Pool),
+try_send(Pool, PoolRef, ConnID, CorrId, Data, Timeout, Dispatcher) ->
   TS       = os:system_time(microsecond),
   Deadline = arterial_util:calc_expiration(TS, Timeout),
   %% Registered before sending: a reply or disconnect can only be observed
   %% by arterial_connection after the write below returns, so there is no
   %% risk of a lookup racing ahead of the insert.
   arterial_nif:register_corr(PoolRef, ConnID, CorrId, self(), 0, Deadline),
-  case (arterial_observe:dispatcher()):send_and_release(Pool, PoolRef, ConnID, Data) of
+  case Dispatcher:send_and_release(Pool, PoolRef, ConnID, Data) of
     {ok,    _SlotId} -> ok;
     {error, _Reason} -> arterial_nif:unregister_corr(PoolRef, ConnID, CorrId), retry
   end.
 
-send_cast_to_any(_Pool, Size, Tried, _Data) when length(Tried) >= Size ->
+send_cast_to_any(_Pool, _PoolRef, Size, Tried, _Data, _Dispatcher) when length(Tried) >= Size ->
   {error, no_connection};
-send_cast_to_any(Pool, Size, Tried, Data) ->
+send_cast_to_any(Pool, PoolRef, Size, Tried, Data, Dispatcher) ->
   case next_candidate(Pool, Size, Tried) of
     none ->
       {error, no_connection};
     ConnID ->
-      PoolRef = arterial_pool:pool_ref(Pool),
-      case (arterial_observe:dispatcher()):send_and_release(Pool, PoolRef, ConnID, Data) of
+      case Dispatcher:send_and_release(Pool, PoolRef, ConnID, Data) of
         {ok, _SlotId}    -> ok;
-        {error, _Reason} -> send_cast_to_any(Pool, Size, [ConnID | Tried], Data)
+        {error, _Reason} -> send_cast_to_any(Pool, PoolRef, Size, [ConnID | Tried], Data, Dispatcher)
       end
   end.
 
-await_reply(Pool, CorrId, ConnID, Timeout) ->
+await_reply(PoolRef, CorrId, ConnID, Timeout) ->
   receive
     {arterial_reply,        CorrId, Reply} -> {ok, Reply};
     {arterial_disconnected, CorrId}        -> {error, disconnected};
     {arterial_timeout,      CorrId}        -> {error, timeout};
     {telemetry_event, _, _, _} ->
-      await_reply(Pool, CorrId, ConnID, Timeout);
+      await_reply(PoolRef, CorrId, ConnID, Timeout);
     {'EXIT', _Pid, _Reason} ->
-      await_reply(Pool, CorrId, ConnID, Timeout);
+      await_reply(PoolRef, CorrId, ConnID, Timeout);
     {arterial_event, _StripeId, _SlotId, _Event} ->
-      await_reply(Pool, CorrId, ConnID, Timeout);
+      await_reply(PoolRef, CorrId, ConnID, Timeout);
     {arterial_reply, _OtherCorrId, _Reply} ->
-      await_reply(Pool, CorrId, ConnID, Timeout);
+      await_reply(PoolRef, CorrId, ConnID, Timeout);
     {arterial_disconnected, _OtherCorrId} ->
-      await_reply(Pool, CorrId, ConnID, Timeout);
+      await_reply(PoolRef, CorrId, ConnID, Timeout);
     {arterial_timeout, _OtherCorrId} ->
-      await_reply(Pool, CorrId, ConnID, Timeout);
+      await_reply(PoolRef, CorrId, ConnID, Timeout);
     {slow_result, _Result} ->
-      await_reply(Pool, CorrId, ConnID, Timeout);
+      await_reply(PoolRef, CorrId, ConnID, Timeout);
     {result, _N, _Result} ->
-      await_reply(Pool, CorrId, ConnID, Timeout);
+      await_reply(PoolRef, CorrId, ConnID, Timeout);
     Other ->
-      error({invalid_reply, Other, #{pool => Pool, corr_id => CorrId}})
+      error({invalid_reply, Other, #{corr_id => CorrId}})
   after Timeout ->
     %% Eagerly remove the NIF entry so the sweeper doesn't send a
     %% redundant {arterial_timeout, CorrId} into a stale mailbox.
-    arterial_nif:unregister_corr(arterial_pool:pool_ref(Pool), ConnID, CorrId),
+    arterial_nif:unregister_corr(PoolRef, ConnID, CorrId),
     {error, timeout}
   end.
 

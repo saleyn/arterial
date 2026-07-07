@@ -481,8 +481,8 @@ private:
     if (fd == m_wakeup_rd) {
       uint64_t val;
       reactor_eventfd_read(m_wakeup_rd, val);
-      // EPOLLONESHOT disarms the fd after each event — re-arm for the next wakeup.
-      reactor_add(m_handle, m_wakeup_rd, REACTOR_EV_IN | REACTOR_EV_ET);
+      // One-shot poll (uring) or EPOLLONESHOT (epoll): re-arm for the next wakeup.
+      reactor_mod(m_handle, m_wakeup_rd, REACTOR_EV_IN | REACTOR_EV_ET);
       return;
     }
 

@@ -13,7 +13,7 @@ s4_debug_test() ->
     SPort = list_to_integer(PS),
     {ok, PoolRef} = arterial_nif:init_pool(?CONNS, 1),
     Parent = self(),
-    T0 = erlang:monotonic_time(millisecond),
+    _T0 = erlang:monotonic_time(millisecond),
     Pids = [spawn(fun() ->
       try
         SlotId = connect_slot(PoolRef, Idx, {127,0,0,1}, SPort),
@@ -26,7 +26,7 @@ s4_debug_test() ->
     Results = [receive {done, P} -> ok after 10000 ->
       io:format(standard_error, "WORKER TIMEOUT pid=~p~n", [P]), timeout
     end || P <- Pids],
-    T1 = erlang:monotonic_time(millisecond),
+    _T1 = erlang:monotonic_time(millisecond),
     Errs = length([X || X <- Results, X =:= timeout]),
     Port ! {self(), close},
     ?assertEqual(0, Errs)

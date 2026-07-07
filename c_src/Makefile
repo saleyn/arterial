@@ -33,8 +33,12 @@ endif
 
 # io_uring (Linux reactor backend)
 # Normalise HAS_URING: accept "1", "Y", "yes" from env/cmdline; fall back to pkg-config.
+# Automatically disabled on WSL: io_uring POLL_ADD is unreliable on WSL kernels.
 # We cannot use := to override a command-line variable, so derive a private variable.
-_HAS_URING := $(if $(filter 1 Y yes,$(HAS_URING)),yes,$(shell pkg-config --exists liburing && echo yes))
+_IS_WSL    := $(shell grep -qsiE 'Microsoft|WSL' /proc/version 2>/dev/null && echo yes)
+# HAS_URING can be set explicitly to override WSL auto-detection.
+# Without an explicit override, WSL disables io_uring (unreliable POLL_ADD).
+_HAS_URING := $(if $(filter 1 Y yes,$(HAS_URING)),yes,$(if $(filter yes,$(_IS_WSL)),no,$(shell pkg-config --exists liburing && echo yes)))
 ifeq ($(_HAS_URING),yes)
   URING_CFLAGS  := $(shell pkg-config --cflags liburing)
   POOL_LDFLAGS  += $(shell pkg-config --libs liburing)
@@ -130,10 +134,8 @@ $(PRIV_DIR) $(OBJ_DIR) $(TEST_DIR):
 
 REACTOR_TEST := $(PRIV_DIR)/reactor_test
 REACTOR_TEST_OBJ := $(OBJ_DIR)/reactor_test.o
-# liburing is only needed when not overridden to epoll-only
-HAS_URING ?= $(shell pkg-config --exists liburing && echo 1)
-HAS_URING := $(if $(filter 1 Y yes,$(HAS_URING)),1)
-ifeq ($(HAS_URING),1)
+# Use the same WSL-aware uring selection as the NIF build above.
+ifeq ($(_HAS_URING),yes)
   URING_CFLAGS  := $(shell pkg-config --cflags liburing)
   URING_LDFLAGS := $(shell pkg-config --libs liburing)
 else
