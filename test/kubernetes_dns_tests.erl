@@ -160,19 +160,20 @@ enhanced_resolve_address_test() ->
 
 %% Test DNS caching with different TTLs
 dns_caching_ttl_test() ->
-  % This test checks that the caching mechanism works with different TTLs
-  % We can't easily test the actual TTL differences without waiting,
-  % but we can verify the caching mechanism works
-
-  % Clear any existing cache for our test hostname
+  % Verify the caching mechanism returns a seeded result without doing real DNS.
+  % Pre-seed the process-dictionary cache so resolve_address hits the cache path.
   TestHostname = "cache-test-" ++ integer_to_list(erlang:system_time()),
-  erase({dns_cache, TestHostname}),
+  FakeAddr = {10, 0, 0, 1},
+  NowSec = erlang:system_time(second),
+  put({dns_cache, TestHostname}, {[FakeAddr], NowSec}),
 
-  % This should fail (non-existent domain) but test the caching path
+  % Both calls should return the cached value — no DNS lookup occurs.
   Result1 = arterial_connection:resolve_address(TestHostname),
   Result2 = arterial_connection:resolve_address(TestHostname),
 
-  % Results should be consistent
+  erase({dns_cache, TestHostname}),
+
+  ?assertEqual({ok, [FakeAddr]}, Result1),
   ?assertEqual(Result1, Result2).
 
 %% Test Kubernetes environment detection flags

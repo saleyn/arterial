@@ -238,7 +238,6 @@ public:
     , m_entries(fd_vec_size)  // value-init: each FdEntry has fd=-1
     , m_cmds(cmds_ring_cap)
   {
-    // Register the wakeup fd for read events (persistent, edge-triggered).
     reactor_add(m_handle, m_wakeup_rd, REACTOR_EV_IN | REACTOR_EV_ET);
   }
 
@@ -482,10 +481,8 @@ private:
     if (fd == m_wakeup_rd) {
       uint64_t val;
       reactor_eventfd_read(m_wakeup_rd, val);
-#if defined(REACTOR_BACKEND_URING)
-      // One-shot poll: re-arm the wakeup fd so future command posts wake us up.
+      // EPOLLONESHOT disarms the fd after each event — re-arm for the next wakeup.
       reactor_add(m_handle, m_wakeup_rd, REACTOR_EV_IN | REACTOR_EV_ET);
-#endif
       return;
     }
 
@@ -731,6 +728,12 @@ private:
     // No timerfd, no poll_add, no separate wakeup — one kernel round-trip.
     //--------------------------------------------------------------------------
     {
+      // Remove any epoll registration set up by arm_connect → arm_write before
+      // this command ran.  The connect result is delivered as an io_uring CQE;
+      // we must not also have the fd registered for EPOLLOUT in epoll or both
+      // paths would fire and call on_writable/on_connect for the same event.
+      reactor_del(m_handle, fd);
+
       struct io_uring* ring = reactor_uring(m_handle);
 
       // ts must outlive io_uring_submit() — declare in outer scope.

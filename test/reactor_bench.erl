@@ -670,9 +670,10 @@ shackle_client_run(ServerPort, NConns, NReqs, MsgSize) ->
   DurationMs = max(400, NReqs * 2),
   Payload = binary:copy(<<0>>, MsgSize - 4),
   Pool = reactor_bench_shackle_pool,
-  %% Stop, restart and ensure the pool supervisor is alive before starting.
-  application:stop(shackle),
-  timer:sleep(100),  % let foil ETS ownership transfer complete after app stop
+  %% Stop previous pool if running, start the shackle app if not yet started.
+  %% We avoid application:stop/start because shackle_app:stop/1 unconditionally
+  %% emits an error_logger report on every shutdown (library bug).
+  try shackle_pool:stop(Pool) catch _:_ -> ok end,
   ok = ensure_app_started(shackle),
   ok = shackle_pool:start(Pool, reactor_bench_shackle_client,
     [{address, "127.0.0.1"}, {port, ServerPort},

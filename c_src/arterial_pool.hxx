@@ -278,6 +278,11 @@ inline bool PoolStripe::try_process_fifo_queue() {
 
 // Destructor ensures all file descriptors are closed
 PoolContext::~PoolContext() {
+  // Stop the reactor thread before closing fds.  If fds are closed first,
+  // the reactor's pending POLL_ADD SQEs see EBADF and the ring exits with
+  // an error, sending a spurious {arterial_reactor_exit, ...} to the owner.
+  if (reactor_ptr) reactor_ptr->stop();
+
   for (auto& stripe_ptr : stripes)
     for (auto& slot : stripe_ptr->slots) {
       if (slot.fd != -1) {

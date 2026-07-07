@@ -102,7 +102,6 @@
 #  include <liburing.h>
 #  include <memory>
 #  include <mutex>
-#  include <unordered_map>
 #elif defined(REACTOR_BACKEND_EPOLL)
 #  include <sys/epoll.h>
 #  include <sys/eventfd.h>
@@ -238,7 +237,11 @@ inline ReactorOp  reactor_userdata_op(uint64_t ud) noexcept { return ReactorOp(u
 //------------------------------------------------------------------------------
 struct ReactorUringCtx {
   struct io_uring ring;
-  int             epoll_fd = -1;  // companion epoll for poll-add results
+  // Companion epoll fd.  On some kernels (notably WSL2) IORING_OP_POLL_ADD for
+  // TCP sockets fails with EBADF.  To avoid this, all fd readiness polling is
+  // done through this epoll instance instead of io_uring POLL_ADD.  io_uring is
+  // only used for async operations: CONNECT (with linked LINK_TIMEOUT).
+  int             epoll_fd = -1;
 
   ReactorUringCtx() { memset(&ring, 0, sizeof(ring)); }
   ~ReactorUringCtx()
@@ -314,143 +317,105 @@ inline struct io_uring* reactor_uring(reactor_handle_t h)
   return &detail::uring_table()[h]->ring;
 }
 
-// ---- fd interest tracking via io_uring poll_add ----------------------------
+// ---- fd interest tracking — all fds through the companion epoll -----------
 //
-// We use IORING_OP_POLL_ADD (multishot where available) to get epoll-like
-// readiness notifications.  The fired CQE contains:
-//   user_data = reactor_userdata(fd, ReactorOp::PollAdd)
-//   res       = the epoll event mask (EPOLLIN | EPOLLOUT …)
+// On some kernels (notably WSL2 with kernel 6.18) IORING_OP_POLL_ADD for TCP
+// sockets causes io_uring_submit to return -EBADF even when the fd is valid.
+// To avoid this entirely, all fd readiness polling (sockets, timerfd, and the
+// wakeup eventfd) goes through the companion epoll fd.  io_uring is used only
+// for async CONNECT (IORING_OP_CONNECT + linked IORING_OP_LINK_TIMEOUT) where
+// the CQE result directly tells us connect success/failure/timeout in one step.
 //
-// For the epoll emulation path the companion epoll fd is used instead.
+// reactor_wait blocks in epoll_wait (for socket/wakeup/timer events) while
+// also draining any pending io_uring Connect CQEs non-blocking.
 
 inline void reactor_add(reactor_handle_t h, int fd, uint32_t ev)
 {
-  auto& ring = reactor_ctx(h).ring;
-  auto* sqe  = io_uring_get_sqe(&ring);
-  if (!sqe) {
-    io_uring_submit(&ring);
-    sqe = io_uring_get_sqe(&ring);
-    if (!sqe) throw std::runtime_error("io_uring SQ full");
+  int epfd = reactor_ctx(h).epoll_fd;
+  epoll_event e{}; e.events = ev | EPOLLONESHOT; e.data.fd = fd;
+  if (::epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &e) < 0) {
+    if (errno == EEXIST)
+      ::epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &e);
   }
-  // Use one-shot POLL_ADD (no IORING_POLL_ADD_MULTI).  After the CQE fires,
-  // reactor_wait re-arms the fd by calling reactor_add again.  This avoids the
-  // cancel-race with POLL_ADD_MULTI: a fired multishot stays in the kernel's
-  // active-request list, so cancel-by-user_data can match the wrong SQE
-  // (old active multishot vs. new pending one-shot).  One-shot polls have a
-  // clean lifecycle: fire → gone → re-arm, making reactor_del a no-op in the
-  // common case and eliminating the entire race class.
-  io_uring_prep_poll_add(sqe, fd, ev);
-  io_uring_sqe_set_data64(sqe, reactor_userdata(fd, ReactorOp::PollAdd));
-  io_uring_submit(&ring);
 }
 
 inline void reactor_del(reactor_handle_t h, int fd)
 {
-  auto& ring = reactor_ctx(h).ring;
-  auto* sqe  = io_uring_get_sqe(&ring);
-  if (!sqe) { io_uring_submit(&ring); sqe = io_uring_get_sqe(&ring); }
-  if (!sqe) return; // best-effort
-  io_uring_prep_cancel64(sqe, reactor_userdata(fd, ReactorOp::PollAdd),
-                         IORING_ASYNC_CANCEL_ALL);
-  io_uring_sqe_set_data64(sqe, reactor_userdata(fd, ReactorOp::Cancel));
-  io_uring_submit(&ring);
+  int epfd = reactor_ctx(h).epoll_fd;
+  ::epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
 }
 
 inline void reactor_mod(reactor_handle_t h, int fd, uint32_t ev)
 {
-  // With one-shot polls (no IORING_POLL_ADD_MULTI), the previous poll has
-  // already fired and is gone from the kernel's active-request list by the
-  // time reactor_mod is called.  A cancel-then-add sequence is therefore
-  // unnecessary — the cancel finds the NEW poll (not yet activated) and
-  // cancels it instead, silencing future reads.  Just add the new poll.
+  // EPOLLONESHOT: after each event the fd is disarmed.  reactor_mod re-arms it
+  // via EPOLL_CTL_MOD (or ADD if the fd is not yet registered).
   reactor_add(h, fd, ev);
 }
 
-/// Wait for completions.
-/// Translates CQEs that carry ReactorOp::PollAdd results into reactor_event_t
-/// entries (same shape as epoll_event).  Other CQEs (Connect, Recv, Send,
-/// Timeout) are placed in *aux_buf / *aux_n if provided, otherwise dropped.
+// reactor_add_wakeup is identical to reactor_add in the epoll-for-all-fds
+// design.  It exists so reactor.hpp can use a single call site for wakeup fd
+// registration without compile-time guards at the call site.
+inline void reactor_add_wakeup(reactor_handle_t h, int fd, uint32_t ev)
+{
+  reactor_add(h, fd, ev);
+}
+
+/// Wait for fd readiness events (epoll) and async connect completions (io_uring).
 ///
-/// @param aux_buf  optional buffer for non-poll CQEs (nullptr = ignore)
-/// @param aux_n    in/out: capacity on entry, count on exit
+/// Blocks in epoll_wait(timeout_ms) for socket/wakeup/timer events.
+/// After epoll returns, io_uring CQEs are drained non-blocking to pick up
+/// any CONNECT completions that arrived since the last reactor_wait call.
+/// Connect CQEs are translated into synthetic reactor_event_t entries and
+/// appended to the buf[] returned to the caller.
+///
+/// @param aux_buf  unused (kept for API symmetry with earlier versions)
+/// @param aux_n    unused
 inline int reactor_wait(reactor_handle_t h, reactor_event_t* buf, int maxev,
                         int timeout_ms,
-                        struct io_uring_cqe** aux_buf = nullptr,
-                        int* aux_n = nullptr)
+                        struct io_uring_cqe** /*aux_buf*/ = nullptr,
+                        int* /*aux_n*/ = nullptr)
 {
-  auto& ring = reactor_ctx(h).ring;
+  auto& ctx  = reactor_ctx(h);
+  auto& ring = ctx.ring;
 
-  // Submit any pending SQEs before waiting.
+  // Submit any pending CONNECT SQEs before blocking.
   io_uring_submit(&ring);
 
-  struct __kernel_timespec ts{};
-  struct __kernel_timespec* tsp = nullptr;
-  if (timeout_ms >= 0) {
-    ts.tv_sec  = timeout_ms / 1000;
-    ts.tv_nsec = (timeout_ms % 1000) * 1'000'000L;
-    tsp = &ts;
-  }
-
-  struct io_uring_cqe* cqe;
-  int rc = io_uring_wait_cqe_timeout(&ring, &cqe, tsp);
-  if (rc < 0) {
-    if (rc == -ETIME || rc == -EINTR) return 0;
-    errno = -rc;
+  // Block in epoll until a socket, timer, or wakeup fd becomes ready.
+  int nev = ::epoll_wait(ctx.epoll_fd, buf, maxev, timeout_ms);
+  if (nev < 0) {
+    if (errno == EINTR) return 0;
     return -1;
   }
 
-  // Drain all available CQEs.
-  // NOTE: io_uring_cqe_seen / io_uring_cq_advance must NOT be called inside
-  // io_uring_for_each_cqe — the comment in liburing.h says cq_advance must be
-  // called *after* the loop.  We count consumed CQEs and advance once at the end.
-  int   nev     = 0;
-  int   naux    = 0;
-  int   aux_cap = aux_n ? *aux_n : 0;
+  // Non-blocking drain of io_uring CQEs (CONNECT completions).
+  // We peek without blocking: io_uring_peek_cqe returns -EAGAIN when the CQ
+  // is empty, which is the normal case when no connect has just completed.
+  struct io_uring_cqe* cqe;
   unsigned nconsumed = 0;
-  unsigned head;
-  io_uring_for_each_cqe(&ring, head, cqe) {
+  while (nev < maxev && io_uring_peek_cqe(&ring, &cqe) == 0) {
     ++nconsumed;
     uint64_t  ud = io_uring_cqe_get_data64(cqe);
     ReactorOp op = reactor_userdata_op(ud);
     int       fd = reactor_userdata_fd(ud);
 
-    if (op == ReactorOp::PollAdd) {
-      // cqe->res < 0 means the poll was cancelled (ECANCELED) or had an error.
-      // Cancellations are silent (reactor_del submits a cancel and we drop the
-      // resulting CQE here to avoid spurious on_error calls).
-      if (cqe->res < 0) {
-        // Cancelled or error — silently drop, same as Cancel op.
-      } else if (nev < maxev) {
-        buf[nev].data.fd = fd;
-        buf[nev].events  = uint32_t(cqe->res);
-        ++nev;
-      }
-    } else if (op == ReactorOp::Connect) {
-      // Connect CQE from a linked IORING_OP_CONNECT + IORING_OP_LINK_TIMEOUT pair.
-      //   cqe->res == 0           → connected
-      //   cqe->res == -ECANCELED  → timed out (linked timeout fired first)
-      //   cqe->res <  0 (other)   → connection refused / reset
-      if (nev < maxev) {
-        buf[nev].data.fd = fd;
-        if (cqe->res == 0)
-          buf[nev].events = REACTOR_EV_CONNECT;
-        else if (cqe->res == -ECANCELED)
-          buf[nev].events = REACTOR_EV_CONNECT | REACTOR_EV_HUP;  // timeout
-        else
-          buf[nev].events = REACTOR_EV_CONNECT | REACTOR_EV_ERR;  // refused/reset
-        ++nev;
-      }
-    } else if (op == ReactorOp::Timeout) {
-      // Linked IORING_OP_LINK_TIMEOUT CQE — silently consumed.
-    } else if (op != ReactorOp::Cancel) {
-      if (aux_buf && naux < aux_cap)
-        aux_buf[naux++] = cqe;
+    if (op == ReactorOp::Connect) {
+      // Translate Connect CQE into a synthetic epoll-style event.
+      buf[nev].data.fd = fd;
+      if (cqe->res == 0)
+        buf[nev].events = REACTOR_EV_CONNECT;
+      else if (cqe->res == -ECANCELED)
+        buf[nev].events = REACTOR_EV_CONNECT | REACTOR_EV_HUP;  // timed out
+      else
+        buf[nev].events = REACTOR_EV_CONNECT | REACTOR_EV_ERR;  // refused/reset
+      ++nev;
     }
+    // Timeout and Cancel CQEs are silently consumed.
+    io_uring_cqe_seen(&ring, cqe);
+    nconsumed = 0;  // cqe_seen already advanced the ring; don't double-advance
   }
-  // Advance the CQ ring past all consumed entries — must be after the loop.
-  io_uring_cq_advance(&ring, nconsumed);
+  (void)nconsumed; // cqe_seen handles advancement one-by-one
 
-  if (aux_n) *aux_n = naux;
   return nev;
 }
 
