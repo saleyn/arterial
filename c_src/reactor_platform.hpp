@@ -69,8 +69,6 @@
 #include <cstdint>
 #include <cerrno>
 #include <cstring>
-#include <stdexcept>
-#include <string>
 #include <sys/types.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -253,7 +251,7 @@ namespace detail {
   inline std::mutex& uring_mutex() { static std::mutex m; return m; }
 } // namespace detail
 
-/// Create an io_uring-backed reactor handle.
+/// Create an io_uring-backed reactor handle.  Returns -1 on failure.
 inline reactor_handle_t reactor_create(unsigned entries = 4096,
                                        unsigned /*unused*/ = 0)
 {
@@ -261,14 +259,14 @@ inline reactor_handle_t reactor_create(unsigned entries = 4096,
 
   struct io_uring_params params{};
   if (io_uring_queue_init_params(entries, &ctx->ring, &params) < 0)
-    throw std::runtime_error(std::string("io_uring_queue_init: ") + strerror(errno));
+    return -1;
 
   std::lock_guard<std::mutex> lg(detail::uring_mutex());
   for (int i = 0; i < detail::s_max_rings; ++i) {
     auto& slot = detail::uring_table()[i];
     if (!slot) { slot = ctx.release(); return i; }
   }
-  throw std::runtime_error("reactor_create: too many rings");
+  return -1;
 }
 
 inline void reactor_destroy(reactor_handle_t h)
@@ -292,33 +290,35 @@ inline struct io_uring* reactor_uring(reactor_handle_t h)
 }
 
 // Submit a POLL_ADD SQE for fd.  One-shot: fires once, must be re-armed.
-inline void reactor_add(reactor_handle_t h, int fd, uint32_t ev)
+inline int reactor_add(reactor_handle_t h, int fd, uint32_t ev)
 {
   struct io_uring* ring = &reactor_ctx(h).ring;
   struct io_uring_sqe* sqe = io_uring_get_sqe(ring);
   if (!sqe) { io_uring_submit(ring); sqe = io_uring_get_sqe(ring); }
-  if (!sqe) return;
+  if (!sqe) return -1;
   io_uring_prep_poll_add(sqe, fd, ev);
   sqe->flags |= IOSQE_ASYNC;
   io_uring_sqe_set_data64(sqe, reactor_userdata(fd, ReactorOp::PollAdd));
+  return 0;
 }
 
 // Cancel any outstanding POLL_ADD for fd (e.g. before closing or re-arming).
-inline void reactor_del(reactor_handle_t h, int fd)
+inline int reactor_del(reactor_handle_t h, int fd)
 {
   struct io_uring* ring = &reactor_ctx(h).ring;
   struct io_uring_sqe* sqe = io_uring_get_sqe(ring);
   if (!sqe) { io_uring_submit(ring); sqe = io_uring_get_sqe(ring); }
-  if (!sqe) return;
+  if (!sqe) return -1;
   io_uring_prep_cancel64(sqe, reactor_userdata(fd, ReactorOp::PollAdd), 0);
   io_uring_sqe_set_data64(sqe, reactor_userdata(fd, ReactorOp::Cancel));
+  return 0;
 }
 
 // mod = cancel + re-add with new interest mask.
-inline void reactor_mod(reactor_handle_t h, int fd, uint32_t ev)
+inline int reactor_mod(reactor_handle_t h, int fd, uint32_t ev)
 {
   reactor_del(h, fd);
-  reactor_add(h, fd, ev);
+  return reactor_add(h, fd, ev);
 }
 
 inline void reactor_add_wakeup(reactor_handle_t h, int fd, uint32_t ev)
@@ -392,30 +392,28 @@ inline int reactor_wait(reactor_handle_t h, reactor_event_t* buf, int maxev,
 inline reactor_handle_t reactor_create(unsigned /*entries*/ = 0, unsigned = 0)
 {
   int fd = ::epoll_create1(EPOLL_CLOEXEC);
-  if (fd < 0) throw std::runtime_error(std::string("epoll_create1: ") + strerror(errno));
-  return fd;
+  return fd;  // -1 on failure, caller checks
 }
 inline void reactor_destroy(reactor_handle_t h) { if (h >= 0) ::close(h); }
 
-inline void reactor_add(reactor_handle_t h, int fd, uint32_t ev)
+inline int reactor_add(reactor_handle_t h, int fd, uint32_t ev)
 {
   epoll_event e{}; e.events = ev; e.data.fd = fd;
-  if (::epoll_ctl(h, EPOLL_CTL_ADD, fd, &e) < 0)
-    throw std::runtime_error(std::string("epoll_ctl ADD fd=") + std::to_string(fd) + ": " + strerror(errno));
+  return ::epoll_ctl(h, EPOLL_CTL_ADD, fd, &e);
 }
-inline void reactor_mod(reactor_handle_t h, int fd, uint32_t ev)
+inline int reactor_mod(reactor_handle_t h, int fd, uint32_t ev)
 {
   epoll_event e{}; e.events = ev; e.data.fd = fd;
   if (::epoll_ctl(h, EPOLL_CTL_MOD, fd, &e) < 0) {
     if (errno == ENOENT)
-      ::epoll_ctl(h, EPOLL_CTL_ADD, fd, &e);
-    else
-      throw std::runtime_error(std::string("epoll_ctl MOD fd=") + std::to_string(fd) + ": " + strerror(errno));
+      return ::epoll_ctl(h, EPOLL_CTL_ADD, fd, &e);
+    return -1;
   }
+  return 0;
 }
-inline void reactor_del(reactor_handle_t h, int fd)
+inline int reactor_del(reactor_handle_t h, int fd)
 {
-  ::epoll_ctl(h, EPOLL_CTL_DEL, fd, nullptr);
+  return ::epoll_ctl(h, EPOLL_CTL_DEL, fd, nullptr);
 }
 inline int reactor_wait(reactor_handle_t h, reactor_event_t* buf, int maxev, int timeout_ms)
 {
@@ -432,9 +430,7 @@ inline int reactor_wait(reactor_handle_t h, reactor_event_t* buf, int maxev, int
 
 inline int reactor_eventfd_create()
 {
-  int fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-  if (fd < 0) throw std::runtime_error(std::string("eventfd: ") + strerror(errno));
-  return fd;
+  return ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);  // -1 on failure
 }
 inline int  reactor_eventfd_write_fd(int efd)      { return efd; }
 inline void reactor_eventfd_close(int efd)          { if (efd >= 0) ::close(efd); }
@@ -449,9 +445,7 @@ inline int  reactor_eventfd_write(int wfd, uint64_t val)
 
 inline int reactor_timerfd_create()
 {
-  int fd = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-  if (fd < 0) throw std::runtime_error(std::string("timerfd_create: ") + strerror(errno));
-  return fd;
+  return ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);  // -1 on failure
 }
 inline int reactor_timerfd_arm(reactor_handle_t /*h*/, int tid,
                                uint64_t initial_ms, uint64_t interval_ms)
@@ -481,9 +475,7 @@ inline void reactor_timerfd_close(reactor_handle_t /*h*/, int tid)
 
 inline reactor_handle_t reactor_create(unsigned = 0, unsigned = 0)
 {
-  int kq = ::kqueue();
-  if (kq < 0) throw std::runtime_error(std::string("kqueue: ") + strerror(errno));
-  return kq;
+  return ::kqueue();  // -1 on failure
 }
 inline void reactor_destroy(reactor_handle_t h) { if (h >= 0) ::close(h); }
 
@@ -500,25 +492,26 @@ inline void kq_to_kevent(int fd, uint32_t ev, bool add, struct kevent* out, int&
 }
 } // namespace detail
 
-inline void reactor_add(reactor_handle_t kq, int fd, uint32_t ev)
+inline int reactor_add(reactor_handle_t kq, int fd, uint32_t ev)
 {
   struct kevent ch[2]; int n;
   detail::kq_to_kevent(fd, ev, true, ch, n);
   if (n > 0 && ::kevent(kq, ch, n, nullptr, 0, nullptr) < 0)
-    throw std::runtime_error(std::string("kevent ADD: ") + strerror(errno));
+    return -1;
+  return 0;
 }
-inline void reactor_mod(reactor_handle_t kq, int fd, uint32_t ev)
+inline int reactor_mod(reactor_handle_t kq, int fd, uint32_t ev)
 {
   struct kevent del[2]; int n;
   detail::kq_to_kevent(fd, REACTOR_EV_IN | REACTOR_EV_OUT, false, del, n);
   ::kevent(kq, del, n, nullptr, 0, nullptr);
-  reactor_add(kq, fd, ev);
+  return reactor_add(kq, fd, ev);
 }
-inline void reactor_del(reactor_handle_t kq, int fd)
+inline int reactor_del(reactor_handle_t kq, int fd)
 {
   struct kevent del[2]; int n;
   detail::kq_to_kevent(fd, REACTOR_EV_IN | REACTOR_EV_OUT, false, del, n);
-  ::kevent(kq, del, n, nullptr, 0, nullptr);
+  return ::kevent(kq, del, n, nullptr, 0, nullptr) < 0 ? -1 : 0;
 }
 inline int reactor_wait(reactor_handle_t kq, reactor_event_t* buf, int maxev, int timeout_ms)
 {
@@ -555,7 +548,7 @@ inline std::unordered_map<int,int>& pipe_map()
 inline int reactor_eventfd_create()
 {
   int fds[2];
-  if (::pipe(fds) < 0) throw std::runtime_error(std::string("pipe: ") + strerror(errno));
+  if (::pipe(fds) < 0) return -1;
   ::fcntl(fds[0], F_SETFL, O_NONBLOCK | O_CLOEXEC);
   ::fcntl(fds[1], F_SETFL, O_NONBLOCK | O_CLOEXEC);
   std::lock_guard<std::mutex> lg(detail::pipe_mtx());

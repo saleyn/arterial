@@ -62,9 +62,10 @@ else
   EXT := .so
 endif
 
-SRC    := arterial_nif.cpp
-OBJ    := $(OBJ_DIR)/arterial_nif.o
-TARGET := $(PRIV_DIR)/arterial_nif$(EXT)
+SRC        := arterial_nif.cpp
+NIF_SUFFIX := $(if $(filter 1,$(TEST)),_test,)
+OBJ        := $(OBJ_DIR)/arterial$(NIF_SUFFIX).o
+TARGET     := $(PRIV_DIR)/arterial$(NIF_SUFFIX)$(EXT)
 
 # Detect compiler family for LTO flags.
 # AppleClang uses ld64 which handles thin-LTO natively — no -fuse-ld=lld.
@@ -123,9 +124,10 @@ BUILD_DEFINES := \
   -DARTERIAL_VERSION='"$(ARTERIAL_VERSION)"' \
   -DARTERIAL_APP_VERSION='"$(ARTERIAL_APP_VERSION)"' \
   -DARTERIAL_OPT_LEVEL='"$(ARTERIAL_OPT_LEVEL)"' \
-  -DARTERIAL_PGO=$(ARTERIAL_PGO)
+  -DARTERIAL_PGO=$(ARTERIAL_PGO) \
+  $(if $(filter 1,$(TEST)),-DTEST,)
 
-HDRS := $(wildcard *.hpp *.hxx *.h)
+HDRS := $(wildcard *.hpp *.hxx *.h) enif.hpp
 $(OBJ): $(SRC) $(HDRS) | $(OBJ_DIR)
 	$(CXX) -c $(CXXFLAGS) $(BUILD_DEFINES) -o $@ $<
 
@@ -146,7 +148,7 @@ endif
 $(REACTOR_TEST_OBJ): reactor_test.cpp reactor.hpp reactor_platform.hpp erl_nif_stub.h | $(OBJ_DIR)
 	$(CXX) -c $(CXXFLAGS) $(URING_CFLAGS) -DREACTOR_TEST_STUB_NIF -o $@ $<
 
-$(REACTOR_TEST): $(REACTOR_TEST_OBJ) | $(PRIV_DIR)
+$(REACTOR_TEST): $(REACTOR_TEST_OBJ) $(HDRS) | $(PRIV_DIR)
 	$(CXX) $(LDFLAGS) $(URING_LDFLAGS) -o $@ $< -lpthread
 
 test_reactor: $(REACTOR_TEST)

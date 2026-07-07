@@ -3,6 +3,7 @@
 #include <array>
 #include <vector>
 #include <memory>
+#include <iterator>
 #include <unistd.h>
 #include <sys/uio.h>
 #include <sys/ioctl.h>
@@ -117,6 +118,8 @@ static ERL_NIF_TERM init_pool_nif(
   // init_pool caller), which has no handle_info and would log a spurious
   // "unexpected message" warning on every normal pool stop.
   ctx->reactor_ptr = std::make_unique<arterial::Reactor>("arterial_pool");
+  if (!ctx->reactor_ptr->valid())
+    return make_tuple(env, am_error, am_reactor_init_failed);
   ctx->reactor_ptr->start();
 
   return make_tuple(env, am_ok, ctx);
@@ -190,186 +193,6 @@ static ERL_NIF_TERM register_socket_nif(
   }
 
   return make_tuple(env, am_ok, slot_id);
-}
-
-//-----------------------------------------------------------------------------
-// Open and connect a brand-new IPv4 TCP socket entirely inside this NIF
-// in non-blocking mode, then claim a conn for it exactly like
-// register_socket_nif. Unlike register_socket/4, the fd never has any
-// other owner (no Erlang `socket()` term, no `prim_socket` resource
-// fighting over it) -- the safer alternative to handing off an
-// already-open fd, see arterial_connection2's moduledoc.
-//-----------------------------------------------------------------------------
-static ERL_NIF_TERM connect_nif(
-  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
-{
-  PoolContext* ctx;
-  unsigned int stripe_id;
-  IP4Tuple     octets;
-  int          port;
-  unsigned int timeout_ms;
-  bool         nodelay;
-  ErlNifPid    owner_pid;
-
-  assert(argc == 7);
-
-  if  (!get(env, argv[0], ctx)
-    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
-    || !get(env, argv[2], octets)
-    || !get(env, argv[3], port, 0, 65535)
-    || !get(env, argv[4], timeout_ms)
-    || !get(env, argv[5], nodelay)
-    || !get(env, argv[6], owner_pid))
-    return enif_make_badarg(env);
-
-  auto& stripe = *ctx->stripes[stripe_id];
-
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0)
-    return make_tuple(env, am_error, am_socket_failed);
-
-  if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) {
-    close(fd);
-    return make_tuple(env, am_error, am_failed_to_set_nonblocking);
-  }
-  if (nodelay) {
-    static constexpr int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-  }
-
-  struct sockaddr_in addr{};
-  auto [o0, o1, o2, o3] = octets;
-  addr.sin_family       = AF_INET;
-  addr.sin_port         = htons(static_cast<uint16_t>(port));
-  uint32_t ip_host      = (o0 << 24) | (o1 << 16) | (o2 << 8) | o3;
-  addr.sin_addr.s_addr  = htonl(ip_host);
-
-  int rc = connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
-  if (rc < 0 && errno != EINPROGRESS) {
-    close(fd);
-    return make_tuple(env, am_error, am_connect_failed);
-  }
-  // For EINPROGRESS, connection is in progress - proceed with slot claiming
-  // The slot will be marked as SLOT_CONNECTING and completion will be
-  // handled via enif_select write-ready notifications
-
-  // Claim slot and setup timeout if needed
-  auto slot_result = ctx->claim_slot(env, stripe, fd, owner_pid);
-  if (slot_result < 0) {
-    close(fd);
-    return make_tuple(env, am_error, am_stripe_full);
-  }
-
-  Connection& conn = stripe.slots[slot_result];
-
-  // Monitor the owner: if it dies the on_down callback closes the slot.
-  if (ctx->monitor_owner(env, conn) != 0) {
-    stripe.release_slot(slot_result);
-    close(fd);
-    return make_tuple(env, am_error, am_connect_failed);
-  }
-
-  // Set up connection timeout using RAII if timeout_ms > 0
-  if (timeout_ms > 0) {
-    int timeout_fd = setup_connection_timeout_fd(conn, timeout_ms);
-    if (timeout_fd < 0) {
-      ctx->demonitor_owner(env, conn);
-      stripe.release_slot(slot_result);
-      close(fd);
-      return make_tuple(env, am_error, am_timeout_setup_failed);
-    }
-  }
-
-  return make_tuple(env, am_ok, slot_result);
-}
-
-//-----------------------------------------------------------------------------
-// Non-blocking version of connect_nif: starts connection and returns
-// immediately, then sends completion notification via message when connection
-// completes or fails.
-//-----------------------------------------------------------------------------
-static ERL_NIF_TERM connect_async_nif(
-  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
-{
-  PoolContext* ctx;
-  unsigned int stripe_id;
-  IP4Tuple     octets;
-  int          port;
-  bool         nodelay;
-  ErlNifPid    owner_pid;
-
-  assert(argc == 6);
-
-  if  (!get(env, argv[0], ctx)
-    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
-    || !get(env, argv[2], octets)
-    || !get(env, argv[3], port, 0, 65535)
-    || !get(env, argv[4], nodelay)
-    || !get(env, argv[5], owner_pid)) [[unlikely]]
-    return enif_make_badarg(env);
-
-  auto& stripe = *ctx->stripes[stripe_id];
-
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0)
-    return make_tuple(env, am_error, am_socket_failed);
-
-  if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) {
-    close(fd);
-    return make_tuple(env, am_error, am_failed_to_set_nonblocking);
-  }
-  if (nodelay) {
-    static constexpr int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-  }
-
-  auto [o0, o1, o2, o3] = octets;
-  struct sockaddr_in addr{};
-  addr.sin_family      = AF_INET;
-  addr.sin_port        = htons(static_cast<uint16_t>(port));
-  uint32_t ip_host     = (o0 << 24) | (o1 << 16) | (o2 << 8) | o3;
-  addr.sin_addr.s_addr = htonl(ip_host);
-
-  int rc = connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
-  if (rc < 0 && errno != EINPROGRESS) [[unlikely]] {
-    close(fd);
-    return make_tuple(env, am_error, am_connect_failed);
-  }
-
-  int slot_id = ctx->claim_slot(env, stripe, fd, owner_pid);
-  if (slot_id < 0) {
-    close(fd);
-    return make_tuple(env, am_error, am_stripe_full);
-  }
-
-  auto& conn = stripe.slots[slot_id];
-
-  if (ctx->monitor_owner(env, conn) != 0) {
-    stripe.release_slot(slot_id);
-    close(fd);
-    return make_tuple(env, am_error, am_connect_failed);
-  }
-
-  if (rc == 0) {
-    // Connection completed immediately
-    conn.status.store(SLOT_AVAILABLE, std::memory_order_release);
-    conn.arm_read(env, ctx);
-    return make_tuple(env, am_ok, slot_id);
-  }
-
-  // Connection in progress — arm write notification for completion
-  conn.status.store(SLOT_CONNECTING, std::memory_order_release);
-
-  if (conn.arm_connect(env, ctx) < 0) {
-    ctx->demonitor_owner(env, conn);
-    conn.status.store(SLOT_EMPTY, std::memory_order_release);
-    stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
-    close(conn.fd);
-    conn.fd = -1;
-    return make_tuple(env, am_error, am_select_failed);
-  }
-
-  return make_tuple(env, am_ok, am_connecting, slot_id);
 }
 
 //-----------------------------------------------------------------------------
@@ -515,206 +338,6 @@ claimed:
 }
 
 //-----------------------------------------------------------------------------
-static ERL_NIF_TERM handle_readable_nif(
-  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
-{
-  using ReadResult = Connection::ReadResult;
-
-  PoolContext* ctx;
-  auto pconn = arterial::resolve_slot(env, argc, argv, &ctx);
-  if (!pconn) [[unlikely]]
-    return enif_make_badarg(env);
-  Connection& conn = *pconn;
-
-  // Delegate to Connection method
-  auto res = conn.handle_readable(env, ctx);
-
-  // Handle the result and convert to appropriate Erlang terms
-  switch (res.result) {
-    case ReadResult::DATA:
-      return make_tuple(env, am_ok, std::move(res.data));
-
-    case ReadResult::CLOSED:
-      ctx->notify_and_close(env, conn);
-      return am_closed;
-
-    case ReadResult::HANDSHAKE_READ:
-    case ReadResult::HANDSHAKE_WRITE:
-      return make_tuple(env, am_ok, std::move(res.data));
-
-    case ReadResult::CONNECT_OK:
-    case ReadResult::CONNECT_FAILED:
-      if (res.send_connect_msg) {
-        nifpp::msg_env msg_env;
-        auto msg = conn.make_connect_result_msg(msg_env, res.connect_result);
-        enif_send(env, &conn.owner_pid, msg_env, msg);
-      }
-      if (res.result == ReadResult::CONNECT_FAILED) {
-        ctx->notify_and_close(env, conn);
-        return am_closed;
-      }
-      return make_tuple(env, am_ok, std::move(res.data));
-
-    case ReadResult::ERROR:
-      return make_tuple(env, am_error, am_alloc_failed);
-
-    default:
-      return make_tuple(env, am_error, am_unknown);
-  }
-}
-
-//-----------------------------------------------------------------------------
-static ERL_NIF_TERM handle_writable_nif(
-  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
-{
-  using WriteResult = Connection::WriteResult;
-
-  PoolContext* ctx;
-  Connection*  pconn = arterial::resolve_slot(env, argc, argv, &ctx);
-  if (!pconn) [[unlikely]]
-    return enif_make_badarg(env);
-  Connection& conn = *pconn;
-
-  // Delegate to Connection method
-  auto res = conn.handle_writable(env, ctx);
-
-  // Handle the result and convert to appropriate Erlang terms
-  switch (res.result) {
-    case WriteResult::OK:
-      return am_ok;
-
-    case WriteResult::CLOSED:
-      ctx->notify_and_close(env, conn);
-      return am_closed;
-
-    case WriteResult::HANDSHAKE_READ:
-    case WriteResult::HANDSHAKE_WRITE:
-      return am_ok;
-
-    case WriteResult::CONNECT_OK:
-    case WriteResult::CONNECT_FAILED:
-      if (res.send_connect_msg) {
-        nifpp::msg_env msg_env;
-        auto msg = conn.make_connect_result_msg(msg_env, res.connect_result);
-        enif_send(env, &conn.owner_pid, msg_env, msg);
-      }
-      if (res.result == WriteResult::CONNECT_FAILED) {
-        ctx->notify_and_close(env, conn);
-        return am_closed;
-      }
-      return am_ok;
-
-    case WriteResult::ERROR:
-      return make_tuple(env, am_error, am_unknown);
-
-    default:
-      return make_tuple(env, am_error, am_unknown);
-  }
-}
-
-//-----------------------------------------------------------------------------
-// Protocol-aware version of connect_nif
-//-----------------------------------------------------------------------------
-static ERL_NIF_TERM connect_proto_nif(
-  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
-{
-  PoolContext* ctx;
-  unsigned int stripe_id;
-  int          port;
-  unsigned int timeout_ms;
-  bool         nodelay;
-  ErlNifPid    owner_pid;
-  ProtocolType protocol;
-  IP4Tuple     octets;
-
-  assert(argc == 8);
-
-  if  (!get(env, argv[0], ctx)
-    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
-    || !get(env, argv[2], octets)
-    || !get(env, argv[3], port, 0, 65535)
-    || !get(env, argv[4], timeout_ms)
-    || !parse_protocol(env, argv[5], protocol)
-    || !get(env, argv[6], nodelay)
-    || !get(env, argv[7], owner_pid)) [[unlikely]]
-    return enif_make_badarg(env);
-
-  // Delegate to Connection method
-  auto result = Connection::connect_proto(
-                  env, ctx, stripe_id, octets,
-                  port, timeout_ms, protocol, nodelay, owner_pid);
-
-  // Handle the result and convert to appropriate Erlang terms
-  switch (result.result) {
-    case Connection::ConnectResult::OK:
-      return make_tuple(env, am_ok, result.slot_id);
-
-    case Connection::ConnectResult::CONNECTING:
-      return make_tuple(env, am_ok, am_connecting, result.slot_id);
-
-    case Connection::ConnectResult::FAILED:
-    case Connection::ConnectResult::STRIPE_FULL:
-    case Connection::ConnectResult::SOCKET_FAILED:
-    case Connection::ConnectResult::CONFIG_FAILED:
-    case Connection::ConnectResult::SELECT_FAILED:
-    case Connection::ConnectResult::SSL_FAILED:
-      return make_tuple(env, am_error, result.error_reason);
-
-    default:
-      return make_tuple(env, am_error, am_unknown);
-  }
-}
-
-//-----------------------------------------------------------------------------
-// Protocol-aware async version
-//-----------------------------------------------------------------------------
-static ERL_NIF_TERM connect_async_proto_nif(
-  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
-{
-  PoolContext* ctx;
-  unsigned int stripe_id;
-  int          port;
-  bool         nodelay;
-  ErlNifPid    owner_pid;
-  ProtocolType protocol;
-  IP4Tuple     octets;
-
-  assert(argc == 7);
-
-  if  (!get(env, argv[0], ctx)
-    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
-    || !get(env, argv[2], octets)
-    || !get(env, argv[3], port, 0, 65535)
-    || !parse_protocol(env, argv[4], protocol)
-    || !get(env, argv[5], nodelay)
-    || !get(env, argv[6], owner_pid)) [[unlikely]]
-    return enif_make_badarg(env);
-
-  // Delegate to Connection method
-  auto result = Connection::connect_async_proto(env, ctx, stripe_id, octets, port, protocol, nodelay, owner_pid);
-
-  // Handle the result and convert to appropriate Erlang terms
-  switch (result.result) {
-    case Connection::ConnectResult::OK:
-      return make_tuple(env, am_ok, static_cast<unsigned int>(result.slot_id));
-
-    case Connection::ConnectResult::CONNECTING:
-      return make_tuple(env, am_ok, am_connecting, static_cast<unsigned int>(result.slot_id));
-
-    case Connection::ConnectResult::FAILED:
-    case Connection::ConnectResult::STRIPE_FULL:
-    case Connection::ConnectResult::SOCKET_FAILED:
-    case Connection::ConnectResult::CONFIG_FAILED:
-    case Connection::ConnectResult::SELECT_FAILED:
-    case Connection::ConnectResult::SSL_FAILED:
-      return make_tuple(env, am_error, result.error_reason);
-
-    default:
-      return make_tuple(env, am_error, am_unknown);
-  }
-}
-
-//-----------------------------------------------------------------------------
 // Force-close a slot (bouncer recycle, or teardown of an idle connection)
 // unlike notify_and_close, this is caller-initiated, so no "closed"
 // heads-up is sent (the caller already knows).
@@ -755,47 +378,11 @@ static ERL_NIF_TERM close_slot_nif(
   return am_ok;
 }
 
-//-----------------------------------------------------------------------------
-// Handle connection timeout cleanup - free slot and release resources
-//-----------------------------------------------------------------------------
-static ERL_NIF_TERM handle_connection_timeout_nif(
-  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
-{
-  PoolContext* ctx;
-  Connection* pconn = arterial::resolve_slot(env, argc, argv, &ctx);
-  if (!pconn) [[unlikely]]
-    return enif_make_badarg(env);
-  Connection& conn = *pconn;
-
-  // Bump generation before remove_fd so in-flight callbacks see stale gen.
-  conn.generation.fetch_add(1, std::memory_order_release);
-
-  // Free the slot.
-  conn.status.store(SLOT_EMPTY, std::memory_order_release);
-  auto& stripe = *ctx->stripes[conn.stripe_id];
-  stripe.lease_mask.fetch_and(~(1ULL << conn.slot_id), std::memory_order_release);
-
-  // Cancel the connection timeout timer (closes timerfd directly — safe since
-  // enif_select is no longer used for timer fds).
-  conn.timer.reset();
-
-  int fd = conn.fd;
-  conn.fd = -1;
-
-  if (fd != -1) {
-#ifdef HAVE_OPENSSL
-    cleanup_slot_ssl(conn);
-#endif
-    // Reactor closes the fd on its thread — race-free, no enif_select(STOP).
-    ctx->reactor().remove_fd(fd);
-  }
-
-  return am_ok;
-}
-
 //=============================================================================
-// Reactor server NIFs — pure-NIF listen/accept, no OTP socket involvement.
+// Reactor server NIFs — test-infrastructure only (echo servers, reactor_bench)
 //=============================================================================
+
+#ifdef TEST
 
 //-----------------------------------------------------------------------------
 // reactor_listen(PoolRef, Port) → {ok, Fd} | {error, Reason}
@@ -960,54 +547,7 @@ static ERL_NIF_TERM reactor_register_client_nif(
   return make_tuple(env, am_ok, static_cast<unsigned int>(slot_id));
 }
 
-//-----------------------------------------------------------------------------
-// Socket options enhanced functions (stubs for now)
-//-----------------------------------------------------------------------------
-static ERL_NIF_TERM connect_with_opts_nif(
-  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
-{
-  PoolContext* ctx;
-  unsigned int stripe_id;
-  int          port;
-  unsigned int timeout_ms;
-  bool         nodelay;
-  ErlNifPid    owner_pid;
-  IP4Tuple     octets;
-
-  assert(argc == 8);
-
-  if  (!get(env, argv[0], ctx)
-    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
-    || !get(env, argv[2], octets)
-    || !get(env, argv[3], port, 0, 65535)
-    || !get(env, argv[4], timeout_ms)
-    || !get(env, argv[5], nodelay)
-    || !get(env, argv[6], owner_pid)) [[unlikely]]
-    return enif_make_badarg(env);
-
-  // Delegate to Connection method
-  auto result = Connection::connect_with_opts(env, ctx, stripe_id, octets, port, timeout_ms, nodelay, owner_pid, argv[7]);
-
-  // Handle the result and convert to appropriate Erlang terms
-  switch (result.result) {
-    case Connection::ConnectResult::OK:
-      return make_tuple(env, am_ok, static_cast<unsigned int>(result.slot_id));
-
-    case Connection::ConnectResult::CONNECTING:
-      return make_tuple(env, am_ok, am_connecting, static_cast<unsigned int>(result.slot_id));
-
-    case Connection::ConnectResult::FAILED:
-    case Connection::ConnectResult::STRIPE_FULL:
-    case Connection::ConnectResult::SOCKET_FAILED:
-    case Connection::ConnectResult::CONFIG_FAILED:
-    case Connection::ConnectResult::SELECT_FAILED:
-    case Connection::ConnectResult::SSL_FAILED:
-      return make_tuple(env, am_error, result.error_reason);
-
-    default:
-      return make_tuple(env, am_error, am_unknown);
-  }
-}
+#endif // TEST
 
 //-----------------------------------------------------------------------------
 static ERL_NIF_TERM connect_proto_with_opts_nif(
@@ -1515,36 +1055,11 @@ static ERL_NIF_TERM reserve_send_fifo_request_nif(
 #    define ARTERIAL_BACKEND "unknown"
 #  endif
 #endif
-
-//-----------------------------------------------------------------------------
-// register_corr(PoolRef, StripeId, CorrId, CallerPid, ConnId, DeadlineUs)
-//   → ok | {error, table_full}
-//-----------------------------------------------------------------------------
-static ERL_NIF_TERM register_corr_nif(
-  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
-{
-  PoolContext* ctx;
-  unsigned int stripe_id, corr_id, conn_id;
-  ErlNifPid    caller_pid;
-  ErlNifSInt64 deadline_us;
-
-  assert(argc == 6);
-
-  if  (!get(env, argv[0], ctx)
-    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count - 1))
-    || !get(env, argv[2], corr_id)
-    || !enif_get_local_pid(env, argv[3], &caller_pid)
-    || !get(env, argv[4], conn_id)
-    || !enif_get_int64(env, argv[5], &deadline_us)) [[unlikely]]
-    return enif_make_badarg(env);
-
-  auto& ct = ctx->stripes[stripe_id]->corr_table;
-  if (!ct.insert(corr_id, caller_pid,
-                 static_cast<uint32_t>(conn_id),
-                 static_cast<int64_t>(deadline_us))) [[unlikely]]
-    return make_tuple(env, am_error, enif_make_atom(env, "table_full"));
-  return am_ok;
-}
+#ifdef TEST
+#  define ARTERIAL_PROFILE "test"
+#else
+#  define ARTERIAL_PROFILE "prod"
+#endif
 
 //-----------------------------------------------------------------------------
 // register_and_send(PoolRef, StripeId, CorrId, CallerPid, DeadlineUs, DataList)
@@ -1633,9 +1148,7 @@ static ERL_NIF_TERM lookup_and_remove_corr_nif(
   if (!ctx->stripes[stripe_id]->corr_table.remove(corr_id, out))
     return enif_make_atom(env, "not_found");
 
-  return enif_make_tuple2(env,
-    enif_make_pid(env, &out.caller_pid),
-    enif_make_uint(env, out.conn_id));
+  return make_tuple(env, out.caller_pid, out.conn_id);
 }
 
 //-----------------------------------------------------------------------------
@@ -1740,17 +1253,22 @@ static ERL_NIF_TERM info_nif(ErlNifEnv* env, int argc, [[maybe_unused]] const ER
     return am_unknown;
   };
 
-  ERL_NIF_TERM keys[]   = { am_version, am_app_version, am_pgo, am_optimization, am_backend };
-  ERL_NIF_TERM values[] = {
+  auto profile = [=]() -> ERL_NIF_TERM {
+    return strcmp(ARTERIAL_PROFILE, "test") == 0 ? am_test : am_prod;
+  };
+
+  ERL_NIF_TERM keys[] = { am_version, am_app_version, am_pgo, am_optimization, am_backend, am_profile };
+  ERL_NIF_TERM vals[] = {
     make_binary(env, std::string_view(ARTERIAL_VERSION)),
     make_binary(env, std::string_view(ARTERIAL_APP_VERSION)),
     ARTERIAL_PGO ? am_true : am_false,
     opt(),
-    backend()
+    backend(),
+    profile()
   };
 
   ERL_NIF_TERM map;
-  enif_make_map_from_arrays(env, keys, values, 5, &map);
+  enif_make_map_from_arrays(env, keys, vals, std::size(keys), &map);
   return map;
 }
 

@@ -58,8 +58,9 @@ call(Pool, Request, Timeout) ->
 do_call(Pool, Request, Timeout, Dispatcher) ->
   #pool_meta{pool_ref = PoolRef, codec = Codec, size = Size} = arterial_pool:pool_meta(Pool),
   CorrId = new_corr_id(),
-  Data   = iolist_to_binary(Codec:encode_request(CorrId, Request)),
-  case send_to_any(Pool, PoolRef, Size, [], CorrId, Data, Timeout, Dispatcher) of
+  Data   = Codec:encode_request(CorrId, Request),
+  Start  = erlang:system_info(scheduler_id) rem Size,
+  case send_to_any(PoolRef, Size, Start, 0, CorrId, Data, Timeout, Dispatcher, Pool) of
     {ok, ConnID} ->
       await_reply(PoolRef, CorrId, ConnID, Timeout);
     {error, _} = Error ->
@@ -90,8 +91,9 @@ cast(Pool, Request) ->
 do_cast(Pool, Request, Dispatcher) ->
   #pool_meta{pool_ref = PoolRef, codec = Codec, size = Size} = arterial_pool:pool_meta(Pool),
   CorrId = new_corr_id(),
-  Data   = iolist_to_binary(Codec:encode_request(CorrId, Request)),
-  send_cast_to_any(Pool, PoolRef, Size, [], Data, Dispatcher).
+  Data   = Codec:encode_request(CorrId, Request),
+  Start  = erlang:system_info(scheduler_id) rem Size,
+  send_cast_to_any(PoolRef, Size, Start, 0, Data, Dispatcher, Pool).
 
 -doc """
 A fresh wire-level correlation id, truncated to 32 bits (the width
@@ -114,37 +116,27 @@ new_corr_id() ->
 %%% Internal functions
 %%%-----------------------------------------------------------------------------
 
-send_to_any(_Pool, _PoolRef, Size, Tried, _CorrId, _Data, _Timeout, _Dispatcher) when length(Tried) >= Size ->
+%% Try stripes in scheduler-affine order.  Availability and slot selection are
+%% handled entirely inside the NIF's register_and_send (CAS on lease_mask):
+%% the Erlang layer just needs to advance to the next stripe on failure and
+%% give up after trying all Size stripes.
+send_to_any(_PoolRef, Size, _Start, Size, _CorrId, _Data, _Timeout, _Dispatcher, _Pool) ->
   {error, no_connection};
-send_to_any(Pool, PoolRef, Size, Tried, CorrId, Data, Timeout, Dispatcher) ->
-  case next_candidate(Pool, Size, Tried) of
-    none ->
-      {error, no_connection};
-    ConnID ->
-      case try_send(Pool, PoolRef, ConnID, CorrId, Data, Timeout, Dispatcher) of
-        ok    -> {ok, ConnID};
-        retry -> send_to_any(Pool, PoolRef, Size, [ConnID | Tried], CorrId, Data, Timeout, Dispatcher)
-      end
-  end.
-
-try_send(Pool, PoolRef, ConnID, CorrId, Data, Timeout, Dispatcher) ->
+send_to_any(PoolRef, Size, Start, Offset, CorrId, Data, Timeout, Dispatcher, Pool) ->
+  ConnID   = (Start + Offset) rem Size,
   Deadline = arterial_util:calc_expiration(os:system_time(microsecond), Timeout),
   case Dispatcher:register_and_send(Pool, PoolRef, ConnID, CorrId, self(), Deadline, Data) of
-    {ok,    _SlotId} -> ok;
-    {error, _Reason} -> retry
+    {ok,    _SlotId} -> {ok, ConnID};
+    {error, _Reason} -> send_to_any(PoolRef, Size, Start, Offset + 1, CorrId, Data, Timeout, Dispatcher, Pool)
   end.
 
-send_cast_to_any(_Pool, _PoolRef, Size, Tried, _Data, _Dispatcher) when length(Tried) >= Size ->
+send_cast_to_any(_PoolRef, Size, _Start, Size, _Data, _Dispatcher, _Pool) ->
   {error, no_connection};
-send_cast_to_any(Pool, PoolRef, Size, Tried, Data, Dispatcher) ->
-  case next_candidate(Pool, Size, Tried) of
-    none ->
-      {error, no_connection};
-    ConnID ->
-      case Dispatcher:send_and_release(Pool, PoolRef, ConnID, Data) of
-        {ok, _SlotId}    -> ok;
-        {error, _Reason} -> send_cast_to_any(Pool, PoolRef, Size, [ConnID | Tried], Data, Dispatcher)
-      end
+send_cast_to_any(PoolRef, Size, Start, Offset, Data, Dispatcher, Pool) ->
+  ConnID = (Start + Offset) rem Size,
+  case Dispatcher:send_and_release(Pool, PoolRef, ConnID, Data) of
+    {ok,    _SlotId} -> ok;
+    {error, _Reason} -> send_cast_to_any(PoolRef, Size, Start, Offset + 1, Data, Dispatcher, Pool)
   end.
 
 await_reply(PoolRef, CorrId, ConnID, Timeout) ->
@@ -156,27 +148,3 @@ await_reply(PoolRef, CorrId, ConnID, Timeout) ->
     arterial_nif:unregister_corr(PoolRef, ConnID, CorrId),
     {error, timeout}
   end.
-
-%% Scheduler-affine starting offset, then a linear scan of every
-%% remaining ConnID (wrapping), skipping any already in `Tried` and any
-%% currently unavailable connection (no socket / disconnected /
-%% draining for a bounce). Throttling is handled in the NIF.
-next_candidate(Pool, Size, Tried) ->
-  Start = erlang:system_info(scheduler_id) rem Size,
-  find_candidate(Pool, Size, Tried, Start, 0).
-
-find_candidate(_Pool, Size, _Tried, _Start, Size) ->
-  none;
-find_candidate(Pool, Size, Tried, Start, Offset) ->
-  ConnID = (Start + Offset) rem Size,
-  case lists:member(ConnID, Tried) of
-    true ->
-      find_candidate(Pool, Size, Tried, Start, Offset + 1);
-    false ->
-      case arterial_pool:is_available(Pool, ConnID) of
-        true  -> ConnID;
-        false -> find_candidate(Pool, Size, Tried, Start, Offset + 1)
-      end
-  end.
-
-%% Throttling is now handled directly in the NIF during send_and_release/3

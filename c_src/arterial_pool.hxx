@@ -26,7 +26,7 @@ static inline ReadHandler make_read_handler(PoolContext* ctx,
 {
   auto& conn    = ctx->stripes[stripe_id]->slots[slot_id];
   uint32_t gen  = conn.generation.load(std::memory_order_acquire);
-  return [ctx, stripe_id, slot_id, gen](int fd, void*) -> int {
+  return [ctx, stripe_id, slot_id, gen]([[maybe_unused]] int fd, void*) -> int {
     auto& c = ctx->stripes[stripe_id]->slots[slot_id];
     uint32_t cur_gen = c.generation.load(std::memory_order_acquire);
     if (cur_gen != gen) return -1;
@@ -55,7 +55,7 @@ static inline WriteHandler make_write_handler(PoolContext* ctx,
 {
   auto& conn    = ctx->stripes[stripe_id]->slots[slot_id];
   uint32_t gen  = conn.generation.load(std::memory_order_acquire);
-  return [ctx, stripe_id, slot_id, gen](int fd_arg, void*) -> int {
+  return [ctx, stripe_id, slot_id, gen]([[maybe_unused]] int fd_arg, void*) -> int {
     auto& c = ctx->stripes[stripe_id]->slots[slot_id];
     if (c.generation.load(std::memory_order_acquire) != gen) return -1;
     auto res = c.handle_writable(nullptr, ctx);

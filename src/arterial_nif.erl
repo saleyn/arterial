@@ -5,14 +5,11 @@ NIF bindings to the raw-socket connection-pool engine (`c_src/arterial_nif.cpp`)
 -- the low-level half of `arterial`'s NIF-resident-I/O connection
 pool backend (see `arterial_pool`'s moduledoc for the full picture).
 
-This NIF performs the actual `read(2)`/
-`write(2)`/`writev(2)` syscalls itself, directly inside whichever Erlang
-process calls in: `send_and_release/3` writes synchronously inside the
-calling process (typically the request's own caller, see
-`arterial_client:call/3`), and `handle_readable/3`/`handle_writable/3`
-perform a read/flush synchronously inside whichever process calls them
-(expected to be the slot's registered "owner" process, normally an
-`arterial_connection` worker).
+`send_and_release/3` and `register_and_send/6` write synchronously
+inside the calling process (typically the request's own caller, see
+`arterial_client:call/3`). The reactor delivers
+`{arterial_event, StripeId, SlotId, read, Bin}` messages directly to
+the slot's owner pid; all decoding runs in Erlang.
 
 Sockets are organized into `Stripes` (assigned by the caller, e.g. by
 scheduler id, to spread atomic-CAS contention across cores) of up to 64
@@ -20,42 +17,31 @@ scheduler id, to spread atomic-CAS contention across cores) of up to 64
 state lives in one lock-free `uint64` bitmask, which is also why 64 is a
 hard per-stripe cap.
 
-There is no callback invoked automatically by the NIF runtime when a
-socket becomes readable/writable (no such mechanism exists in
-`erl_nif.h`): `enif_select` only ever delivers a message --
-`{arterial_event, StripeId, SlotId, read | write | closed}` -- to
-the slot's owner pid, which must then call `handle_readable/3` or
-`handle_writable/3` to actually do the I/O and re-arm the next
-notification. `closed` needs no further NIF call; the fd is already
-gone by the time it's delivered.
-
 ## Protocol Support
 
-This NIF supports three socket protocols via `connect_proto/8` family:
-- **TCP** - Reliable stream protocol with optional TLS/SSL
-- **UDP** - Unreliable datagram protocol with multicast support
-- **SSL** - TLS/SSL over TCP (requires OpenSSL)
-
+This NIF supports TCP, UDP, and SSL via `connect_proto_with_opts/9`.
 **Multicast support:** UDP sockets can be configured with multicast
 options including TTL, loopback control, interface selection, and
-group membership management. See `connect_proto_with_opts/9`.
+group membership management.
 """.
 
 -export([init/0]).
--export([init_pool/2, init_pool/3, configure_throttle/3, register_socket/4, connect/7, connect_async/6, connect_proto/8, connect_async_proto/7, send_and_release/3, send_on_slot/4]).
--export([connect_with_opts/8, connect_proto_with_opts/9]).
--export([handle_readable/3, handle_writable/3, close_slot/3, handle_connection_timeout/3]).
+-export([init_pool/2, init_pool/3, configure_throttle/3, register_socket/4, send_and_release/3, send_on_slot/4]).
+-export([connect_proto_with_opts/9]).
+-export([close_slot/3]).
+-ifdef(TEST).
 -export([reactor_listen/2, reactor_accept/3, reactor_close_fd/2, reactor_register_client/4]).
+-endif.
 -export([is_slot_available/3, set_slot_available/3, set_slot_unavailable/3]).
 -export([reserve_fifo_connection/3, send_fifo_request/6, release_fifo_connection/4, fifo_connection_status/3, handle_fifo_reply/4]).
--export([reserve_send_fifo_request/5]). % New combined function (#3)
--export([register_corr/6, register_and_send/6, unregister_corr/3,
+-export([reserve_send_fifo_request/5]).
+-export([register_and_send/6, unregister_corr/3,
          lookup_and_remove_corr/3, corr_count/2, drain_corr_map/3, sweep_corr_map/2]).
 -export([info/0]).
 
 -on_load(init/0).
 
--define(LIBNAME, arterial_nif).
+-define(LIBNAME, arterial).
 -define(NOT_LOADED_ERROR,
   erlang:nif_error({not_loaded, [{module, ?MODULE}, {line, ?LINE}]})).
 
@@ -147,114 +133,6 @@ NIF (there's no other way to get one in).
   {ok, non_neg_integer()} |
   {error, failed_to_set_nonblocking | stripe_full}.
 register_socket(_PoolRef, _StripeId, _RawFd, _OwnerPid) ->
-  ?NOT_LOADED_ERROR.
-
--doc """
-Open a brand-new IPv4 TCP socket, connect it to `IP`:`Port` (waiting up
-to `TimeoutMs` milliseconds), and -- on success -- claim an idle slot of
-stripe `StripeId` for it, exactly like `register_socket/4`. `Nodelay`
-sets `TCP_NODELAY` on the new socket when `true`.
-
-Unlike `register_socket/4`, the fd is opened by this NIF and never has
-any other owner at any point: nothing else (no Erlang `socket()` term,
-no `prim_socket`/`esock` resource) ever believes it owns this fd, so
-there is no "stealing control of fd=N" warning and no fd-reuse risk on
-teardown. This runs as a dirty, IO-bound NIF (`connect/2` can block for
-up to `TimeoutMs`), so it never ties up a regular scheduler thread.
-
-## Examples
-
-```
-1> arterial_nif:connect(PoolRef, 0, {127,0,0,1}, 9000, 5000, true, self()).
-{ok, SlotId}
-2> arterial_nif:connect(PoolRef, 0, {127,0,0,1}, 1, 200, true, self()).
-{error, connect_failed}
-```
-""".
--spec connect(pool_ref(), non_neg_integer(), inet:ip4_address(),
-              arterial:inet_port(), non_neg_integer(), boolean(), pid()) ->
-  {ok, non_neg_integer()} |
-  {error, socket_failed | failed_to_set_nonblocking | connect_failed | timeout | stripe_full}.
-connect(_PoolRef, _StripeId, _IP, _Port, _TimeoutMs, _Nodelay, _OwnerPid) ->
-  ?NOT_LOADED_ERROR.
-
--doc """
-Open a brand-new IPv4 TCP socket and start connecting to `IP`:`Port`
-asynchronously. Unlike `connect/7`, this function returns immediately
-after starting the connection attempt.
-
-Returns `{ok, SlotId}` if connection completes immediately,
-`{ok, connecting, SlotId}` if connection is in progress, or
-`{error, Reason}` if the connection attempt fails immediately.
-
-When an async connection completes, sends a message to `OwnerPid`:
-`{arterial_event, StripeId, SlotId, connect_result, Result}`
-where `Result` is `ok` for success or an error atom for failure.
-
-`Nodelay` sets `TCP_NODELAY` on the new socket when `true`.
-
-## Examples
-
-```
-1> arterial_nif:connect_async(PoolRef, 0, {127,0,0,1}, 9000, true, self()).
-{ok, 0}
-2> arterial_nif:connect_async(PoolRef, 0, {127,0,0,1}, 9001, true, self()).
-{ok, connecting, 1}
-```
-""".
--spec connect_async(pool_ref(), non_neg_integer(), inet:ip4_address(),
-                   arterial:inet_port(), boolean(), pid()) ->
-  {ok, non_neg_integer()} | {ok, connecting, non_neg_integer()} |
-  {error, socket_failed | failed_to_set_nonblocking | connect_failed | stripe_full}.
-connect_async(_PoolRef, _StripeId, _IP, _Port, _Nodelay, _OwnerPid) ->
-  ?NOT_LOADED_ERROR.
-
--doc """
-Open a brand-new IPv4 socket with the specified protocol and connect to
-`IP`:`Port` (waiting up to `TimeoutMs` milliseconds). Supports `tcp`, `udp`,
-and `ssl` protocols. This is the protocol-aware version of `connect/7`.
-
-For `tcp`: behaves identically to `connect/7`.
-For `udp`: creates a UDP socket and optionally "connects" it to the remote address.
-For `ssl`: creates a TCP socket and performs SSL handshake.
-
-`Nodelay` sets `TCP_NODELAY` for TCP/SSL protocols (ignored for UDP).
-
-## Examples
-
-```
-1> arterial_nif:connect_proto(PoolRef, 0, {127,0,0,1}, 9000, 5000, tcp, true, self()).
-{ok, 0}
-2> arterial_nif:connect_proto(PoolRef, 0, {127,0,0,1}, 9001, 5000, udp, false, self()).
-{ok, 1}
-```
-""".
--spec connect_proto(pool_ref(), non_neg_integer(), inet:ip4_address(),
-                   arterial:inet_port(), non_neg_integer(), tcp | udp | ssl, boolean(), pid()) ->
-  {ok, non_neg_integer()} |
-  {error, socket_failed | failed_to_set_nonblocking | connect_failed |
-          timeout       | stripe_full               | unsupported_protocol}.
-connect_proto(_PoolRef, _StripeId, _IP, _Port, _TimeoutMs, _Protocol, _Nodelay, _OwnerPid) ->
-  ?NOT_LOADED_ERROR.
-
--doc """
-Async version of `connect_proto/8`. Opens a socket with the specified protocol
-and starts connecting asynchronously.
-
-## Examples
-
-```
-1> arterial_nif:connect_async_proto(PoolRef, 0, {127,0,0,1}, 9000, tcp, true, self()).
-{ok, connecting, 0}
-2> arterial_nif:connect_async_proto(PoolRef, 0, {127,0,0,1}, 9001, udp, false, self()).
-{ok, 1}
-```
-""".
--spec connect_async_proto(pool_ref(), non_neg_integer(), inet:ip4_address(),
-                         arterial:inet_port(), tcp | udp | ssl, boolean(), pid()) ->
-  {ok, non_neg_integer()} | {ok, connecting, non_neg_integer()} |
-  {error, socket_failed | failed_to_set_nonblocking | connect_failed | stripe_full | unsupported_protocol}.
-connect_async_proto(_PoolRef, _StripeId, _IP, _Port, _Protocol, _Nodelay, _OwnerPid) ->
   ?NOT_LOADED_ERROR.
 
 -doc """
@@ -380,56 +258,6 @@ send_on_slot(_PoolRef, _StripeId, _SlotId, _IoList) ->
   ?NOT_LOADED_ERROR.
 
 -doc """
-Called by a slot's owner process upon receiving
-`{arterial_event, StripeId, SlotId, read}`: reads whatever is
-currently available on the slot's socket (one `ioctl(FIONREAD)` + one
-`read(2)`, synchronously inside the calling process) and re-arms the next
-read-readiness notification.
-
-Returns `{ok, Binary}` (possibly `<<>>` on a spurious wakeup -- still
-re-armed, safe to ignore) with the raw bytes read, or `closed` if the
-peer closed the connection (or the read failed for any other reason) --
-the fd is already gone and deselected by the time this returns; no
-further cleanup call is needed.
-
-## Examples
-
-```
-1> arterial_nif:handle_readable(PoolRef, 0, SlotId).
-{ok, <<"...">>}
-```
-""".
--spec handle_readable(pool_ref(), non_neg_integer(), non_neg_integer()) ->
-  {ok, binary()} | closed.
-handle_readable(_PoolRef, _StripeId, _SlotId) ->
-  ?NOT_LOADED_ERROR.
-
--doc """
-Called by a slot's owner process upon receiving
-`{arterial_event, StripeId, SlotId, write}`: flushes as much of the
-slot's pending write buffer (left over from a `send_and_release/3` that
-couldn't complete immediately) as the kernel will currently accept.
-
-Returns `ok` whether or not the buffer is now fully flushed (re-arming
-the next write-readiness notification itself if not) -- the slot becomes
-available for a new `send_and_release/3` exactly when fully flushed, with
-no separate signal to the original caller (which already got `{ok,
-SlotId}` back from `send_and_release/3` regardless). Returns `closed` if
-the connection died before the buffer could be flushed.
-
-## Examples
-
-```
-1> arterial_nif:handle_writable(PoolRef, 0, SlotId).
-ok
-```
-""".
--spec handle_writable(pool_ref(), non_neg_integer(), non_neg_integer()) ->
-  ok | closed.
-handle_writable(_PoolRef, _StripeId, _SlotId) ->
-  ?NOT_LOADED_ERROR.
-
--doc """
 Force-close slot `SlotId` of stripe `StripeId` (e.g. `arterial_bouncer`
 recycling a connection, or `arterial_connection` tearing one down) --
 deselects and closes its fd without sending any `closed` notification
@@ -447,63 +275,6 @@ ok
 """.
 -spec close_slot(pool_ref(), non_neg_integer(), non_neg_integer()) -> ok.
 close_slot(_PoolRef, _StripeId, _SlotId) ->
-  ?NOT_LOADED_ERROR.
-
--doc """
-Handle connection timeout by cleaning up the connection slot and releasing resources.
-This function should be called when a connection timeout message is received.
-
-## Parameters
-- `PoolRef`: Reference to the connection pool
-- `StripeId`: Stripe identifier
-- `SlotId`: Slot identifier
-
-## Returns
-`ok` on successful cleanup.
-
-## Examples
-```
-% Called when timeout message received
-1> arterial_nif:handle_connection_timeout(PoolRef, StripeId, SlotId).
-ok
-```
-""".
--spec handle_connection_timeout(pool_ref(), non_neg_integer(), non_neg_integer()) -> ok.
-handle_connection_timeout(_PoolRef, _StripeId, _SlotId) ->
-  ?NOT_LOADED_ERROR.
-
--doc """
-Enhanced `connect/7` with socket options support. Like `connect/7` but accepts
-an additional list of socket options to apply to the socket before connecting.
-
-**Basic socket options:**
-- Atoms: `keepalive`, `nodelay`, `reuseaddr`
-- Tuples: `{keepalive, true}`, `{sndbuf, 8192}`, `{rcvbuf, 8192}`, `{priority, 0..6}`, `{tos, integer()}`, `{linger, {boolean(), integer()}}`
-
-**Multicast options (UDP protocol only):**
-- `{multicast_ttl, 0..255}` - Multicast TTL (time-to-live) hop limit
-- `{multicast_loop, boolean()}` - Enable/disable multicast loopback
-- `{multicast_if, {A,B,C,D}}` - Interface address for outgoing multicast packets
-- `{add_membership, {{MA,MB,MC,MD}, {IA,IB,IC,ID}}}` - Join multicast group (multicast addr, interface addr)
-- `{drop_membership, {{MA,MB,MC,MD}, {IA,IB,IC,ID}}}` - Leave multicast group (multicast addr, interface addr)
-
-## Examples
-
-```
-1> arterial_nif:connect_with_opts(PoolRef, 0, {127,0,0,1}, 9000, 5000, true, self(), [keepalive, {sndbuf, 16384}]).
-{ok, SlotId}
-2> % UDP multicast example
-2> arterial_nif:connect_proto_with_opts(PoolRef, 0, {239,1,1,1}, 12345, 5000, udp, false, self(),
-2>   [{multicast_ttl, 16}, {add_membership, {{239,1,1,1}, {0,0,0,0}}}]).
-{ok, SlotId}
-```
-""".
--spec connect_with_opts(pool_ref(), non_neg_integer(), inet:ip4_address(),
-                        arterial:inet_port(), non_neg_integer(), boolean(),
-                        pid(), [atom() | {atom(), term()}]) ->
-  {ok, non_neg_integer()} |
-  {error, socket_failed | failed_to_set_nonblocking | connect_failed | timeout | stripe_full}.
-connect_with_opts(_PoolRef, _StripeId, _IP, _Port, _TimeoutMs, _Nodelay, _OwnerPid, _SocketOpts) ->
   ?NOT_LOADED_ERROR.
 
 -doc """
@@ -692,18 +463,6 @@ reserve_send_fifo_request(_PoolRef, _StripeId, _RequestData, _ReservationTimeout
 %%%-----------------------------------------------------------------------------
 
 -doc """
-Register a correlation id in the per-stripe NIF map before sending a request.
-`StripeId` is the stripe the request was sent on.  `CorrId` is the wire-level
-correlation id.  `CallerPid` is the process waiting for the reply.  `ConnId`
-is the slot index (used by `drain_corr_map/3` on disconnect).  `DeadlineUs`
-is `os:system_time(microsecond) + TimeoutUs` (used by `sweep_corr_map/2`).
-""".
--spec register_corr(pool_ref(), non_neg_integer(), non_neg_integer(),
-                    pid(), non_neg_integer(), integer()) -> ok.
-register_corr(_PoolRef, _StripeId, _CorrId, _CallerPid, _ConnId, _DeadlineUs) ->
-  ?NOT_LOADED_ERROR.
-
--doc """
 Register the correlation entry and send `Data` in a single NIF call.
 Equivalent to `register_corr/6` followed by `send_and_release/3`, but
 avoids the second NIF boundary crossing.  On send failure the correlation
@@ -755,8 +514,9 @@ of `ets:select`.
 sweep_corr_map(_PoolRef, _NowUs) ->
   ?NOT_LOADED_ERROR.
 
-%% --- Reactor server NIFs ---
+%% --- Reactor server NIFs (test-infrastructure only) ---
 
+-ifdef(TEST).
 -doc "Create a non-blocking TCP listen socket. Returns {ok, {Fd, ActualPort}}.".
 reactor_listen(_PoolRef, _Port) -> ?NOT_LOADED_ERROR.
 
@@ -768,6 +528,7 @@ reactor_close_fd(_PoolRef, _Fd) -> ?NOT_LOADED_ERROR.
 
 -doc "Register a client fd with the NIF pool for read events. Returns {ok, SlotId}.".
 reactor_register_client(_PoolRef, _StripeId, _ClientFd, _OwnerPid) -> ?NOT_LOADED_ERROR.
+-endif.
 
 -doc "Return NIF library info.".
 info() -> ?NOT_LOADED_ERROR.
@@ -777,19 +538,24 @@ info() -> ?NOT_LOADED_ERROR.
 %%%-----------------------------------------------------------------------------
 
 -doc false.
+-ifdef(TEST).
+-define(NIF_SO_NAME, "arterial_test").
+-else.
+-define(NIF_SO_NAME, "arterial").
+-endif.
+
 init() ->
   SoName = case code:priv_dir(?LIBNAME) of
     {error, bad_name} ->
       case code:which(?MODULE) of
         Filename when is_list(Filename) ->
           Dir = filename:dirname(filename:dirname(Filename)),
-          filename:join([Dir, "priv", "arterial_nif"]);
+          filename:join([Dir, "priv", ?NIF_SO_NAME]);
         _ ->
-          % More robust fallback using absolute path from current working directory
           {ok, Cwd} = file:get_cwd(),
-          filename:join([Cwd, "_build", "default", "lib", "arterial", "priv", "arterial_nif"])
+          filename:join([Cwd, "_build", "default", "lib", "arterial", "priv", ?NIF_SO_NAME])
       end;
     Dir ->
-      filename:join(Dir, "arterial_nif")
+      filename:join(Dir, ?NIF_SO_NAME)
   end,
   erlang:load_nif(SoName, 0).

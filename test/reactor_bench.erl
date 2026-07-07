@@ -30,6 +30,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -export([run/0, run_with/2, run_with/3, main/1]).
 -export([erl_nif_client_run/4, erl_nif_client_run/5]).
+-export([arterial_client_run/4]).
 
 -define(CONNS,    8).
 -define(REQS,     2_000).
@@ -105,16 +106,16 @@ run_with(NConns, NReqs, MsgSize) ->
     app_version  := TagVsn,
     backend      := Backend,
     pgo          := PGO} = arterial_nif:info(),
-  io:format(standard_error, "~n~n~s~n", [bar(121)]),
+  io:format(standard_error, "~n~n~s~n", [bar(123)]),
   io:format(standard_error,
     "Arterial Reactor -- Seven-Scenario Benchmark (~p -O~p~s v~s (~s))~n",
     [Backend, Opt, if PGO -> " PGO"; true -> "" end, TagVsn, GitVsn]),
   io:format(standard_error,
             "Conns: ~p Stripes: ~p Reqs/conn: ~p  Msg: ~p bytes  Total: ~p~n~n",
             [NConns, NStripes, NReqs, MsgSize, Total]),
-  io:format(standard_error, "~-48s  ~10s  ~8s  ~8s  ~8s  ~8s  ~8s  ~8s~n",
+  io:format(standard_error, "~-50s  ~10s  ~8s  ~8s  ~8s  ~8s  ~8s  ~8s~n",
             ["Scenario","req/s","MB/s","mean µs","p50 µs","p99 µs","p999 µs","err #/%"]),
-  io:format(standard_error, "~s~n", [bar(121)]),
+  io:format(standard_error, "~s~n", [bar(123)]),
 
   Scenarios = [
     {"C++ server (Reactor) <-> C++ client",
@@ -125,10 +126,10 @@ run_with(NConns, NReqs, MsgSize) ->
       fun cpp_server_start/0,
       fun cpp_server_stop/1,
       fun erl_gentcp_client_run/4},
-    {"C++ server (Reactor) <-> Erl client (Reactor)",
+    {"C++ server (Reactor) <-> Erl client (arterial)",
       fun cpp_server_start/0,
       fun cpp_server_stop/1,
-      fun(P, C, R, M) -> erl_nif_client_run(P, C, R, M, NStripes) end},
+      fun(P, C, R, M) -> arterial_client_run(P, C, R, M) end},
     {"C++ server (Reactor) <-> Shackle client",
       fun cpp_server_start/0,
       fun cpp_server_stop/1,
@@ -146,10 +147,10 @@ run_with(NConns, NReqs, MsgSize) ->
       fun() -> erl_nif_server_start(NStripes) end,
       fun erl_nif_server_stop/1,
       fun erl_gentcp_client_run/4},
-    {"Erl server (Reactor) <-> Erl client (Reactor)",
+    {"Erl server (Reactor) <-> Erl client (arterial)",
       fun() -> erl_nif_server_start(NStripes) end,
       fun erl_nif_server_stop/1,
-      fun(P, C, R, M) -> erl_nif_client_run(P, C, R, M, NStripes) end},
+      fun(P, C, R, M) -> arterial_client_run(P, C, R, M) end},
     {"Erl server (Reactor) <-> Shackle client",
       fun() -> erl_nif_server_start(NStripes) end,
       fun erl_nif_server_stop/1,
@@ -167,10 +168,10 @@ run_with(NConns, NReqs, MsgSize) ->
       fun() -> erl_gentcp_server_start(MsgSize) end,
       fun erl_gentcp_server_stop/1,
       fun erl_gentcp_client_run/4},
-    {"Erl server (gen_tcp) <-> Erl client (Reactor)",
+    {"Erl server (gen_tcp) <-> Erl client (arterial)",
       fun() -> erl_gentcp_server_start(MsgSize) end,
       fun erl_gentcp_server_stop/1,
-      fun(P, C, R, M) -> erl_nif_client_run(P, C, R, M, NStripes) end},
+      fun(P, C, R, M) -> arterial_client_run(P, C, R, M) end},
     {"Erl server (gen_tcp) <-> Shackle client",
       fun() -> erl_gentcp_server_start(MsgSize) end,
       fun erl_gentcp_server_stop/1,
@@ -216,7 +217,7 @@ run_with(NConns, NReqs, MsgSize) ->
       I + 1
   end, 1, OrderedTests),
 
-  io:format(standard_error, "~s~n~n", [bar(121)]).
+  io:format(standard_error, "~s~n~n", [bar(123)]).
 
 %% ============================================================
 %% C++ echo server (reactor_bench binary, "server" mode)
@@ -657,6 +658,82 @@ nif_await_frame(StripeId, SlotId, Buf, T0, MsgSize, _Deadline) ->
   end.
 
 %% ============================================================
+%% arterial_client client
+%%
+%% Uses arterial_pool + arterial_client:call/3 with reactor_bench_codec.
+%% N worker processes each loop calling arterial_client:call/3 until the
+%% duration elapses, matching shackle_client_run's structure exactly.
+%% ============================================================
+
+-define(ARTERIAL_POOL, reactor_bench_arterial_pool).
+
+arterial_client_run(ServerPort, NConns, NReqs, MsgSize) ->
+  DurationMs = max(400, NReqs * 2),
+  Payload    = binary:copy(<<0>>, MsgSize - 4),
+  Pool       = ?ARTERIAL_POOL,
+  reactor_bench_codec:set_msg_size(MsgSize),
+  arterial_pool:stop(Pool),
+  {ok, _} = application:ensure_all_started(arterial),
+  {ok, _} = arterial_pool:start_link(Pool, #{
+    size               => NConns,
+    codec              => reactor_bench_codec,
+    address            => "127.0.0.1",
+    port               => ServerPort,
+    default_timeout_ms => ?TIMEOUT
+  }),
+  ok = arterial_pool:wait_connected(Pool, all, 8000),
+  try
+    arterial_bench_run(Pool, NConns, DurationMs, Payload, MsgSize)
+  after
+    arterial_pool:stop(Pool)
+  end.
+
+arterial_bench_run(Pool, NWorkers, DurationMs, Payload, MsgSize) ->
+  Parent   = self(),
+  Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+  T0       = erlang:monotonic_time(microsecond),
+  Pids = [spawn(fun() ->
+    arterial_worker_loop(Pool, Parent, Deadline, Payload, [], 0)
+  end) || _ <- lists:seq(1, NWorkers)],
+  WaitMs  = DurationMs + ?TIMEOUT + 1000,
+  Results = [receive {arterial_done, P, Lats, Errs} -> {Lats, Errs}
+             after WaitMs -> exit({arterial_worker_timeout, P})
+             end || P <- Pids],
+  T1 = erlang:monotonic_time(microsecond),
+  AllLats   = lists:sort(lists:append([L || {L, _} <- Results])),
+  TotalErrs = lists:sum([E || {_, E} <- Results]),
+  Total     = length(AllLats) + TotalErrs,
+  ElapsedUs = T1 - T0,
+  TotalMB   = Total * MsgSize * 2 / (1024 * 1024),
+  #{total      => Total,
+    elapsed_us => ElapsedUs,
+    rps        => Total / (ElapsedUs / 1_000_000),
+    throughput => TotalMB / (ElapsedUs / 1_000_000),
+    lat_mean   => mean(AllLats),
+    lat_p50    => pct(AllLats, 0.50),
+    lat_p99    => pct(AllLats, 0.99),
+    lat_p999   => pct(AllLats, 0.999),
+    errors     => TotalErrs,
+    error_rate => TotalErrs / max(1, Total) * 100.0}.
+
+arterial_worker_loop(Pool, Parent, Deadline, Payload, Lats, Errs) ->
+  case erlang:monotonic_time(millisecond) >= Deadline of
+    true ->
+      Parent ! {arterial_done, self(), Lats, Errs};
+    false ->
+      T0 = erlang:monotonic_time(microsecond),
+      case arterial_client:call(Pool, Payload, ?TIMEOUT) of
+        {ok, _Reply} ->
+          T1 = erlang:monotonic_time(microsecond),
+          arterial_worker_loop(Pool, Parent, Deadline, Payload,
+                               [T1 - T0 | Lats], Errs);
+        {error, _} ->
+          arterial_worker_loop(Pool, Parent, Deadline, Payload,
+                               Lats, Errs + 1)
+      end
+  end.
+
+%% ============================================================
 %% Shackle client
 %%
 %% Uses reactor_bench_shackle_client with the same <<Seq:32/big, Payload>>
@@ -885,5 +962,5 @@ print_row(Label, I,
     true       -> F(ErrPct, 2) ++ "%"
   end,
   io:format(standard_error,
-    "~2w: ~-45s  ~s  ~s  ~s  ~s  ~s  ~s ~9s~n",
+    "~2w: ~-47s  ~s  ~s  ~s  ~s  ~s  ~s ~9s~n",
     [I, Label, F10(RPS), F(MB,2), F(Mean,1), F(P50,1), F(P99,1), F(P999,1), ErrS]).

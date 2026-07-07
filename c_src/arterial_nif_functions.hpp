@@ -19,11 +19,6 @@ static ERL_NIF_TERM configure_throttle_nif(ErlNifEnv* env, int argc, const ERL_N
 //=============================================================================
 
 static ERL_NIF_TERM register_socket_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-static ERL_NIF_TERM connect_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-static ERL_NIF_TERM connect_async_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-static ERL_NIF_TERM connect_proto_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-static ERL_NIF_TERM connect_async_proto_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-static ERL_NIF_TERM connect_with_opts_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM connect_proto_with_opts_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 //=============================================================================
@@ -32,41 +27,22 @@ static ERL_NIF_TERM connect_proto_with_opts_nif(ErlNifEnv* env, int argc, const 
 
 static ERL_NIF_TERM send_and_release_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM send_on_slot_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-static ERL_NIF_TERM handle_readable_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-static ERL_NIF_TERM handle_writable_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 //=============================================================================
 // Slot Management NIFs
 //=============================================================================
 
 static ERL_NIF_TERM close_slot_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-static ERL_NIF_TERM handle_connection_timeout_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 //=============================================================================
-// Reactor server NIFs — pure-NIF listen/accept, no OTP socket involvement.
+// Reactor server NIFs — test-infrastructure only (echo servers, reactor_bench)
 //=============================================================================
-// reactor_listen(PoolRef, Port::integer()) → {ok, ListenFd::integer()} | {error, Reason}
-//   Creates a non-blocking TCP listen socket bound to 127.0.0.1:Port (or any
-//   interface if Port=0 for ephemeral).  Returns the raw fd for use with
-//   reactor_accept.
+#ifdef TEST
 static ERL_NIF_TERM reactor_listen_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-
-// reactor_accept(PoolRef, ListenFd::integer(), OwnerPid::pid()) → ok | {error, Reason}
-//   Registers ListenFd with the pool's Reactor.  Whenever a client connects,
-//   the reactor calls accept4() and sends:
-//     {arterial_accept, ListenFd, ClientFd::integer(), {IP4, Port}}
-//   to OwnerPid.  The server process should then register ClientFd with the
-//   reactor for I/O and re-arm accept if needed (it is persistent/multishot).
 static ERL_NIF_TERM reactor_accept_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-
-// reactor_close_fd(PoolRef, Fd::integer()) → ok
-//   Removes Fd from the reactor and closes it (remove_fd).
 static ERL_NIF_TERM reactor_close_fd_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
-
-// reactor_register_client(PoolRef, StripeId, ClientFd, OwnerPid) → {ok, SlotId} | {error, Reason}
-//   Registers a ClientFd (from reactor_accept) with the NIF pool for read/write
-//   events.  OwnerPid receives {arterial_event, StripeId, SlotId, read, Bin}.
 static ERL_NIF_TERM reactor_register_client_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+#endif
 static ERL_NIF_TERM is_slot_available_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM set_slot_available_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM set_slot_unavailable_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
@@ -86,7 +62,6 @@ static ERL_NIF_TERM reserve_send_fifo_request_nif(ErlNifEnv* env, int argc, cons
 // Corr-map NIFs (in-NIF correlation-id → caller-pid mapping)
 //=============================================================================
 
-static ERL_NIF_TERM register_corr_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM register_and_send_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM unregister_corr_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM lookup_and_remove_corr_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
@@ -123,31 +98,25 @@ static ErlNifFunc nif_funcs[] = {
 
   // Connection management
   {"register_socket",             4, register_socket_nif,           0},
-  {"connect",                     7, connect_nif,                   0},
-  {"connect_async",               6, connect_async_nif,             0},
-  {"connect_proto",               8, connect_proto_nif,             0},
-  {"connect_async_proto",         7, connect_async_proto_nif,       0},
-  {"connect_with_opts",           8, connect_with_opts_nif,         0},
   {"connect_proto_with_opts",     9, connect_proto_with_opts_nif,   0},
 
   // I/O operations
   {"send_and_release",            3, send_and_release_nif,          0},
   {"send_on_slot",                4, send_on_slot_nif,              0},
-  {"handle_readable",             3, handle_readable_nif,           0},
-  {"handle_writable",             3, handle_writable_nif,           0},
 
-  // Reactor server (pure-NIF listen/accept, no OTP socket)
+  // Slot management
+  {"close_slot",                  3, close_slot_nif,                0},
+  {"is_slot_available",           3, is_slot_available_nif,         0},
+  {"set_slot_available",          3, set_slot_available_nif,        0},
+  {"set_slot_unavailable",        3, set_slot_unavailable_nif,      0},
+
+#ifdef TEST
+  // Reactor server (test-infrastructure: echo servers, reactor_bench)
   {"reactor_listen",              2, reactor_listen_nif,            0},
   {"reactor_accept",              3, reactor_accept_nif,            0},
   {"reactor_close_fd",            2, reactor_close_fd_nif,          0},
   {"reactor_register_client",     4, reactor_register_client_nif,   0},
-
-  // Slot management
-  {"close_slot",                  3, close_slot_nif,                0},
-  {"handle_connection_timeout",   3, handle_connection_timeout_nif, 0},
-  {"is_slot_available",           3, is_slot_available_nif,         0},
-  {"set_slot_available",          3, set_slot_available_nif,        0},
-  {"set_slot_unavailable",        3, set_slot_unavailable_nif,      0},
+#endif
 
   // FIFO Mode 3 functions
   {"reserve_fifo_connection",     3, reserve_fifo_connection_nif,   0},
@@ -158,7 +127,6 @@ static ErlNifFunc nif_funcs[] = {
   {"reserve_send_fifo_request",   5, reserve_send_fifo_request_nif, 0},
 
   // Corr-map NIFs
-  {"register_corr",               6, register_corr_nif,             0},
   {"register_and_send",           6, register_and_send_nif,         0},
   {"unregister_corr",             3, unregister_corr_nif,           0},
   {"lookup_and_remove_corr",      3, lookup_and_remove_corr_nif,    0},

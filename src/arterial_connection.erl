@@ -124,6 +124,7 @@ born inside the NIF and never touches Erlang's `socket` module at all.
 -record(state, {
   pfx          :: binary(),
   pool         :: arterial_pool:name(),
+  pool_ref     :: arterial_nif:pool_ref(),
   conn_id      :: non_neg_integer(),
   codec        :: module(),
   addresses    :: [address_entry(), ...],
@@ -195,6 +196,7 @@ init([Pool, ConnID, Opts]) ->
     conn_timeout := ConnTimeout
   } = maps:merge(#{nodelay => true, conn_timeout => 15000}, Opts),
   Codec      = arterial_pool:codec(Pool),
+  PoolRef    = arterial_pool:pool_ref(Pool),
   Addresses   = addresses(Opts),
   Port        = maps:get(port, Opts, undefined),
   Protocol    = maps:get(protocol, Opts, tcp),
@@ -208,6 +210,7 @@ init([Pool, ConnID, Opts]) ->
   {ok, #state{
     pfx          = Pfx,
     pool         = Pool,
+    pool_ref     = PoolRef,
     conn_id      = ConnID,
     codec        = Codec,
     addresses    = Addresses,
@@ -352,10 +355,12 @@ handle_connect_result(Error, #state{pfx = Pfx} = State) ->
 %% handle_read_event/1 removed: the Reactor NIF reads data in C++ and delivers
 %% it directly as {arterial_event, ConnID, 0, read, Binary} — no NIF callback.
 
-append_and_decode(Bin, #state{pfx = Pfx, pool = Pool, codec = Codec,
+append_and_decode(Bin, #state{pfx = Pfx, pool_ref = PoolRef, codec = Codec,
                               buffer = Buffer, conn_id = ConnID} = State) ->
-  NewBuffer = <<Buffer/binary, Bin/binary>>,
-  PoolRef   = arterial_pool:pool_ref(Pool),
+  NewBuffer = case Buffer of
+    <<>> -> Bin;
+    _    -> <<Buffer/binary, Bin/binary>>
+  end,
   try decode_loop(Codec, NewBuffer, PoolRef, ConnID) of
     Rest -> {noreply, State#state{buffer = Rest}}
   catch error:{codec_decode_error, Reason} ->

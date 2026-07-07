@@ -238,7 +238,11 @@ public:
     , m_entries(fd_vec_size)  // value-init: each FdEntry has fd=-1
     , m_cmds(cmds_ring_cap)
   {
-    reactor_add(m_handle, m_wakeup_rd, REACTOR_EV_IN | REACTOR_EV_ET);
+    if (m_handle < 0 || m_wakeup_rd < 0) {
+      m_valid = false;
+      return;
+    }
+    m_valid = (reactor_add(m_handle, m_wakeup_rd, REACTOR_EV_IN | REACTOR_EV_ET) == 0);
   }
 
   ~Reactor() { stop(); }
@@ -283,6 +287,7 @@ public:
   }
 
   bool running() const { return m_running.load(std::memory_order_relaxed); }
+  bool valid()   const { return m_valid; }
 
   //----------------------------------------------------------------------------
   // Registration API (thread-safe — may be called from any thread)
@@ -580,9 +585,7 @@ private:
     FdEntry* e = find_entry(fd);
     if (!e || e->fd < 0) return;
     if (!e->on_readable) return;  // arm_connect: no EPOLLIN needed yet
-    try {
-      reactor_mod(m_handle, fd, REACTOR_EV_IN | REACTOR_EV_RDHUP);
-    } catch (...) {}
+    reactor_mod(m_handle, fd, REACTOR_EV_IN | REACTOR_EV_RDHUP);
     // If data arrived in the narrow window before the poll was registered,
     // dispatch the read handler directly so it isn't silently lost.
     int bytes = 0;
@@ -612,9 +615,7 @@ private:
     uint32_t ev = REACTOR_EV_OUT | REACTOR_EV_RDHUP;
     if (e->on_readable) ev |= REACTOR_EV_IN;
     else                ev |= REACTOR_EV_ET;  // edge-triggered ok for connect-only
-    try {
-      reactor_mod(m_handle, fd, ev);
-    } catch (...) {
+    if (reactor_mod(m_handle, fd, ev) < 0) {
       // fd was closed before the arm_write cmd was processed; treat as gone.
       do_remove_fd(fd);
     }
@@ -638,9 +639,7 @@ private:
 
 #if defined(REACTOR_OS_LINUX)
     // On Linux, timerfd is a real fd — register it for read events.
-    try {
-      reactor_add(m_handle, tid, REACTOR_EV_IN | REACTOR_EV_ONESHOT);
-    } catch (...) {
+    if (reactor_add(m_handle, tid, REACTOR_EV_IN | REACTOR_EV_ONESHOT) < 0) {
       reactor_timerfd_close(m_handle, tid);
       return;
     }
@@ -796,9 +795,7 @@ private:
           // REACTOR_EV_CONNECT alone = success.
           // Install read-interest for subsequent I/O; the caller's on_readable
           // (set via Reactor::connect) is already in e->on_readable.
-          try {
-            reactor_add(m_handle, fd, REACTOR_EV_IN | REACTOR_EV_RDHUP);
-          } catch (...) {}
+          reactor_add(m_handle, fd, REACTOR_EV_IN | REACTOR_EV_RDHUP);
           // Invoke on_writable if set — this is the "connection ready, send
           // first request" callback (equivalent to the epoll write-ready path).
           FdEntry* entry = find_entry(fd);
@@ -848,10 +845,8 @@ private:
       if (uot) uot(ifd, ud);
     };
 
-    try {
-      reactor_add(m_handle, fd,
-                  REACTOR_EV_OUT | REACTOR_EV_IN | REACTOR_EV_ET | REACTOR_EV_RDHUP);
-    } catch (...) {
+    if (reactor_add(m_handle, fd,
+                    REACTOR_EV_OUT | REACTOR_EV_IN | REACTOR_EV_ET | REACTOR_EV_RDHUP) < 0) {
       send_connect_result(pid, stripe, slot, false);
       close_fd();
       return;
@@ -990,6 +985,7 @@ private:
   //----------------------------------------------------------------------------
   // State
   //----------------------------------------------------------------------------
+  bool                    m_valid{true};
   std::string             m_ident;
   reactor_handle_t        m_handle;
   int                     m_wakeup_rd;  ///< eventfd read end

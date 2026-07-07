@@ -17,7 +17,7 @@ compile:
 	rebar3 $@
 
 nif:	# Invoked by rebar3 through compile pre-hook
-	$(MAKE) -C c_src
+	$(MAKE) -C c_src $(if $(findstring /test,$(REBAR_BUILD_DIR)),TEST=1,)
 
 cover:
 	$(REBAR) cover --verbose
@@ -133,6 +133,9 @@ bench-fifo-shackle bench-fifo-shackle-help:
 bench-fifo-all:
 	@$(REBAR) as test compile
 	$(ERL_BENCH) -eval "bench_arterial_fifo:bench_all(), halt()."
+
+bench-reactor:
+	$(REBAR) eunit --module=reactor_bench
 
 clean:
 	$(MAKE) -C c_src $@
