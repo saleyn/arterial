@@ -1,5 +1,6 @@
 #include "arterial_pool.hpp"
 #include "arterial_connection_timer.hxx"  // cancel_connection_timeout
+#include <sys/ioctl.h>
 
 namespace arterial {
 
@@ -13,9 +14,11 @@ namespace arterial {
 //=============================================================================
 
 // Helper: build a callback that runs handle_readable, then sends:
-//   {arterial_event, StripeId, SlotId, data, Binary}  — when data arrives
+//   {arterial_event, StripeId, SlotId, read, Binary}  — when data arrives
 //   {arterial_event, StripeId, SlotId, closed}         — when connection closes
 // to owner_pid so the Erlang arterial_connection can decode and dispatch.
+// All framing and corr-id lookup remain in Erlang; arterial_connection calls
+// lookup_and_remove_corr_nif instead of ets:take to find the waiting caller.
 // Returns 0 to keep registered, -1 to tell the reactor to remove_fd+close.
 static inline ReadHandler make_read_handler(PoolContext* ctx,
                                              unsigned stripe_id,
@@ -23,10 +26,10 @@ static inline ReadHandler make_read_handler(PoolContext* ctx,
 {
   auto& conn    = ctx->stripes[stripe_id]->slots[slot_id];
   uint32_t gen  = conn.generation.load(std::memory_order_acquire);
-  return [ctx, stripe_id, slot_id, gen](int /*fd*/, void*) -> int {
+  return [ctx, stripe_id, slot_id, gen](int fd, void*) -> int {
     auto& c = ctx->stripes[stripe_id]->slots[slot_id];
-    // Guard against slot reuse: if generation changed the slot was closed.
-    if (c.generation.load(std::memory_order_acquire) != gen) return -1;
+    uint32_t cur_gen = c.generation.load(std::memory_order_acquire);
+    if (cur_gen != gen) return -1;
     nifpp::msg_env me;
     auto res = c.handle_readable(me, ctx);
 
@@ -52,7 +55,7 @@ static inline WriteHandler make_write_handler(PoolContext* ctx,
 {
   auto& conn    = ctx->stripes[stripe_id]->slots[slot_id];
   uint32_t gen  = conn.generation.load(std::memory_order_acquire);
-  return [ctx, stripe_id, slot_id, gen](int /*fd*/, void*) -> int {
+  return [ctx, stripe_id, slot_id, gen](int fd_arg, void*) -> int {
     auto& c = ctx->stripes[stripe_id]->slots[slot_id];
     if (c.generation.load(std::memory_order_acquire) != gen) return -1;
     auto res = c.handle_writable(nullptr, ctx);
@@ -92,13 +95,10 @@ static inline ErrorHandler make_error_handler(PoolContext* ctx,
 
 inline int Connection::arm_read(ErlNifEnv* /*env*/, const PoolContext* ctx)
 {
-  // Register the fd with the reactor for persistent read notifications.
-  // With the reactor's edge-triggered multishot mode, this is idempotent:
-  // calling add_fd again on an already-registered fd is harmless (the reactor
-  // treats it as an update). In practice arm_read is called:
-  //   - Once at claim_slot_term (initial registration)
-  //   - From handle_readable/writable to re-arm after an event (no-op here
-  //     since the reactor is persistent — events keep firing automatically)
+  // Register the fd with the reactor for read notifications.
+  // The reactor uses one-shot polls (re-armed automatically after each event
+  // by dispatch()). arm_read is called once at connect time to install the
+  // read handler; subsequent re-arming is done transparently by the reactor.
   auto* mctx = const_cast<PoolContext*>(ctx);
   mctx->reactor().add_fd(
     fd,

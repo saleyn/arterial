@@ -63,6 +63,7 @@
 #include <vector>
 
 #include <netinet/in.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 
 #ifdef REACTOR_TEST_STUB_NIF
@@ -481,6 +482,10 @@ private:
     if (fd == m_wakeup_rd) {
       uint64_t val;
       reactor_eventfd_read(m_wakeup_rd, val);
+#if defined(REACTOR_BACKEND_URING)
+      // One-shot poll: re-arm the wakeup fd so future command posts wake us up.
+      reactor_add(m_handle, m_wakeup_rd, REACTOR_EV_IN | REACTOR_EV_ET);
+#endif
       return;
     }
 
@@ -532,6 +537,16 @@ private:
     if (reactor_is_readable(mask) && e->on_readable) {
       int rc = e->on_readable(fd, e->user_data);
       if (rc < 0) { do_remove_fd(fd); return; }
+#if defined(REACTOR_BACKEND_URING)
+      // One-shot POLL_ADD: re-arm so the next read event is delivered.
+      // do_add_fd / reactor_mod may have posted a fresh POLL_ADD already
+      // (e.g. arm_connect path); reactor_add submits a new SQE regardless.
+      // Duplicate polls are harmless: the second will be cancelled by the
+      // next reactor_mod call or will fire and get dropped (res < 0).
+      // Re-arm only if the fd is still registered (on_readable still set).
+      if (e->on_readable)
+        reactor_add(m_handle, fd, REACTOR_EV_IN | REACTOR_EV_RDHUP);
+#endif
     }
     // Second writable check: handles re-arm after on_writable returned 0
     // and write_armed was set again (e.g. partial send).
@@ -565,19 +580,19 @@ private:
 
   void do_add_fd(int fd)
   {
-    // Register for read interest.  Only adds EPOLLIN if on_readable is set.
     FdEntry* e = find_entry(fd);
     if (!e || e->fd < 0) return;
-    if (!e->on_readable) return;  // arm_connect case: no EPOLLIN needed yet
-
-    // Use LEVEL-TRIGGERED (no EPOLLET) for data sockets so that any data
-    // arriving during the cancel+re-add window of reactor_mod is not silently
-    // lost.  With level-triggered polling, the next reactor_wait iteration
-    // re-fires EPOLLIN as long as unread bytes remain in the kernel buffer,
-    // eliminating the race between arm_read and in-flight server replies.
+    if (!e->on_readable) return;  // arm_connect: no EPOLLIN needed yet
     try {
       reactor_mod(m_handle, fd, REACTOR_EV_IN | REACTOR_EV_RDHUP);
     } catch (...) {}
+    // If data arrived in the narrow window before the poll was registered,
+    // dispatch the read handler directly so it isn't silently lost.
+    int bytes = 0;
+    if (::ioctl(fd, FIONREAD, &bytes) == 0 && bytes > 0 && e->on_readable) {
+      int rc = e->on_readable(fd, e->user_data);
+      if (rc < 0) do_remove_fd(fd);
+    }
   }
 
   void do_remove_fd(int fd)

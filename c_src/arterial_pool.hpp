@@ -9,7 +9,7 @@
 #include <vector>
 #include <memory>
 #include <unistd.h>
-#include <numeric> // Required for std::accumulate
+#include <numeric>
 
 namespace arterial {
 
@@ -19,6 +19,175 @@ namespace arterial {
 // Pool Stripe Management
 //===========================================================================
 
+
+// One slot in the lock-free corr table.
+//
+// Protocol (all transitions via CAS on `key`):
+//   key == 0          → slot is empty, available for insert
+//   key == UINT32_MAX → slot is being written/cleared (transient claim)
+//   key == CorrId     → slot holds a live entry for CorrId
+//
+// Payload fields (caller_pid, conn_id, deadline_us) are written exactly once
+// (between CAS 0→UINT32_MAX and the final store to CorrId), and read exactly
+// once (between CAS CorrId→UINT32_MAX and the final store to 0).
+// The release/acquire on the key stores/loads provides the necessary ordering.
+struct CorrSlot {
+  std::atomic<uint32_t> key{0};
+  ErlNifPid             caller_pid{};
+  uint32_t              conn_id{0};
+  int64_t               deadline_us{0};
+
+  // Atomics are not copyable; provide explicit payload-only copy helpers.
+  CorrSlot() = default;
+  CorrSlot(const CorrSlot&) = delete;
+  CorrSlot& operator=(const CorrSlot&) = delete;
+
+  // Copy payload fields from a slot that is currently claimed (key==TOMBSTONE),
+  // so no other thread will touch the payload until we finish.
+  void copy_payload_from(const CorrSlot& src) {
+    caller_pid  = src.caller_pid;
+    conn_id     = src.conn_id;
+    deadline_us = src.deadline_us;
+  }
+};
+
+// Snapshot of a claimed slot's payload — plain copyable struct passed to callbacks.
+struct CorrPayload {
+  ErlNifPid caller_pid;
+  uint32_t  conn_id;
+  int64_t   deadline_us;
+};
+
+// Lock-free open-addressing corr table backed by a power-of-2 flat array.
+// Each PoolStripe owns one; size is fixed at pool init time.
+struct CorrTable {
+  static constexpr uint32_t EMPTY     = 0u;
+  static constexpr uint32_t TOMBSTONE = UINT32_MAX;
+
+  // Raw heap array — avoids std::vector's copy/move requirements on CorrSlot.
+  std::unique_ptr<CorrSlot[]> slots;
+  uint32_t                    mask{0};
+
+  void init(uint32_t size) {
+    slots = std::make_unique<CorrSlot[]>(size);
+    mask  = size - 1u;
+  }
+
+  // Insert entry for corr_id.  Returns true on success, false if table full.
+  //
+  // Two-pass probe to preserve the lazy-deletion invariant:
+  //   Pass 1 — scan from home slot until EMPTY; record first TOMBSTONE seen.
+  //            If corr_id already live, bail (duplicate — shouldn't happen in
+  //            normal use, but safe).
+  //   Pass 2 — claim the tombstone recorded in pass 1 (if any), or the first
+  //            EMPTY slot encountered; write payload; publish corr_id.
+  //
+  // This keeps probe chains intact: TOMBSTONE marks "something was here, keep
+  // probing" while EMPTY is the definitive chain terminator.
+  bool insert(uint32_t corr_id, ErlNifPid pid, uint32_t conn_id, int64_t deadline_us) {
+    uint32_t idx      = corr_id & mask;
+    uint32_t tomb_idx = UINT32_MAX;  // index of first tombstone seen
+    bool     found_empty = false;
+
+    // Pass 1: scan from home slot; stop at EMPTY (chain end).
+    // Record the first tombstone seen along the way.
+    for (uint32_t i = 0; i <= mask; ++i, idx = (idx + 1) & mask) {
+      uint32_t k = slots[idx].key.load(std::memory_order_acquire);
+      if (k == corr_id) return false;   // duplicate — already present
+      if (k == TOMBSTONE && tomb_idx == UINT32_MAX) tomb_idx = idx;
+      if (k == EMPTY) { found_empty = true; break; }
+    }
+
+    // If no empty slot and no tombstone, the table is genuinely full.
+    if (!found_empty && tomb_idx == UINT32_MAX) return false;
+
+    // Pass 2: claim tombstone if one was seen (preferred — recycles space),
+    // otherwise claim the empty slot at idx.
+    uint32_t target   = (tomb_idx != UINT32_MAX) ? tomb_idx : idx;
+    uint32_t expected = (tomb_idx != UINT32_MAX) ? TOMBSTONE : EMPTY;
+
+    if (!slots[target].key.compare_exchange_strong(
+          expected, TOMBSTONE,
+          std::memory_order_acquire, std::memory_order_relaxed)) [[unlikely]]
+      return false;  // lost the race; caller retries at the NIF layer if needed
+
+    slots[target].caller_pid   = pid;
+    slots[target].conn_id      = conn_id;
+    slots[target].deadline_us  = deadline_us;
+    slots[target].key.store(corr_id, std::memory_order_release);
+    return true;
+  }
+
+  // Remove entry for corr_id and return its payload.  Returns true if found.
+  //
+  // Leaves TOMBSTONE (not EMPTY) so probe chains for other keys that hashed
+  // past this slot remain intact.  Average O(1) at low load factor.
+  bool remove(uint32_t corr_id, CorrPayload& out) {
+    uint32_t idx = corr_id & mask;
+    for (uint32_t i = 0; i <= mask; ++i, idx = (idx + 1) & mask) {
+      uint32_t k = slots[idx].key.load(std::memory_order_acquire);
+      if (k == EMPTY) return false;   // chain terminated — not present
+      if (k != corr_id) continue;
+      if (slots[idx].key.compare_exchange_strong(
+            k, TOMBSTONE, std::memory_order_acquire, std::memory_order_relaxed)) {
+        out = {slots[idx].caller_pid, slots[idx].conn_id, slots[idx].deadline_us};
+        // Leave TOMBSTONE in place — do NOT store EMPTY here.
+        return true;
+      }
+      // CAS failed: another thread just claimed this exact slot.
+      return false;
+    }
+    return false;
+  }
+
+  // Erase entry for corr_id without returning payload (e.g. on send failure).
+  void erase(uint32_t corr_id) {
+    CorrPayload ignored;
+    remove(corr_id, ignored);
+  }
+
+  // Scan all slots; for entries with conn_id == target_conn, claim and call fn.
+  template<typename Fn>
+  void drain_by_conn(uint32_t target_conn, Fn&& fn) {
+    for (uint32_t i = 0; i <= mask; ++i) {
+      uint32_t k = slots[i].key.load(std::memory_order_acquire);
+      if (k == EMPTY || k == TOMBSTONE) continue;
+      if (slots[i].conn_id != target_conn) continue;
+      if (slots[i].key.compare_exchange_strong(
+            k, TOMBSTONE, std::memory_order_acquire, std::memory_order_relaxed)) {
+        CorrPayload p{slots[i].caller_pid, slots[i].conn_id, slots[i].deadline_us};
+        slots[i].key.store(EMPTY, std::memory_order_release);
+        fn(k, p);
+      }
+    }
+  }
+
+  // Scan all slots; for entries with deadline_us < now_us, claim and call fn.
+  template<typename Fn>
+  void sweep_expired(int64_t now_us, Fn&& fn) {
+    for (uint32_t i = 0; i <= mask; ++i) {
+      uint32_t k = slots[i].key.load(std::memory_order_acquire);
+      if (k == EMPTY || k == TOMBSTONE) continue;
+      if (slots[i].deadline_us >= now_us) continue;
+      if (slots[i].key.compare_exchange_strong(
+            k, TOMBSTONE, std::memory_order_acquire, std::memory_order_relaxed)) {
+        CorrPayload p{slots[i].caller_pid, slots[i].conn_id, slots[i].deadline_us};
+        slots[i].key.store(EMPTY, std::memory_order_release);
+        fn(k, p);
+      }
+    }
+  }
+
+  // Approximate live-entry count (may race with concurrent inserts/removes).
+  std::size_t count() const {
+    std::size_t n = 0;
+    for (uint32_t i = 0; i <= mask; ++i) {
+      uint32_t k = slots[i].key.load(std::memory_order_relaxed);
+      if (k != EMPTY && k != TOMBSTONE) ++n;
+    }
+    return n;
+  }
+};
 
 // Individual stripe within a connection pool
 // Contains up to 64 connection slots and associated FIFO queue
@@ -33,6 +202,10 @@ struct PoolStripe {
   size_t                capacity{0};      // Max slots capacity in this stripe
   uint64_t              capacity_mask{0};
   FifoReservationQueue  fifo_queue{};     // FIFO reservation queue (optional)
+
+  // Lock-free per-stripe correlation table (replaces ETS + mutex).
+  // Initialized by PoolContext::initialize() after construction.
+  CorrTable             corr_table;
 
   //===========================================================================
   // Stripe Operations

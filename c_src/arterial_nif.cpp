@@ -44,14 +44,29 @@ using namespace arterial;
 // NIFs
 //===========================================================================
 
+// Round up to the next power of two (returns 1 for n=0).
+static inline uint32_t next_pow2(uint32_t n) {
+  if (n == 0) return 1;
+  --n;
+  n |= n >>  1; n |= n >>  2; n |= n >>  4;
+  n |= n >>  8; n |= n >> 16;
+  return n + 1;
+}
+
+// init_pool(NumStripes, SlotsPerStripe)
+// init_pool(NumStripes, SlotsPerStripe, CorrTableSize)
+//
+// CorrTableSize (optional): number of slots in each stripe's lock-free corr
+// table.  Must be a power of 2; if not, it is rounded up.  When omitted the
+// default is max(256, next_pow2(SlotsPerStripe * 16)).
 static ERL_NIF_TERM init_pool_nif(
   ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
 {
-  // Debug: Test if debug logging works at all
   unsigned int num_stripes;
   unsigned int slots_per_stripe;
 
-  assert(argc == 2);
+  if (argc < 2 || argc > 3) [[unlikely]]
+    return enif_make_badarg(env);
 
   if (!get(env, argv[0], num_stripes) ||
       !get(env, argv[1], slots_per_stripe)) [[unlikely]]
@@ -59,6 +74,17 @@ static ERL_NIF_TERM init_pool_nif(
 
   if (slots_per_stripe > 64)
     return make_tuple(env, am_error, am_max_slots_exceeded_64);
+
+  // Determine corr table size per stripe.
+  uint32_t corr_size;
+  if (argc == 3) {
+    unsigned int requested;
+    if (!get(env, argv[2], requested) || requested == 0) [[unlikely]]
+      return enif_make_badarg(env);
+    corr_size = next_pow2(requested);
+  } else {
+    corr_size = std::max(256u, next_pow2(slots_per_stripe * 16));
+  }
 
   auto ctx = construct_resource<PoolContext>();
 
@@ -69,6 +95,7 @@ static ERL_NIF_TERM init_pool_nif(
     ctx->stripes[i] = std::make_unique<PoolStripe>();
     auto& stripe = *ctx->stripes[i];
     stripe.capacity = slots_per_stripe;
+    stripe.corr_table.init(corr_size);
 
     // Initialize lease mask: 0 = available, 1 = leased
     // Set all slots beyond capacity as permanently leased (unavailable)
@@ -86,8 +113,6 @@ static ERL_NIF_TERM init_pool_nif(
   }
 
   // Start the reactor — it runs on its own thread for this pool's lifetime.
-  // Pass the calling process as owner so it receives
-  // {arterial_reactor_exit, Ident, Errno} if the reactor exits abnormally.
   ErlNifPid owner_pid;
   enif_self(env, &owner_pid);
   ctx->reactor_ptr = std::make_unique<arterial::Reactor>("arterial_pool");
@@ -1490,6 +1515,164 @@ static ERL_NIF_TERM reserve_send_fifo_request_nif(
 #  endif
 #endif
 
+//-----------------------------------------------------------------------------
+// register_corr(PoolRef, StripeId, CorrId, CallerPid, ConnId, DeadlineUs)
+//   → ok | {error, table_full}
+//-----------------------------------------------------------------------------
+static ERL_NIF_TERM register_corr_nif(
+  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
+{
+  PoolContext* ctx;
+  unsigned int stripe_id, corr_id, conn_id;
+  ErlNifPid    caller_pid;
+  ErlNifSInt64 deadline_us;
+
+  assert(argc == 6);
+
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count - 1))
+    || !get(env, argv[2], corr_id)
+    || !enif_get_local_pid(env, argv[3], &caller_pid)
+    || !get(env, argv[4], conn_id)
+    || !enif_get_int64(env, argv[5], &deadline_us)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  auto& ct = ctx->stripes[stripe_id]->corr_table;
+  if (!ct.insert(corr_id, caller_pid,
+                 static_cast<uint32_t>(conn_id),
+                 static_cast<int64_t>(deadline_us))) [[unlikely]]
+    return make_tuple(env, am_error, enif_make_atom(env, "table_full"));
+  return am_ok;
+}
+
+//-----------------------------------------------------------------------------
+// unregister_corr(PoolRef, StripeId, CorrId) → ok
+//-----------------------------------------------------------------------------
+static ERL_NIF_TERM unregister_corr_nif(
+  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
+{
+  PoolContext* ctx;
+  unsigned int stripe_id, corr_id;
+
+  assert(argc == 3);
+
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count - 1))
+    || !get(env, argv[2], corr_id)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  ctx->stripes[stripe_id]->corr_table.erase(corr_id);
+  return am_ok;
+}
+
+//-----------------------------------------------------------------------------
+// lookup_and_remove_corr(PoolRef, StripeId, CorrId)
+//   → {CallerPid, ConnId} | not_found
+//-----------------------------------------------------------------------------
+static ERL_NIF_TERM lookup_and_remove_corr_nif(
+  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
+{
+  PoolContext* ctx;
+  unsigned int stripe_id, corr_id;
+
+  assert(argc == 3);
+
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count - 1))
+    || !get(env, argv[2], corr_id)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  CorrPayload out;
+  if (!ctx->stripes[stripe_id]->corr_table.remove(corr_id, out))
+    return enif_make_atom(env, "not_found");
+
+  return enif_make_tuple2(env,
+    enif_make_pid(env, &out.caller_pid),
+    enif_make_uint(env, out.conn_id));
+}
+
+//-----------------------------------------------------------------------------
+// corr_count(PoolRef, StripeId) → Count::non_neg_integer()
+//-----------------------------------------------------------------------------
+static ERL_NIF_TERM corr_count_nif(
+  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
+{
+  PoolContext* ctx;
+  unsigned int stripe_id;
+
+  assert(argc == 2);
+
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count - 1))) [[unlikely]]
+    return enif_make_badarg(env);
+
+  return enif_make_uint(env,
+    static_cast<unsigned int>(ctx->stripes[stripe_id]->corr_table.count()));
+}
+
+//-----------------------------------------------------------------------------
+// drain_corr_map(PoolRef, StripeId, ConnId) → ok
+// Removes all entries for ConnId and sends {arterial_disconnected, CorrId}
+// to each waiting caller.
+//-----------------------------------------------------------------------------
+static ERL_NIF_TERM drain_corr_map_nif(
+  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
+{
+  PoolContext* ctx;
+  unsigned int stripe_id, conn_id;
+
+  assert(argc == 3);
+
+  if  (!get(env, argv[0], ctx)
+    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count - 1))
+    || !get(env, argv[2], conn_id)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  ctx->stripes[stripe_id]->corr_table.drain_by_conn(conn_id,
+    [](uint32_t cid, CorrPayload p) {
+      nifpp::msg_env me;
+      auto msg = nifpp::make(me,
+        std::make_tuple(am_arterial_disconnected, static_cast<unsigned int>(cid)));
+      enif_send(nullptr, &p.caller_pid, me, msg);
+    });
+
+  return am_ok;
+}
+
+//-----------------------------------------------------------------------------
+// sweep_corr_map(PoolRef, NowUs) → ExpiredCount::integer()
+// Scans all stripes for entries whose deadline has passed and sends
+// {arterial_timeout, CorrId} to each expired caller.
+//-----------------------------------------------------------------------------
+static ERL_NIF_TERM sweep_corr_map_nif(
+  ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
+{
+  PoolContext* ctx;
+  ErlNifSInt64 now_us;
+
+  assert(argc == 2);
+
+  if  (!get(env, argv[0], ctx)
+    || !enif_get_int64(env, argv[1], &now_us)) [[unlikely]]
+    return enif_make_badarg(env);
+
+  unsigned int expired_count = 0;
+
+  for (std::size_t s = 0; s < ctx->stripe_count; ++s) {
+    ctx->stripes[s]->corr_table.sweep_expired(static_cast<int64_t>(now_us),
+      [&](uint32_t cid, CorrPayload p) {
+        nifpp::msg_env me;
+        auto msg = nifpp::make(me,
+          std::make_tuple(am_arterial_timeout, static_cast<unsigned int>(cid)));
+        enif_send(nullptr, &p.caller_pid, me, msg);
+        ++expired_count;
+      });
+  }
+
+  return enif_make_uint(env, expired_count);
+}
+
+//-----------------------------------------------------------------------------
 static ERL_NIF_TERM info_nif(ErlNifEnv* env, int argc, [[maybe_unused]] const ERL_NIF_TERM argv[])
 {
   if (argc != 0) [[unlikely]]

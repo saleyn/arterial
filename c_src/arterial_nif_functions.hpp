@@ -83,6 +83,17 @@ static ERL_NIF_TERM handle_fifo_reply_nif(ErlNifEnv* env, int argc, const ERL_NI
 static ERL_NIF_TERM reserve_send_fifo_request_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 //=============================================================================
+// Corr-map NIFs (in-NIF correlation-id → caller-pid mapping)
+//=============================================================================
+
+static ERL_NIF_TERM register_corr_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM unregister_corr_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM lookup_and_remove_corr_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM corr_count_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM drain_corr_map_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM sweep_corr_map_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
+//=============================================================================
 // Misc NIFs
 //=============================================================================
 
@@ -106,6 +117,7 @@ static void unload(ErlNifEnv* env, void* priv_data);
 static ErlNifFunc nif_funcs[] = {
   // Core pool management
   {"init_pool",                   2, init_pool_nif,                 0},
+  {"init_pool",                   3, init_pool_nif,                 0},
   {"configure_throttle",          3, configure_throttle_nif,        0},
 
   // Connection management
@@ -143,6 +155,14 @@ static ErlNifFunc nif_funcs[] = {
   {"fifo_connection_status",      3, fifo_connection_status_nif,    0},
   {"handle_fifo_reply",           4, handle_fifo_reply_nif,         0},
   {"reserve_send_fifo_request",   5, reserve_send_fifo_request_nif, 0},
+
+  // Corr-map NIFs
+  {"register_corr",               6, register_corr_nif,             0},
+  {"unregister_corr",             3, unregister_corr_nif,           0},
+  {"lookup_and_remove_corr",      3, lookup_and_remove_corr_nif,    0},
+  {"corr_count",                  2, corr_count_nif,                0},
+  {"drain_corr_map",              3, drain_corr_map_nif,            0},
+  {"sweep_corr_map",              2, sweep_corr_map_nif,            0},
 
   {"info",                        0, info_nif,                      0},
 };

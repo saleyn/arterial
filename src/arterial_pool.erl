@@ -84,7 +84,7 @@ theoretically create more connections by increasing slots per stripe.
 -export([start_link/2, stop/1]).
 -export([init/1]).
 -export([sup_name/1]).
--export([pool_ref/1, codec/1, size/1, default_timeout_ms/1, throttle/1, corr_table/1]).
+-export([pool_ref/1, codec/1, size/1, default_timeout_ms/1, throttle/1]).
 -export([set_available/2, set_unavailable/2, is_available/2, wait_connected/2, wait_connected/3]).
 
 -doc "The atom identifying a pool; shared with `arterial_nif:pool_ref/0`'s owner.".
@@ -290,10 +290,6 @@ stop(Name) ->
     undefined -> ok;
     Pid       -> _ = supervisor:stop(Pid)
   end,
-  case ets:whereis(corr_table(Name)) of
-    undefined -> ok;
-    _Tid      -> ets:delete(corr_table(Name))
-  end,
   lists:foreach(fun(Key) -> persistent_term:erase(Key) end, [
     pool_key(Name), codec_key(Name), size_key(Name),
     timeout_key(Name), throttle_key(Name)
@@ -328,12 +324,6 @@ init([Name, Opts]) ->
       Error -> {Error, #{result => error}}
     end
   end),
-
-  CorrTable = corr_table(Name),
-  ets:new(CorrTable, [
-    set, public, named_table,
-    {read_concurrency, true}, {write_concurrency, true}
-  ]),
 
   persistent_term:put(pool_key(Name),    PoolRef),
   persistent_term:put(codec_key(Name),   Codec),
@@ -424,10 +414,6 @@ default_timeout_ms(Name) -> get_pt(timeout_key(Name), Name).
 -doc "`Name`'s throttle state, or `undefined` if throttling is disabled. Returns `{RatePerSec, WindowMsec}`.".
 -spec throttle(name()) -> undefined | {pos_integer(), pos_integer()}.
 throttle(Name) -> get_pt(throttle_key(Name), Name).
-
--doc "The name of `Name`'s public correlation-id ETS table.".
--spec corr_table(name()) -> atom().
-corr_table(Name) -> list_to_atom("arterial_corr_" ++ atom_to_list(Name)).
 
 -doc "Mark connection `ConnID` of `Name` available for new sends.".
 -spec set_available(name(), non_neg_integer()) -> ok.

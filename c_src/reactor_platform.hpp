@@ -332,12 +332,14 @@ inline void reactor_add(reactor_handle_t h, int fd, uint32_t ev)
     sqe = io_uring_get_sqe(&ring);
     if (!sqe) throw std::runtime_error("io_uring SQ full");
   }
-  // Use IORING_POLL_ADD_MULTI for persistent (level-triggered) notifications.
-  // One-shot registrations (REACTOR_EV_ONESHOT) skip the multishot flag so they
-  // fire exactly once and auto-remove from the ring.
+  // Use one-shot POLL_ADD (no IORING_POLL_ADD_MULTI).  After the CQE fires,
+  // reactor_wait re-arms the fd by calling reactor_add again.  This avoids the
+  // cancel-race with POLL_ADD_MULTI: a fired multishot stays in the kernel's
+  // active-request list, so cancel-by-user_data can match the wrong SQE
+  // (old active multishot vs. new pending one-shot).  One-shot polls have a
+  // clean lifecycle: fire → gone → re-arm, making reactor_del a no-op in the
+  // common case and eliminating the entire race class.
   io_uring_prep_poll_add(sqe, fd, ev);
-  if (!(ev & REACTOR_EV_ONESHOT))
-    sqe->len |= IORING_POLL_ADD_MULTI;
   io_uring_sqe_set_data64(sqe, reactor_userdata(fd, ReactorOp::PollAdd));
   io_uring_submit(&ring);
 }
@@ -348,16 +350,19 @@ inline void reactor_del(reactor_handle_t h, int fd)
   auto* sqe  = io_uring_get_sqe(&ring);
   if (!sqe) { io_uring_submit(&ring); sqe = io_uring_get_sqe(&ring); }
   if (!sqe) return; // best-effort
-  io_uring_prep_cancel64(sqe, reactor_userdata(fd, ReactorOp::PollAdd), 0);
+  io_uring_prep_cancel64(sqe, reactor_userdata(fd, ReactorOp::PollAdd),
+                         IORING_ASYNC_CANCEL_ALL);
   io_uring_sqe_set_data64(sqe, reactor_userdata(fd, ReactorOp::Cancel));
   io_uring_submit(&ring);
 }
 
 inline void reactor_mod(reactor_handle_t h, int fd, uint32_t ev)
 {
-  // io_uring doesn't support IORING_POLL_ADD_MULTI in POLL_UPDATE flags
-  // (EINVAL).  Cancel the existing poll and re-add with new events instead.
-  reactor_del(h, fd);
+  // With one-shot polls (no IORING_POLL_ADD_MULTI), the previous poll has
+  // already fired and is gone from the kernel's active-request list by the
+  // time reactor_mod is called.  A cancel-then-add sequence is therefore
+  // unnecessary — the cancel finds the NEW poll (not yet activated) and
+  // cancels it instead, silencing future reads.  Just add the new poll.
   reactor_add(h, fd, ev);
 }
 

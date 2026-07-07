@@ -58,8 +58,8 @@ do_call(Pool, Request, Timeout) ->
   Data   = iolist_to_binary(Codec:encode_request(CorrId, Request)),
   Size   = arterial_pool:size(Pool),
   case send_to_any(Pool, Size, [], CorrId, Data, Timeout) of
-    ok ->
-      await_reply(Pool, CorrId, Timeout);
+    {ok, ConnID} ->
+      await_reply(Pool, CorrId, ConnID, Timeout);
     {error, _} = Error ->
       Error
   end.
@@ -120,24 +120,22 @@ send_to_any(Pool, Size, Tried, CorrId, Data, Timeout) ->
       {error, no_connection};
     ConnID ->
       case try_send(Pool, ConnID, CorrId, Data, Timeout) of
-        ok    -> ok;
+        ok    -> {ok, ConnID};
         retry -> send_to_any(Pool, Size, [ConnID | Tried], CorrId, Data, Timeout)
       end
   end.
 
 try_send(Pool, ConnID, CorrId, Data, Timeout) ->
-  CorrTable = arterial_pool:corr_table(Pool),
-  TS        = os:system_time(microsecond),
-  Deadline  = arterial_util:calc_expiration(TS, Timeout),
-  %% Inserted before sending: the reply (or even a disconnect) can only
-  %% ever be noticed by arterial_connection after the write below
-  %% returns, so there's no risk of it being decoded and dropped for
-  %% lack of a matching entry yet.
-  ets:insert(CorrTable, {CorrId, self(), ConnID, Deadline}),
-  PoolRef = arterial_pool:pool_ref(Pool),
+  PoolRef  = arterial_pool:pool_ref(Pool),
+  TS       = os:system_time(microsecond),
+  Deadline = arterial_util:calc_expiration(TS, Timeout),
+  %% Registered before sending: a reply or disconnect can only be observed
+  %% by arterial_connection after the write below returns, so there is no
+  %% risk of a lookup racing ahead of the insert.
+  arterial_nif:register_corr(PoolRef, ConnID, CorrId, self(), 0, Deadline),
   case (arterial_observe:dispatcher()):send_and_release(Pool, PoolRef, ConnID, Data) of
-    {ok, _SlotId}    -> ok;
-    {error, _Reason} -> ets:delete(CorrTable, CorrId), retry
+    {ok,    _SlotId} -> ok;
+    {error, _Reason} -> arterial_nif:unregister_corr(PoolRef, ConnID, CorrId), retry
   end.
 
 send_cast_to_any(_Pool, Size, Tried, _Data) when length(Tried) >= Size ->
@@ -154,43 +152,33 @@ send_cast_to_any(Pool, Size, Tried, Data) ->
       end
   end.
 
-await_reply(Pool, CorrId, Timeout) ->
+await_reply(Pool, CorrId, ConnID, Timeout) ->
   receive
     {arterial_reply,        CorrId, Reply} -> {ok, Reply};
-    {arterial_disconnected, Pool,  CorrId} -> {error, disconnected};
-    {arterial_timeout,      Pool,  CorrId} -> {error, timeout};
+    {arterial_disconnected, CorrId}        -> {error, disconnected};
+    {arterial_timeout,      CorrId}        -> {error, timeout};
     {telemetry_event, _, _, _} ->
-      % Telemetry events from test handlers should not interfere with reply waiting
-      await_reply(Pool, CorrId, Timeout);
+      await_reply(Pool, CorrId, ConnID, Timeout);
     {'EXIT', _Pid, _Reason} ->
-      % Filter out stray EXIT messages from linked processes (common in test environments)
-      % These can accumulate in the mailbox when trap_exit is true and interfere with replies
-      await_reply(Pool, CorrId, Timeout);
+      await_reply(Pool, CorrId, ConnID, Timeout);
     {arterial_event, _StripeId, _SlotId, _Event} ->
-      % Filter out stray arterial_event messages that might be sent to wrong process
-      % These should normally go to the connection process, not the client
-      await_reply(Pool, CorrId, Timeout);
+      await_reply(Pool, CorrId, ConnID, Timeout);
     {arterial_reply, _OtherCorrId, _Reply} ->
-      % Filter out arterial replies with mismatched correlation IDs
-      % These can happen when processes are reused or messages cross over between tests
-      await_reply(Pool, CorrId, Timeout);
-    {arterial_disconnected, _OtherPool, _OtherCorrId} ->
-      % Filter out disconnect messages from other pools/correlation IDs
-      await_reply(Pool, CorrId, Timeout);
-    {arterial_timeout, _OtherPool, _OtherCorrId} ->
-      % Filter out timeout messages from other pools/correlation IDs
-      await_reply(Pool, CorrId, Timeout);
+      await_reply(Pool, CorrId, ConnID, Timeout);
+    {arterial_disconnected, _OtherCorrId} ->
+      await_reply(Pool, CorrId, ConnID, Timeout);
+    {arterial_timeout, _OtherCorrId} ->
+      await_reply(Pool, CorrId, ConnID, Timeout);
     {slow_result, _Result} ->
-      % Filter out messages from spawned processes in tests (like bounce tests)
-      % These are internal test communication and should not interfere
-      await_reply(Pool, CorrId, Timeout);
+      await_reply(Pool, CorrId, ConnID, Timeout);
     {result, _N, _Result} ->
-      % Filter out concurrent test result messages
-      await_reply(Pool, CorrId, Timeout);
+      await_reply(Pool, CorrId, ConnID, Timeout);
     Other ->
       error({invalid_reply, Other, #{pool => Pool, corr_id => CorrId}})
   after Timeout ->
-    ets:delete(arterial_pool:corr_table(Pool), CorrId),
+    %% Eagerly remove the NIF entry so the sweeper doesn't send a
+    %% redundant {arterial_timeout, CorrId} into a stale mailbox.
+    arterial_nif:unregister_corr(arterial_pool:pool_ref(Pool), ConnID, CorrId),
     {error, timeout}
   end.
 

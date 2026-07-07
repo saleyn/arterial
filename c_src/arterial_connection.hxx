@@ -139,8 +139,8 @@ Connection::handle_readable(ErlNifEnv* env, PoolContext* ctx)
     return ReadResultData(ReadResult::CLOSED);
   }
 
-  // No arm_read: the reactor's persistent multishot EPOLLIN poll registered
-  // at connect time continuously delivers read events without re-registration.
+  // No arm_read here: dispatch() re-arms the one-shot EPOLLIN poll after
+  // each read event, so reads keep firing without explicit re-registration.
 
   // FIFO Mode 3: if this slot is reserved, deliver reply directly
   // to the waiting caller instead of returning bytes for codec decoding.
@@ -437,6 +437,7 @@ Connection::connect_proto(ErlNifEnv* env, PoolContext* ctx,
       // Transfer socket ownership to connection after successful claiming
       stripe.slots[slot_id].fd = socket_fd.release();
       stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
+      stripe.slots[slot_id].arm_read(env, ctx);
       return ConnectResultData(ConnectResult::OK, slot_id);
     }
   } else if (errno == EINPROGRESS) {
@@ -525,6 +526,7 @@ Connection::connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
       stripe.slots[slot_id].fd = socket_fd.release();
       // Clear the lease mask bit to make the conn available for send_and_release
       stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
+      stripe.slots[slot_id].arm_read(env, ctx);
     }
 
     return slot_id < 0
@@ -597,6 +599,7 @@ Connection::connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
       // Transfer socket ownership to connection after successful claiming
       stripe.slots[slot_id].fd = socket_fd.release();
       stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
+      stripe.slots[slot_id].arm_read(env, ctx);
       return ConnectResultData(ConnectResult::OK, slot_id);
     }
   } else if (errno == EINPROGRESS) {
@@ -714,15 +717,20 @@ Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
   unsigned int i = 0;
   size_t total_bytes = 0;
 
-  list_for_each(env, data_list, [&](ERL_NIF_TERM item) {
-    ErlNifBinary bin;
-    if (enif_inspect_binary(env, item, &bin)) {
-      iov[i].iov_base = bin.data;
-      iov[i].iov_len = bin.size;
-      total_bytes += bin.size;
-      i++;
+  // Iterate raw list cells; get() would attempt integer coercion for ERL_NIF_TERM,
+  // so we use enif_get_list_cell directly to keep each element as a term.
+  {
+    ERL_NIF_TERM head, tail = data_list;
+    while (enif_get_list_cell(env, tail, &head, &tail)) {
+      ErlNifBinary bin;
+      if (enif_inspect_binary(env, head, &bin)) {
+        iov[i].iov_base = bin.data;
+        iov[i].iov_len  = bin.size;
+        total_bytes     += bin.size;
+        i++;
+      }
     }
-  }); 
+  }
 
   ssize_t  written = 0;
   uint64_t target_bit = (1ULL << slot_id);
@@ -894,10 +902,9 @@ Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
   conn.status.store(SLOT_AVAILABLE, std::memory_order_release);
   stripe.lease_mask.fetch_and(~target_bit, std::memory_order_release);
 
-  // No arm_read needed: the reactor's persistent multishot EPOLLIN poll
-  // (registered once at connect time) continuously delivers read events.
-  // Calling arm_read on every send would cancel+re-add the poll SQE 10k
-  // times per connection, creating unnecessary overhead.
+  // No arm_read needed: the reactor's one-shot EPOLLIN poll is re-armed
+  // automatically in dispatch() after each read event so that reads keep
+  // firing without re-registration on every send.
 
   return SendResultData(SendResult::OK, slot_id);
 }
@@ -1120,6 +1127,7 @@ Connection::connect_proto_with_opts(ErlNifEnv* env, PoolContext* ctx,
       return ConnectResultData(ConnectResult::CONNECTING, slot_id);
 
     case PROTO_UDP:
+      conn.arm_read(env, ctx);
       stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
       return ConnectResultData(ConnectResult::OK, slot_id);
 

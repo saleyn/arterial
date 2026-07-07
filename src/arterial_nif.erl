@@ -42,13 +42,15 @@ group membership management. See `connect_proto_with_opts/9`.
 """.
 
 -export([init/0]).
--export([init_pool/2, configure_throttle/3, register_socket/4, connect/7, connect_async/6, connect_proto/8, connect_async_proto/7, send_and_release/3, send_on_slot/4]).
+-export([init_pool/2, init_pool/3, configure_throttle/3, register_socket/4, connect/7, connect_async/6, connect_proto/8, connect_async_proto/7, send_and_release/3, send_on_slot/4]).
 -export([connect_with_opts/8, connect_proto_with_opts/9]).
 -export([handle_readable/3, handle_writable/3, close_slot/3, handle_connection_timeout/3]).
 -export([reactor_listen/2, reactor_accept/3, reactor_close_fd/2, reactor_register_client/4]).
 -export([is_slot_available/3, set_slot_available/3, set_slot_unavailable/3]).
 -export([reserve_fifo_connection/3, send_fifo_request/6, release_fifo_connection/4, fifo_connection_status/3, handle_fifo_reply/4]).
 -export([reserve_send_fifo_request/5]). % New combined function (#3)
+-export([register_corr/6, unregister_corr/3, lookup_and_remove_corr/3,
+         corr_count/2, drain_corr_map/3, sweep_corr_map/2]).
 -export([info/0]).
 
 -on_load(init/0).
@@ -82,6 +84,17 @@ socket's file descriptor to one.
 -spec init_pool(non_neg_integer(), non_neg_integer()) ->
   {ok, pool_ref()} | {error, max_slots_exceeded_64}.
 init_pool(_NumStripes, _SlotsPerStripe) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Like `init_pool/2` but with an explicit per-stripe corr-table size.
+`CorrTableSize` is rounded up to the next power of two.  Must be large
+enough to hold all in-flight requests across the stripe simultaneously
+(defaults to `max(256, next_pow2(SlotsPerStripe * 16))` when omitted).
+""".
+-spec init_pool(non_neg_integer(), non_neg_integer(), pos_integer()) ->
+  {ok, pool_ref()} | {error, max_slots_exceeded_64}.
+init_pool(_NumStripes, _SlotsPerStripe, _CorrTableSize) ->
   ?NOT_LOADED_ERROR.
 
 -doc """
@@ -672,6 +685,62 @@ for error handling flexibility.
   {ok, fifo_request_sent, non_neg_integer(), non_neg_integer(), non_neg_integer()} |
   {error, atom()}.
 reserve_send_fifo_request(_PoolRef, _StripeId, _RequestData, _ReservationTimeoutMs, _RequestTimeoutMs) ->
+  ?NOT_LOADED_ERROR.
+
+%%%-----------------------------------------------------------------------------
+%%% Corr-map NIFs (in-NIF correlation-id → caller mapping, replaces ETS table)
+%%%-----------------------------------------------------------------------------
+
+-doc """
+Register a correlation id in the per-stripe NIF map before sending a request.
+`StripeId` is the stripe the request was sent on.  `CorrId` is the wire-level
+correlation id.  `CallerPid` is the process waiting for the reply.  `ConnId`
+is the slot index (used by `drain_corr_map/3` on disconnect).  `DeadlineUs`
+is `os:system_time(microsecond) + TimeoutUs` (used by `sweep_corr_map/2`).
+""".
+-spec register_corr(pool_ref(), non_neg_integer(), non_neg_integer(),
+                    pid(), non_neg_integer(), integer()) -> ok.
+register_corr(_PoolRef, _StripeId, _CorrId, _CallerPid, _ConnId, _DeadlineUs) ->
+  ?NOT_LOADED_ERROR.
+
+-doc "Remove a previously registered corr entry (on send failure before a reply arrives).".
+-spec unregister_corr(pool_ref(), non_neg_integer(), non_neg_integer()) -> ok.
+unregister_corr(_PoolRef, _StripeId, _CorrId) ->
+  ?NOT_LOADED_ERROR.
+
+-doc "Return the number of pending corr entries in stripe `StripeId`. Used by bounce drain polling.".
+-spec corr_count(pool_ref(), non_neg_integer()) -> non_neg_integer().
+corr_count(_PoolRef, _StripeId) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Atomically remove and return the entry for `CorrId`.
+Returns `{CallerPid, ConnId}` when found, `not_found` otherwise.
+Called by `arterial_connection` after decoding a reply frame, replacing `ets:take`.
+""".
+-spec lookup_and_remove_corr(pool_ref(), non_neg_integer(), non_neg_integer()) ->
+  {pid(), non_neg_integer()} | not_found.
+lookup_and_remove_corr(_PoolRef, _StripeId, _CorrId) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Remove all corr entries for `ConnId` from the stripe and send
+`{arterial_disconnected, Pool, CorrId}` to each waiting caller.
+Called by `arterial_connection` on disconnect instead of scanning ETS by ConnId.
+""".
+-spec drain_corr_map(pool_ref(), non_neg_integer(), non_neg_integer()) -> ok.
+drain_corr_map(_PoolRef, _StripeId, _ConnId) ->
+  ?NOT_LOADED_ERROR.
+
+-doc """
+Scan all stripes for entries whose deadline has passed `NowUs`
+(`os:system_time(microsecond)`), remove them, and send
+`{arterial_timeout, Pool, CorrId}` to each expired caller.
+Returns the count of expired entries.  Called by `arterial_sweeper` instead
+of `ets:select`.
+""".
+-spec sweep_corr_map(pool_ref(), integer()) -> non_neg_integer().
+sweep_corr_map(_PoolRef, _NowUs) ->
   ?NOT_LOADED_ERROR.
 
 %% --- Reactor server NIFs ---

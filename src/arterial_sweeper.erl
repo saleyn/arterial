@@ -2,14 +2,11 @@
 
 -moduledoc """
 Periodic `gen_server` that evicts expired in-flight requests from
-`arterial_pool`'s correlation-id ETS table, mirroring
-`arterial_sweeper`'s role in the original backend (see
-`arterial_nif:sweep_timeouts/1`) -- except entirely in plain Erlang here,
-since the bookkeeping it sweeps lives in an ETS table this backend owns
-directly, not inside a NIF resource.
+the per-stripe NIF corr maps, sending each waiting caller
+`{arterial_timeout, CorrId}` so they don't block until their own
+`after Timeout` fires.
 
-Started once per pool by `arterial_pool`'s supervisor; not meant to be
-used directly by callers of the library.
+Started once per pool by `arterial_pool`'s supervisor.
 """.
 
 -behaviour(gen_server).
@@ -19,32 +16,18 @@ used directly by callers of the library.
 
 -record(state, {
   pool        :: arterial_pool:name(),
-  corr_table  :: atom(),
-  interval_ms :: pos_integer(),
-  batch_size  :: pos_integer()
+  interval_ms :: pos_integer()
 }).
 
 %%%-----------------------------------------------------------------------------
 %%% Public API
 %%%-----------------------------------------------------------------------------
 -doc """
-Start a process that evicts every expired entry of `Pool`'s correlation
-table every `IntervalMs` milliseconds, sending each owning process
-`{arterial_timeout, Pool, CorrId}` (matching `arterial_client:call/3`'s
-own `receive` clause for it, for entries whose owner is still waiting
-when the sweep beats its own `after Timeout`).
-
-## Examples
-
-```
-1> arterial_sweeper:start_link(my_pool, 1000).
-{ok,<0.150.0>}
-```
+Start a sweeper for `Pool` that fires every `IntervalMs` milliseconds.
 """.
 -spec start_link(arterial_pool:name(), pos_integer()) -> {ok, pid()}.
 start_link(Pool, IntervalMs) when is_atom(Pool), is_integer(IntervalMs), IntervalMs > 0 ->
-  Opts = #{pool => Pool, interval => IntervalMs, batch_size => 32},
-  start_link(Opts).
+  start_link(#{pool => Pool, interval => IntervalMs}).
 
 -spec start_link(#{pool => atom(), interval => pos_integer(),
                    batch_size => pos_integer()}) -> {ok, pid()}.
@@ -55,13 +38,8 @@ start_link(Opts) when is_map(Opts) ->
 %%% gen_server callbacks
 %%%-----------------------------------------------------------------------------
 -doc false.
-init(#{pool := Pool, interval := IntervalMs} = Opts) ->
-  BatchSize = maps:get(batch_size, Opts, 32),
-  Table     = arterial_pool:corr_table(Pool),
-  State = #state{
-    pool        = Pool,       corr_table = Table,
-    interval_ms = IntervalMs, batch_size = BatchSize
-  },
+init(#{pool := Pool, interval := IntervalMs} = _Opts) ->
+  State = #state{pool = Pool, interval_ms = IntervalMs},
   schedule(State),
   {ok, State}.
 
@@ -75,7 +53,7 @@ handle_cast(_Msg, State) ->
 
 -doc false.
 handle_info(sweep, #state{pool = Pool} = State) ->
-  Count = sweep(State),
+  Count = sweep(Pool),
   arterial_observe:event([sweep, stop], #{expired_count => Count}, #{pool => Pool}),
   schedule(State),
   {noreply, State}.
@@ -84,18 +62,10 @@ handle_info(sweep, #state{pool = Pool} = State) ->
 %%% Internal functions
 %%%-----------------------------------------------------------------------------
 
-%% Deadlines are microsecond timestamps (see arterial_util:calc_expiration/2)
-%% or the atom `infinity` -- `infinity < Now` is always false under
-%% Erlang's standard term order (atoms compare greater than any number),
-%% so infinity-deadline entries are naturally never selected here.
-sweep(#state{pool = Pool, corr_table = Table, batch_size = BatchSize}) ->
-  Now = os:system_time(microsecond),
-  Fun = fun({CorrId, Pid}) ->
-    ets:delete(Table, CorrId),
-    Pid ! {arterial_timeout, Pool, CorrId}
-  end,
-  MatchSpec = [{{'$1', '$2', '_', '$3'}, [{'<', '$3', Now}], [{{'$1', '$2'}}]}],
-  arterial_util:ets_select_for_each(Table, MatchSpec, BatchSize, Fun).
+sweep(Pool) ->
+  PoolRef = arterial_pool:pool_ref(Pool),
+  NowUs   = os:system_time(microsecond),
+  arterial_nif:sweep_corr_map(PoolRef, NowUs).
 
 schedule(#state{interval_ms = IntervalMs}) ->
   erlang:send_after(IntervalMs, self(), sweep).

@@ -8,8 +8,9 @@ connects the socket *inside* the NIF -- see below), and -- unlike
 actual socket I/O) -- this worker is also the long-lived "owner" process
 that every read/write-readiness notification for its slot targets: it
 decodes newly-read bytes via the pool's `c:arterial_codec` module and
-dispatches each reply directly to its waiting caller's mailbox via the
-pool's public correlation-id ETS table (see `arterial_pool:corr_table/1`).
+dispatches each reply directly to its waiting caller's mailbox, looking
+up the waiting pid via `arterial_nif:lookup_and_remove_corr/3` (the
+per-stripe NIF corr map, replacing the former ETS table).
 `arterial_client:call/3`/`cast/2` write requests directly via
 `arterial_nif:send_and_release/3` in their *own* process, never
 through this worker -- it is only ever in the read path.
@@ -300,18 +301,8 @@ try_addresses([Entry | Rest], #state{
         Result = case Protocol of
           P when P == tcp; P == udp; P == ssl ->
             % Built-in NIF protocols
-            case ActualSocketOpts of
-              [] ->
-                % TEMPORARY FIX: Force use of synchronous connection to work around async event system issues
-                % Add a minimal socket option to trigger synchronous mode
-                MinimalOpts = [{sndbuf, 8192}],  % Set a simple send buffer size
-                arterial_nif:connect_proto_with_opts(PoolRef, ConnID, IP, Port,
-                    State#state.conn_timeout, Protocol, Nodelay, self(), MinimalOpts);
-              _ ->
-                % Use the new socket options aware function
-                arterial_nif:connect_proto_with_opts(PoolRef, ConnID, IP, Port,
-                    State#state.conn_timeout, Protocol, Nodelay, self(), ActualSocketOpts)
-            end;
+            arterial_nif:connect_proto_with_opts(PoolRef, ConnID, IP, Port,
+                State#state.conn_timeout, Protocol, Nodelay, self(), ActualSocketOpts);
           ProtocolModule when is_atom(ProtocolModule) ->
             % Custom protocol module - use arterial_protocol callbacks
             connect_with_protocol_module(ProtocolModule, PoolRef, ConnID, IP, Port, ActualSocketOpts, Nodelay, self())
@@ -361,35 +352,35 @@ handle_connect_result(Error, #state{pfx = Pfx} = State) ->
 %% handle_read_event/1 removed: the Reactor NIF reads data in C++ and delivers
 %% it directly as {arterial_event, ConnID, 0, read, Binary} — no NIF callback.
 
-append_and_decode(Bin, #state{pfx = Pfx, pool = Pool, codec = Codec, buffer = Buffer} = State) ->
+append_and_decode(Bin, #state{pfx = Pfx, pool = Pool, codec = Codec,
+                              buffer = Buffer, conn_id = ConnID} = State) ->
   NewBuffer = <<Buffer/binary, Bin/binary>>,
-  CorrTable = arterial_pool:corr_table(Pool),
-  try decode_loop(Codec, NewBuffer, CorrTable) of
+  PoolRef   = arterial_pool:pool_ref(Pool),
+  try decode_loop(Codec, NewBuffer, PoolRef, ConnID) of
     Rest -> {noreply, State#state{buffer = Rest}}
   catch error:{codec_decode_error, Reason} ->
     ?LOG_NOTICE("~s codec decode error, dropping connection: ~p", [Pfx, Reason]),
     disconnect({codec_error, Reason}, State#state{buffer = <<>>})
   end.
 
-decode_loop(Codec, Buffer, CorrTable) ->
+decode_loop(Codec, Buffer, PoolRef, StripeId) ->
   case Codec:decode(Buffer) of
     {ok, CorrId, Reply, Rest} ->
-      dispatch_reply(CorrTable, CorrId, Reply),
-      decode_loop(Codec, Rest, CorrTable);
+      dispatch_reply(PoolRef, StripeId, CorrId, Reply),
+      decode_loop(Codec, Rest, PoolRef, StripeId);
     more ->
       Buffer;
     {error, Reason} ->
       error({codec_decode_error, Reason})
   end.
 
-dispatch_reply(CorrTable, CorrId, Reply) ->
-  case ets:take(CorrTable, CorrId) of
-    [{CorrId, Pid, _ConnID, _Deadline}] ->
+dispatch_reply(PoolRef, StripeId, CorrId, Reply) ->
+  case arterial_nif:lookup_and_remove_corr(PoolRef, StripeId, CorrId) of
+    {Pid, _ConnId} ->
       Pid ! {arterial_reply, CorrId, Reply},
       ok;
-    [] ->
-      %% Already timed out (arterial_sweeper) or a stray/duplicate
-      %% reply -- nothing to deliver it to.
+    not_found ->
+      %% Already timed out (arterial_sweeper) or a stray/duplicate reply.
       ok
   end.
 
@@ -422,7 +413,10 @@ bounce_check(#state{
   end.
 
 connection_drained(Pool, ConnID) ->
-  ets:match(arterial_pool:corr_table(Pool), {'_', '_', ConnID, '_'}, 1) =:= '$end_of_table'.
+  %% ConnID is the stripe_id in the one-slot-per-stripe pool layout.
+  %% The stripe is fully drained when no corr entries remain.
+  PoolRef = arterial_pool:pool_ref(Pool),
+  arterial_nif:corr_count(PoolRef, ConnID) =:= 0.
 
 %%%-----------------------------------------------------------------------------
 %%% Internal functions: disconnect + notification
@@ -447,12 +441,11 @@ disconnect(Reason, #state{pool = Pool, conn_id = ConnID, connected = Connected} 
 %% now instead, same contract as arterial_nif:connection_down/2 in the
 %% original backend.
 notify_inflight_disconnected(Pool, ConnID) ->
-  CorrTable = arterial_pool:corr_table(Pool),
-  Fun = fun({CorrId, Pid, _ConnID, _Deadline}) ->
-    ets:delete(CorrTable, CorrId),
-    Pid ! {arterial_disconnected, Pool, CorrId}
-  end,
-  arterial_util:ets_match_for_each(CorrTable, {'_', '_', ConnID, '_'}, 32, Fun).
+  %% drain_corr_map removes all entries for ConnID from the NIF corr map and
+  %% sends {arterial_disconnected, CorrId} directly to each waiting caller.
+  %% ConnID is the stripe_id (one slot per stripe pool shape).
+  PoolRef = arterial_pool:pool_ref(Pool),
+  arterial_nif:drain_corr_map(PoolRef, ConnID, 0).
 
 cancel_timer(undefined) -> ok;
 cancel_timer(TimerRef)  -> erlang:cancel_timer(TimerRef), ok.
