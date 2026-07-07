@@ -1,5 +1,5 @@
+#include "arterial_connection_timer.hxx" // cancel_connection_timeout
 #include "arterial_pool.hpp"
-#include "arterial_connection_timer.hxx"  // cancel_connection_timeout
 #include <sys/ioctl.h>
 
 namespace arterial {
@@ -20,67 +20,59 @@ namespace arterial {
 // All framing and corr-id lookup remain in Erlang; arterial_connection calls
 // lookup_and_remove_corr_nif instead of ets:take to find the waiting caller.
 // Returns 0 to keep registered, -1 to tell the reactor to remove_fd+close.
-static inline ReadHandler make_read_handler(PoolContext* ctx,
-                                             unsigned stripe_id,
-                                             unsigned slot_id)
+static inline ReadHandler make_read_handler(PoolContext* ctx, unsigned stripe_id, unsigned slot_id)
 {
-  auto& conn    = ctx->stripes[stripe_id]->slots[slot_id];
+  auto&    conn = ctx->stripes[stripe_id]->slots[slot_id];
   uint32_t gen  = conn.generation.load(std::memory_order_acquire);
   return [ctx, stripe_id, slot_id, gen]([[maybe_unused]] int fd, void*) -> int {
-    auto& c = ctx->stripes[stripe_id]->slots[slot_id];
+    auto&    c       = ctx->stripes[stripe_id]->slots[slot_id];
     uint32_t cur_gen = c.generation.load(std::memory_order_acquire);
     if (cur_gen != gen) return -1;
     nifpp::msg_env me;
-    auto res = c.handle_readable(me, ctx);
+    auto           res = c.handle_readable(me, ctx);
 
-    using ReadResult = Connection::ReadResult;
+    using ReadResult   = Connection::ReadResult;
 
     if (res.result == ReadResult::DATA) {
       TERM bin_term(enif_make_binary(me, &res.data));
-      auto msg = nifpp::make(me,
-        std::make_tuple(am_arterial_event, stripe_id, slot_id,
-                        am_read, bin_term));
+      auto msg = nifpp::make(
+          me, std::make_tuple(am_arterial_event, stripe_id, slot_id, am_read, bin_term));
       enif_send(nullptr, &c.owner_pid, me, msg);
       return 0;
     }
-    if (res.result == ReadResult::CLOSED || res.result == ReadResult::ERROR)
-      return -1;
+    if (res.result == ReadResult::CLOSED || res.result == ReadResult::ERROR) return -1;
     return 0;
   };
 }
 
-static inline WriteHandler make_write_handler(PoolContext* ctx,
-                                               unsigned stripe_id,
-                                               unsigned slot_id)
+static inline WriteHandler
+make_write_handler(PoolContext* ctx, unsigned stripe_id, unsigned slot_id)
 {
-  auto& conn    = ctx->stripes[stripe_id]->slots[slot_id];
+  auto&    conn = ctx->stripes[stripe_id]->slots[slot_id];
   uint32_t gen  = conn.generation.load(std::memory_order_acquire);
   return [ctx, stripe_id, slot_id, gen]([[maybe_unused]] int fd_arg, void*) -> int {
     auto& c = ctx->stripes[stripe_id]->slots[slot_id];
     if (c.generation.load(std::memory_order_acquire) != gen) return -1;
-    auto res = c.handle_writable(nullptr, ctx);
+    auto res          = c.handle_writable(nullptr, ctx);
 
     using WriteResult = Connection::WriteResult;
-    if (res.result == WriteResult::CONNECT_OK ||
-        res.result == WriteResult::CONNECT_FAILED) {
+    if (res.result == WriteResult::CONNECT_OK || res.result == WriteResult::CONNECT_FAILED) {
       if (res.send_connect_msg) {
         nifpp::msg_env me;
-        auto msg = c.make_connect_result_msg(me, res.connect_result);
+        auto           msg = c.make_connect_result_msg(me, res.connect_result);
         enif_send(nullptr, &c.owner_pid, me, msg);
       }
       return (res.result == WriteResult::CONNECT_FAILED) ? -1 : 0;
     }
-    if (res.result == WriteResult::CLOSED || res.result == WriteResult::ERROR)
-      return -1;
+    if (res.result == WriteResult::CLOSED || res.result == WriteResult::ERROR) return -1;
     return 0;
   };
 }
 
-static inline ErrorHandler make_error_handler(PoolContext* ctx,
-                                               unsigned stripe_id,
-                                               unsigned slot_id)
+static inline ErrorHandler
+make_error_handler(PoolContext* ctx, unsigned stripe_id, unsigned slot_id)
 {
-  auto& conn    = ctx->stripes[stripe_id]->slots[slot_id];
+  auto&    conn = ctx->stripes[stripe_id]->slots[slot_id];
   uint32_t gen  = conn.generation.load(std::memory_order_acquire);
   return [ctx, stripe_id, slot_id, gen](int /*fd*/, void*) {
     auto& c = ctx->stripes[stripe_id]->slots[slot_id];
@@ -101,10 +93,8 @@ inline int Connection::arm_read(ErlNifEnv* /*env*/, const PoolContext* ctx)
   // read handler; subsequent re-arming is done transparently by the reactor.
   auto* mctx = const_cast<PoolContext*>(ctx);
   mctx->reactor().add_fd(
-    fd,
-    make_read_handler(mctx, stripe_id, slot_id),
-    make_error_handler(mctx, stripe_id, slot_id),
-    make_write_handler(mctx, stripe_id, slot_id));
+      fd, make_read_handler(mctx, stripe_id, slot_id), make_error_handler(mctx, stripe_id, slot_id),
+      make_write_handler(mctx, stripe_id, slot_id));
   return 0;
 }
 
@@ -123,10 +113,8 @@ inline int Connection::arm_connect(ErlNifEnv* /*env*/, const PoolContext* ctx)
   // (via do_arm_write → reactor_mod) to detect connect completion.
   auto* mctx = const_cast<PoolContext*>(ctx);
   mctx->reactor().register_handlers(
-    fd,
-    {},                                               // no on_read during connect
-    make_error_handler(mctx, stripe_id, slot_id),
-    make_write_handler(mctx, stripe_id, slot_id));
+      fd, {}, // no on_read during connect
+      make_error_handler(mctx, stripe_id, slot_id), make_write_handler(mctx, stripe_id, slot_id));
   mctx->reactor().arm_write(fd);
   return 0;
 }
@@ -137,35 +125,32 @@ inline int Connection::arm_connect(ErlNifEnv* /*env*/, const PoolContext* ctx)
 inline void Connection::set_connect_timeout(const PoolContext* ctx, uint64_t timeout_ms)
 {
   if (timeout_ms == 0 || fd < 0) return;
-  auto* mctx   = const_cast<PoolContext*>(ctx);
-  unsigned sid = stripe_id;
-  unsigned slt = slot_id;
+  auto*     mctx = const_cast<PoolContext*>(ctx);
+  unsigned  sid  = stripe_id;
+  unsigned  slt  = slot_id;
   // On timeout: send {arterial_event, StripeId, SlotId, timeout} to owner_pid
   // and close the connecting socket (the reactor calls remove_fd for us after
   // on_timeout returns via the normal timeout dispatch path).
-  ErlNifPid pid = owner_pid;
+  ErlNifPid pid  = owner_pid;
   mctx->reactor().add_fd(
-    fd,
-    {},                                           // keep existing handlers
-    make_error_handler(mctx, sid, slt),
-    make_write_handler(mctx, sid, slt),
-    // on_timeout: close the connecting fd, free the slot, notify owner.
-    [mctx, sid, slt, pid](int cfd, void*) {
-      auto& conn = mctx->stripes[sid]->slots[slt];
-      cancel_connection_timeout(conn);
-      // Queue remove_fd so the reactor deregisters from epoll and closes cfd
-      // on the next iteration.  We clear conn.fd now so the PoolContext
-      // destructor does not double-close it.
-      conn.fd = -1;
-      mctx->reactor().remove_fd(cfd);
-      conn.status.store(SLOT_EMPTY, std::memory_order_release);
-      mctx->stripes[sid]->lease_mask.fetch_and(
-        ~(1ULL << slt), std::memory_order_release);
-      // Send timeout message to owner
-      nifpp::msg_env me;
-      auto msg = conn.make_event_msg(me, am_timeout);
-      enif_send(nullptr, &pid, me, msg);
-    });
+      fd, {}, // keep existing handlers
+      make_error_handler(mctx, sid, slt), make_write_handler(mctx, sid, slt),
+      // on_timeout: close the connecting fd, free the slot, notify owner.
+      [mctx, sid, slt, pid](int cfd, void*) {
+        auto& conn = mctx->stripes[sid]->slots[slt];
+        cancel_connection_timeout(conn);
+        // Queue remove_fd so the reactor deregisters from epoll and closes cfd
+        // on the next iteration.  We clear conn.fd now so the PoolContext
+        // destructor does not double-close it.
+        conn.fd = -1;
+        mctx->reactor().remove_fd(cfd);
+        conn.status.store(SLOT_EMPTY, std::memory_order_release);
+        mctx->stripes[sid]->lease_mask.fetch_and(~(1ULL << slt), std::memory_order_release);
+        // Send timeout message to owner
+        nifpp::msg_env me;
+        auto           msg = conn.make_event_msg(me, am_timeout);
+        enif_send(nullptr, &pid, me, msg);
+      });
   mctx->reactor().set_timeout(fd, timeout_ms);
 }
 
@@ -174,7 +159,8 @@ inline void Connection::set_connect_timeout(const PoolContext* ctx, uint64_t tim
 //=============================================================================
 
 // Initialize stripe with specified capacity
-void PoolStripe::initialize(std::size_t slot_count) {
+void PoolStripe::initialize(std::size_t slot_count)
+{
   capacity      = std::min(slot_count, MAX_SLOTS_PER_STRIPE);
   capacity_mask = (1ULL << capacity) - 1;
 
@@ -183,7 +169,7 @@ void PoolStripe::initialize(std::size_t slot_count) {
 
   // Initialize slots
   for (uint32_t i = 0; i < capacity; ++i) {
-    slots[i].stripe_id = 0;  // Will be set by PoolContext
+    slots[i].stripe_id = 0; // Will be set by PoolContext
     slots[i].slot_id   = i;
     slots[i].reset();
   }
@@ -191,7 +177,8 @@ void PoolStripe::initialize(std::size_t slot_count) {
 
 // Try to find and claim an available slot
 // Returns slot index or MAX_SLOTS_PER_STRIPE if none available
-std::size_t PoolStripe::try_claim_slot() {
+std::size_t PoolStripe::try_claim_slot()
+{
   uint64_t mask = lease_mask.load(std::memory_order_acquire);
 
   for (std::size_t i = 0; i < capacity; ++i) {
@@ -202,18 +189,19 @@ std::size_t PoolStripe::try_claim_slot() {
 
     // Try to claim this slot
     uint64_t expected = mask;
-    if (lease_mask.compare_exchange_weak(expected, mask|bit, std::memory_order_acq_rel))
-      return i;  // Successfully claimed slot i
+    if (lease_mask.compare_exchange_weak(expected, mask | bit, std::memory_order_acq_rel))
+      return i; // Successfully claimed slot i
 
     // CAS failed, reload mask and continue
     mask = expected;
   }
 
-  return MAX_SLOTS_PER_STRIPE;  // No available slots
+  return MAX_SLOTS_PER_STRIPE; // No available slots
 }
 
 // Release a slot back to available state
-inline void PoolStripe::release_slot(std::size_t slot_index) {
+inline void PoolStripe::release_slot(std::size_t slot_index)
+{
   if (slot_index >= capacity) return;
 
   uint64_t bit = 1ULL << slot_index;
@@ -222,18 +210,15 @@ inline void PoolStripe::release_slot(std::size_t slot_index) {
 }
 
 // Try to process waiting FIFO requests by matching them with available slots
-inline bool PoolStripe::try_process_fifo_queue() {
-  if (!fifo_queue.is_initialized() || fifo_queue.empty()) {
-    return false;  // No queued requests
-  }
+inline bool PoolStripe::try_process_fifo_queue()
+{
+  if (!fifo_queue.is_initialized() || fifo_queue.empty()) return false; // No queued requests
 
   // Try to dequeue a waiting request
   auto entry_opt = fifo_queue.dequeue();
-  if (!entry_opt.has_value()) {
-    return false;  // No valid entries or queue became empty
-  }
+  if (!entry_opt.has_value()) return false; // No valid entries or queue became empty
 
-  auto entry = *entry_opt;
+  auto     entry        = *entry_opt;
   uint64_t current_mask = lease_mask.load(std::memory_order_relaxed);
 
   // Look for an available slot
@@ -244,8 +229,8 @@ inline bool PoolStripe::try_process_fifo_queue() {
     if (current_mask & target_bit) continue;
 
     // Try to claim this slot
-    if (lease_mask.compare_exchange_weak(current_mask, current_mask | target_bit,
-                                              std::memory_order_acq_rel)) {
+    if (lease_mask.compare_exchange_weak(
+            current_mask, current_mask | target_bit, std::memory_order_acq_rel)) {
       auto& slot = slots[i];
 
       // Verify slot is actually available
@@ -261,7 +246,7 @@ inline bool PoolStripe::try_process_fifo_queue() {
       slot.status.store(SLOT_FIFO_RESERVED, std::memory_order_release);
       slot.set_fifo_request(entry.m_requester_pid, entry.m_reservation_id);
 
-      return true;  // Successfully processed one queued request
+      return true; // Successfully processed one queued request
     }
 
     // CAS failed, reload mask and continue
@@ -277,7 +262,8 @@ inline bool PoolStripe::try_process_fifo_queue() {
 //===========================================================================
 
 // Destructor ensures all file descriptors are closed
-PoolContext::~PoolContext() {
+PoolContext::~PoolContext()
+{
   // Stop the reactor thread before closing fds.  If fds are closed first,
   // the reactor's pending POLL_ADD SQEs see EBADF and the ring exits with
   // an error, sending a spurious {arterial_reactor_exit, ...} to the owner.
@@ -290,17 +276,18 @@ PoolContext::~PoolContext() {
         slot.fd = -1;
       }
 
-      #ifdef HAVE_OPENSSL
+#ifdef HAVE_OPENSSL
       if (slot.ssl) {
         SSL_free(slot.ssl);
         slot.ssl = nullptr;
       }
-      #endif
+#endif
     }
 }
 
 // Initialize pool with specified stripe count and slots per stripe
-void PoolContext::initialize(std::size_t num_stripes, std::size_t slots_per_stripe) {
+void PoolContext::initialize(std::size_t num_stripes, std::size_t slots_per_stripe)
+{
   stripe_count = num_stripes;
   stripes.clear();
   stripes.reserve(num_stripes);
@@ -310,25 +297,24 @@ void PoolContext::initialize(std::size_t num_stripes, std::size_t slots_per_stri
     stripe->initialize(slots_per_stripe);
 
     // Set stripe_id for all slots in this stripe
-    for (uint32_t j = 0; j < stripe->capacity; ++j)
-      stripe->slots[j].stripe_id = i;
+    for (uint32_t j = 0; j < stripe->capacity; ++j) stripe->slots[j].stripe_id = i;
 
     stripes.emplace_back(std::move(stripe));
   }
 }
 
-inline PoolUtilization PoolContext::calculate_pool_utilization() {
+inline PoolUtilization PoolContext::calculate_pool_utilization()
+{
   auto total     = total_slots();
   auto available = total_available_slots();
   auto busy      = total - available;
   auto util      = (total > 0) ? (static_cast<double>(busy) / total) * 100.0 : 0.0;
 
   return PoolUtilization{
-    .total_slots         = total,
-    .available_slots     = available,
-    .busy_slots          = busy,
-    .utilization_percent = util
-  };
+      .total_slots         = total,
+      .available_slots     = available,
+      .busy_slots          = busy,
+      .utilization_percent = util};
 }
 
 // Invoked by the runtime once it's safe to close a fd that was selected.
@@ -336,14 +322,15 @@ inline PoolUtilization PoolContext::calculate_pool_utilization() {
 // (conn.fd=-1 set before SELECT_STOP), closes via the event parameter.
 // One-shot heads-up to the owner that this slot's connection just died.
 // The reactor closes the fd on its own thread — no enif_select(STOP) needed.
-int PoolContext::notify_and_close(ErlNifEnv* env, Connection& slot, bool notify) {
+int PoolContext::notify_and_close(ErlNifEnv* env, Connection& slot, bool notify)
+{
   // Remove the owner monitor first to prevent a concurrent on_down from
   // re-entering notify_and_close for the same slot.
   demonitor_owner(env, slot);
 
   if (notify) {
     nifpp::msg_env msg_env;
-    auto msg = slot.make_event_msg(msg_env, am_closed);
+    auto           msg = slot.make_event_msg(msg_env, am_closed);
     enif_send(nullptr, &slot.owner_pid, msg_env, msg);
   }
 
@@ -362,8 +349,7 @@ int PoolContext::notify_and_close(ErlNifEnv* env, Connection& slot, bool notify)
 }
 
 // Claim the first unregistered slot in `stripe` for `fd`/`owner_pid`
-int PoolContext::claim_slot(
-  ErlNifEnv* /*env*/, PoolStripe& stripe, int fd, ErlNifPid owner_pid)
+int PoolContext::claim_slot(ErlNifEnv* /*env*/, PoolStripe& stripe, int fd, ErlNifPid owner_pid)
 {
   // Two masks:
   //   actual_mask  — the live lease_mask from the atomic, refreshed on CAS failure
@@ -371,11 +357,11 @@ int PoolContext::claim_slot(
   // We keep scan_mask separate because compare_exchange_weak may write the fresh
   // actual value back into our variable, erasing the locally-accumulated skips.
   uint64_t actual_mask = stripe.lease_mask.load(std::memory_order_relaxed);
-  uint64_t skip_bits   = 0;    // bits set purely from non-EMPTY status checks
+  uint64_t skip_bits   = 0; // bits set purely from non-EMPTY status checks
 
   while (true) {
     uint64_t scan_mask = actual_mask | skip_bits;
-    int slot_id = std::countr_zero(~scan_mask);
+    int      slot_id   = std::countr_zero(~scan_mask);
     if (static_cast<size_t>(slot_id) >= stripe.capacity) [[unlikely]]
       return -1; // Stripe full
 
@@ -391,36 +377,33 @@ int PoolContext::claim_slot(
     // — writing them before the CAS creates a data race when multiple callers
     // concurrently compete for the same slot: the CAS loser's stores overwrite
     // the winner's fd with -1 and leave the slot corrupted.
-    uint64_t target_bit  = (1ULL << slot_id);
-    uint64_t expected    = actual_mask;          // actual value without skip_bits
-    uint64_t desired     = expected | target_bit;
+    uint64_t target_bit = (1ULL << slot_id);
+    uint64_t expected   = actual_mask; // actual value without skip_bits
+    uint64_t desired    = expected | target_bit;
 
     if (stripe.lease_mask.compare_exchange_weak(
-          expected, desired,
-          std::memory_order_acquire,
-          std::memory_order_relaxed)) {
+            expected, desired, std::memory_order_acquire, std::memory_order_relaxed)) {
       // We own this slot. Initialise under the lease bit so any reader
       // that checks status after seeing bit=1 gets consistent data.
-      slot.fd         = fd;
-      slot.owner_pid  = owner_pid;
+      slot.fd        = fd;
+      slot.owner_pid = owner_pid;
       slot.status.store(SLOT_AVAILABLE, std::memory_order_release);
       return slot_id;
     }
     // CAS failed: `expected` was updated to the current actual mask.
     // Preserve skip_bits — the non-EMPTY slots we already checked haven't changed.
-    actual_mask = expected;
+    actual_mask  = expected;
     // A slot that appeared non-EMPTY may have since been freed (status → SLOT_EMPTY
     // after close_slot).  Clear skip_bits for any slot whose lease bit is now 0.
-    skip_bits &= actual_mask;
+    skip_bits   &= actual_mask;
   }
 }
 
-inline ERL_NIF_TERM PoolContext::claim_slot_term(
-  ErlNifEnv* env, PoolStripe& stripe, int fd, ErlNifPid owner_pid)
+inline ERL_NIF_TERM
+PoolContext::claim_slot_term(ErlNifEnv* env, PoolStripe& stripe, int fd, ErlNifPid owner_pid)
 {
   auto res = claim_slot(env, stripe, fd, owner_pid);
-  if (res < 0)
-    return make_tuple(env, am_error, am_stripe_full);
+  if (res < 0) return make_tuple(env, am_error, am_stripe_full);
   stripe.slots[res].arm_read(env, this);
   return make_tuple(env, am_ok, res);
 }
@@ -429,16 +412,14 @@ int PoolContext::monitor_owner(ErlNifEnv* env, Connection& conn)
 {
   // Build the on_down callback that ERTS calls directly — O(1), no scan.
   nifpp::resource_events<SlotRef> events{
-    [](SlotRef* ref, ErlNifEnv* denv, ErlNifPid* /*pid*/, ErlNifMonitor* /*mon*/) {
-      auto& c = ref->ctx->stripes[ref->stripe_id]->slots[ref->slot_id];
-      // Guard against slot reuse: demonitor_owner nulls slot_ref before reset().
-      if (c.slot_ref == ref)
-        ref->ctx->notify_and_close(denv, c, /*notify=*/false);
-    }
-  };
+      [](SlotRef* ref, ErlNifEnv* denv, ErlNifPid* /*pid*/, ErlNifMonitor* /*mon*/) {
+        auto& c = ref->ctx->stripes[ref->stripe_id]->slots[ref->slot_id];
+        // Guard against slot reuse: demonitor_owner nulls slot_ref before reset().
+        if (c.slot_ref == ref) ref->ctx->notify_and_close(denv, c, /*notify=*/false);
+      }};
 
-  auto ref = construct_resource_with_events<SlotRef>(
-    events, SlotRef{this, conn.stripe_id, conn.slot_id});
+  auto ref =
+      construct_resource_with_events<SlotRef>(events, SlotRef{this, conn.stripe_id, conn.slot_id});
 
   // Hold an extra reference so the SlotRef outlives the resource_ptr destructor.
   conn.slot_ref = ref.get();
@@ -454,7 +435,8 @@ int PoolContext::monitor_owner(ErlNifEnv* env, Connection& conn)
 
 void PoolContext::demonitor_owner(ErlNifEnv* env, Connection& conn)
 {
-  if (!conn.slot_ref) [[unlikely]] return;
+  if (!conn.slot_ref) [[unlikely]]
+    return;
   enif_demonitor_process(env, conn.slot_ref, &conn.owner_monitor);
   enif_release_resource(conn.slot_ref);
   conn.slot_ref = nullptr;

@@ -23,14 +23,14 @@
 //-----------------------------------------------------------------------------
 #pragma once
 
-#include <cstdint>
-#include <cassert>
 #include <algorithm>
+#include <cassert>
+#include <cstdint>
 #include <limits>
 #include <time.h>
 
 #ifndef LIKELY
-#define LIKELY(Cond)   __builtin_expect(!!(Cond), 1)
+#define LIKELY(Cond) __builtin_expect(!!(Cond), 1)
 #endif
 #ifndef UNLIKELY
 #define UNLIKELY(Cond) __builtin_expect(!!(Cond), 0)
@@ -42,13 +42,14 @@ namespace arterial {
 // SOURCE:
 // https://github.com/saleyn/utxx/blob/master/include/utxx/time_val.hpp
 struct nsecs {
-  constexpr explicit nsecs(long   ns) : m_nsec(int64_t(ns))    {}
+  constexpr explicit nsecs(long ns) : m_nsec(int64_t(ns)) {}
   constexpr explicit nsecs(long long ns) : m_nsec(int64_t(ns)) {}
-  constexpr explicit nsecs(size_t ns) : m_nsec(int64_t(ns))    {}
-  constexpr nsecs(long s,  long   ns) : m_nsec(int64_t(s)*1000000000LL+int64_t(ns)) {}
-  constexpr int64_t   value()           const { return m_nsec;  }
-  constexpr int64_t   nsec()            const { return m_nsec;  }
-  constexpr int64_t   nanoseconds()     const { return m_nsec;  }
+  constexpr explicit nsecs(size_t ns) : m_nsec(int64_t(ns)) {}
+  constexpr nsecs(long s, long ns) : m_nsec(int64_t(s) * 1000000000LL + int64_t(ns)) {}
+  constexpr int64_t value() const { return m_nsec; }
+  constexpr int64_t nsec() const { return m_nsec; }
+  constexpr int64_t nanoseconds() const { return m_nsec; }
+
 private:
   int64_t m_nsec;
 };
@@ -60,32 +61,36 @@ struct time_val {
   static const long   N10e6 = 1000000;
   static const size_t N10e9 = 1000000000u;
 
-  constexpr
-  time_val() noexcept         : m_tv(0)                  {}
-  constexpr
-  time_val(nsecs ns)          : m_tv(ns.nsec())          {}
-  time_val(long s, long us)   : m_tv(s*N10e9 + us*1000)  {}
-  time_val(time_val tv, long s)          : m_tv(tv.m_tv + s*N10e9)           {}
-  time_val(time_val tv, long s, long us) : m_tv(tv.m_tv + s*N10e9 + us*1000) {}
+  constexpr time_val() noexcept : m_tv(0) {}
+  constexpr time_val(nsecs ns) : m_tv(ns.nsec()) {}
+  time_val(long s, long us) : m_tv(s * N10e9 + us * 1000) {}
+  time_val(time_val tv, long s) : m_tv(tv.m_tv + s * N10e9) {}
+  time_val(time_val tv, long s, long us) : m_tv(tv.m_tv + s * N10e9 + us * 1000) {}
 
-  explicit time_val(const struct timeval&  a) : m_tv(long(a.tv_sec)*N10e9 + long(a.tv_usec)*1000){}
-  explicit time_val(const struct timespec& a) : m_tv(long(a.tv_sec)*N10e9 + a.tv_nsec){}
-  explicit time_val(struct tm& a_tm)          : m_tv(long(mktime(&a_tm))*N10e9)       {}
+  explicit time_val(const struct timeval& a) : m_tv(long(a.tv_sec) * N10e9 + long(a.tv_usec) * 1000)
+  {}
+  explicit time_val(const struct timespec& a) : m_tv(long(a.tv_sec) * N10e9 + a.tv_nsec) {}
+  explicit time_val(struct tm& a_tm) : m_tv(long(mktime(&a_tm)) * N10e9) {}
 
-  long     microseconds()            const { return m_tv/1000; }
-  double   seconds()                 const { return double(m_tv) / N10e9; }
-  long     milliseconds()            const { return m_tv / N10e6; }
-  long     nanoseconds()             const { return m_tv; }
+  long      microseconds() const { return m_tv / 1000; }
+  double    seconds() const { return double(m_tv) / N10e9; }
+  long      milliseconds() const { return m_tv / N10e6; }
+  long      nanoseconds() const { return m_tv; }
 
-  time_val& add_nsec(long ns)         { m_tv += ns;        return *this; }
-  time_val  add_nsec(long ns)   const { return time_val(nsecs(static_cast<long>(m_tv + ns))); }
+  time_val& add_nsec(long ns)
+  {
+    m_tv += ns;
+    return *this;
+  }
+  time_val        add_nsec(long ns) const { return time_val(nsecs(static_cast<long>(m_tv + ns))); }
 
-  time_val  operator+(nsecs ns)     const { return time_val(nsecs(m_tv + ns.nsec())); }
-  nsecs     operator-(time_val rhs) const { return nsecs(m_tv - rhs.m_tv); }
+  time_val        operator+(nsecs ns) const { return time_val(nsecs(m_tv + ns.nsec())); }
+  nsecs           operator-(time_val rhs) const { return nsecs(m_tv - rhs.m_tv); }
 
-  void now() { m_tv = universal_time().m_tv; }
+  void            now() { m_tv = universal_time().m_tv; }
 
-  static time_val universal_time() {
+  static time_val universal_time()
+  {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return time_val(ts);
@@ -95,7 +100,8 @@ private:
   int64_t m_tv;
 };
 
-inline time_val now_utc() { return time_val::universal_time(); }
+inline time_val now_utc()
+{ return time_val::universal_time(); }
 
 //===========================================================================
 // Throttling Algorithm
@@ -110,39 +116,32 @@ inline time_val now_utc() { return time_val::universal_time(); }
 template <typename T = uint32_t>
 class basic_time_spacing_throttle {
 public:
-  basic_time_spacing_throttle(T a_rate, uint32_t a_window_msec = 1000,
-                              time_val a_now = now_utc())
-    : m_rate        (a_rate)
-    , m_window_ns   (long(a_window_msec) * 1000000)
-    , m_step_ns     (a_rate == 0 ? 0 : m_window_ns / m_rate)
-    , m_next_time   (a_now)
-  {
-    assert(a_rate >= 0);
-  }
+  basic_time_spacing_throttle(T a_rate, uint32_t a_window_msec = 1000, time_val a_now = now_utc())
+      : m_rate(a_rate), m_window_ns(long(a_window_msec) * 1000000),
+        m_step_ns(a_rate == 0 ? 0 : m_window_ns / m_rate), m_next_time(a_now)
+  { assert(a_rate >= 0); }
 
-  void init(T a_rate, uint32_t a_window_msec = 1000, time_val a_now = now_utc()) {
-    new (this) basic_time_spacing_throttle(a_rate, a_window_msec, a_now);
-  }
+  void init(T a_rate, uint32_t a_window_msec = 1000, time_val a_now = now_utc())
+  { new (this) basic_time_spacing_throttle(a_rate, a_window_msec, a_now); }
 
   /// Reset the throttle request counter
-  void reset(time_val a_now = now_utc()) {
-    m_next_time = a_now;
-  }
+  void reset(time_val a_now = now_utc()) { m_next_time = a_now; }
 
   /// Add \a a_samples to the throtlle's counter.
   /// @return number of samples that fit in the throttling window. 0 means
   /// that the throttler is fully congested, and more time needs to elapse
   /// before the throttles gets reset to accept more samples.
-  T add(T a_samples = 1, time_val a_now = now_utc()) {
+  T    add(T a_samples = 1, time_val a_now = now_utc())
+  {
     if (m_rate == 0) return a_samples;
     auto next_time = m_next_time;
     next_time.add_nsec(a_samples * m_step_ns);
-    auto now_next  = a_now + nsecs(m_window_ns);
-    auto diff      = next_time.nanoseconds() - now_next.nanoseconds();
-    if  (diff < -m_window_ns) {
+    auto now_next = a_now + nsecs(m_window_ns);
+    auto diff     = next_time.nanoseconds() - now_next.nanoseconds();
+    if (diff < -m_window_ns) {
       m_next_time = a_now + nsecs(m_step_ns);
       return a_samples;
-    } else if (diff < 0)  {
+    } else if (diff < 0) {
       // All samples fit the throttling threshold
       m_next_time = next_time;
       return a_samples;
@@ -154,28 +153,28 @@ public:
     return n;
   }
 
-  T        rate()        const { return m_rate;                }
-  long     step_msec()   const { return m_step_ns   / 1000000; }
-  long     step_usec()   const { return m_step_ns   / 1000;    }
+  T        rate() const { return m_rate; }
+  long     step_msec() const { return m_step_ns / 1000000; }
+  long     step_usec() const { return m_step_ns / 1000; }
   long     window_msec() const { return m_window_ns / 1000000; }
-  long     window_usec() const { return m_window_ns / 1000;    }
-  time_val next_time()   const { return m_next_time;           }
+  long     window_usec() const { return m_window_ns / 1000; }
+  time_val next_time() const { return m_next_time; }
 
   /// Return the number of available samples given \a a_now current time.
   /// A rate of 0 means "unthrottled", so the max value of T is returned.
-  T        available(time_val a_now = now_utc()) const {
-    return UNLIKELY(m_rate == 0) ? std::numeric_limits<T>::max() : calc_available(a_now);
-  }
+  T        available(time_val a_now = now_utc()) const
+  { return UNLIKELY(m_rate == 0) ? std::numeric_limits<T>::max() : calc_available(a_now); }
 
   /// Return the number of used samples given \a a_now current time.
-  T        used(time_val a_now=now_utc()) const {
-    return UNLIKELY(m_rate==0) ? 0 : m_rate-calc_available(a_now);
-  }
+  T used(time_val a_now = now_utc()) const
+  { return UNLIKELY(m_rate == 0) ? 0 : m_rate - calc_available(a_now); }
 
   /// Return currently used rate per second.
-  double   curr_rate_per_second(time_val a_now=now_utc()) const {
-    return UNLIKELY(m_rate==0)
-         ? 0 : double((m_rate-calc_available(a_now))*1'000'000'000/m_window_ns);
+  double curr_rate_per_second(time_val a_now = now_utc()) const
+  {
+    return UNLIKELY(m_rate == 0)
+             ? 0
+             : double((m_rate - calc_available(a_now)) * 1'000'000'000 / m_window_ns);
   }
 
 private:
@@ -185,11 +184,12 @@ private:
   time_val m_next_time;
 
   /// Return the number of available samples given \a a_now current time.
-  T        calc_available(time_val a_now = now_utc()) const {
+  T        calc_available(time_val a_now = now_utc()) const
+  {
     assert(m_rate != 0);
     auto diff = (a_now - m_next_time).nanoseconds();
-    auto res  = diff >= 0
-              ? m_rate : T(std::min<T>(m_rate, std::max<T>(0, (m_window_ns+diff) / m_step_ns)));
+    auto res = diff >= 0 ? m_rate
+                         : T(std::min<T>(m_rate, std::max<T>(0, (m_window_ns + diff) / m_step_ns)));
     assert(res >= 0 && res <= m_rate);
     return res;
   }

@@ -25,7 +25,7 @@
 // Stub out enif_* so we can link without ERTS.
 // The erl_nif_stub.h declarations are satisfied by these definitions.
 #define REACTOR_TEST_STUB_NIF 1
-#include "reactor.hpp"
+#include "reactor.hxx"
 
 // Stub implementations (must appear after the header so types are defined).
 extern "C" {

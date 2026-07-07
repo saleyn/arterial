@@ -13,7 +13,7 @@
 //-----------------------------------------------------------------------------
 
 #define REACTOR_TEST_STUB_NIF 1
-#include "reactor.hpp"
+#include "reactor.hxx"
 
 extern "C" {
   ErlNifEnv*   enif_alloc_env()  { return nullptr; }

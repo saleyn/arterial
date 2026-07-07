@@ -1,9 +1,9 @@
 #pragma once
 
 #include "arterial_connection.hpp"
-#include "arterial_ssl.hpp"
-#include "arterial_core.hpp"
 #include "arterial_connection_timer.hpp"
+#include "arterial_core.hpp"
+#include "arterial_ssl.hpp"
 
 namespace arterial {
 
@@ -13,8 +13,7 @@ namespace arterial {
 // Connection Event Handler Implementations
 //=============================================================================
 
-inline Connection::ReadResultData
-Connection::handle_readable(ErlNifEnv* env, PoolContext* ctx)
+inline Connection::ReadResultData Connection::handle_readable(ErlNifEnv* env, PoolContext* ctx)
 {
   if (fd == -1) [[unlikely]]
     return ReadResultData(ReadResult::CLOSED);
@@ -42,7 +41,7 @@ Connection::handle_readable(ErlNifEnv* env, PoolContext* ctx)
 
         ReadResultData result(ReadResult::CONNECT_OK);
         result.send_connect_msg = true;
-        result.connect_result = am_ok;
+        result.connect_result   = am_ok;
         return result;
       } else if (handshake_result == 0) {
         // Still needs READ - arm read event and return
@@ -57,7 +56,7 @@ Connection::handle_readable(ErlNifEnv* env, PoolContext* ctx)
         cleanup_slot_ssl(*this);
         ReadResultData result(ReadResult::CONNECT_FAILED);
         result.send_connect_msg = true;
-        result.connect_result = am_connect_failed;
+        result.connect_result   = am_connect_failed;
         return result;
       }
     }
@@ -71,7 +70,7 @@ Connection::handle_readable(ErlNifEnv* env, PoolContext* ctx)
   // not closed) is authoritative.
   int bytes_available = 0;
   ioctl(fd, FIONREAD, &bytes_available);
-  size_t read_size = bytes_available > 0 ? static_cast<size_t>(bytes_available) : 8192;
+  size_t        read_size = bytes_available > 0 ? static_cast<size_t>(bytes_available) : 8192;
 
   nifpp::binary bin(read_size);
   if (!bin) return ReadResultData(ReadResult::ERROR);
@@ -97,8 +96,7 @@ Connection::handle_readable(ErlNifEnv* env, PoolContext* ctx)
       }
 
       if (ssl_error == SSL_ERROR_SYSCALL) {
-        if (errno == EINTR)
-          goto RETRY0;
+        if (errno == EINTR) goto RETRY0;
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
           cleanup_slot_ssl(*this);
           return ReadResultData(ReadResult::CLOSED);
@@ -107,23 +105,20 @@ Connection::handle_readable(ErlNifEnv* env, PoolContext* ctx)
         return ReadResultData(ReadResult::DATA, nifpp::binary{0});
       }
 
-      if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+      if (ssl_error == SSL_ERROR_ZERO_RETURN)
         return ReadResultData(ReadResult::DATA, nifpp::binary{0});
-      }
 
       cleanup_slot_ssl(*this);
       return ReadResultData(ReadResult::CLOSED);
     }
-  }
-  else
+  } else
 #endif
   {
   RETRY1:
     n = read(fd, bin.data, read_size);
 
     if (n <= 0) {
-      if (errno == EINTR)
-        goto RETRY1;
+      if (errno == EINTR) goto RETRY1;
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         arm_read(env, ctx); // TODO: error handling?
         return ReadResultData(ReadResult::DATA, nifpp::binary{0});
@@ -133,9 +128,9 @@ Connection::handle_readable(ErlNifEnv* env, PoolContext* ctx)
   }
 
   if (static_cast<size_t>(n) < bin.size && !bin.realloc(n)) {
-    #ifdef HAVE_OPENSSL
+#ifdef HAVE_OPENSSL
     cleanup_slot_ssl(*this);
-    #endif
+#endif
     return ReadResultData(ReadResult::CLOSED);
   }
 
@@ -147,12 +142,8 @@ Connection::handle_readable(ErlNifEnv* env, PoolContext* ctx)
   if (fifo_request_active.load(std::memory_order_acquire)) {
     if (is_fifo_enabled()) {
       nifpp::msg_env msg_env;
-      auto reply_msg = make_tuple(msg_env,
-        am_arterial_fifo_reply,
-        stripe_id,
-        slot_id,
-        std::move(bin)
-      );
+      auto           reply_msg =
+          make_tuple(msg_env, am_arterial_fifo_reply, stripe_id, slot_id, std::move(bin));
       enif_send(env, &fifo_requester_pid, msg_env, reply_msg);
       clear_fifo_request();
       // Return empty binary so arterial_connection has nothing to decode.
@@ -165,7 +156,8 @@ Connection::handle_readable(ErlNifEnv* env, PoolContext* ctx)
   return ReadResultData(ReadResult::DATA, std::move(bin));
 }
 
-inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, PoolContext* ctx) {
+inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, PoolContext* ctx)
+{
   if (fd == -1) [[unlikely]]
     return WriteResultData(WriteResult::CLOSED);
 
@@ -173,8 +165,8 @@ inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, P
 
   // Handle connection completion for async connect
   if (current_status == SLOT_CONNECTING) {
-    int so_err = 0;
-    socklen_t len = sizeof(so_err);
+    int       so_err = 0;
+    socklen_t len    = sizeof(so_err);
     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &len) == -1 || so_err != 0) {
       // Connection failed - cancel timeout using RAII cleanup
       cancel_connection_timeout(*this);
@@ -185,9 +177,8 @@ inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, P
       // Check if we need SSL handshake
 #ifdef HAVE_OPENSSL
       if (protocol == PROTO_SSL) {
-        if (!setup_ssl_on_socket(*this, fd)) {
+        if (!setup_ssl_on_socket(*this, fd))
           return WriteResultData(WriteResult::CONNECT_FAILED, true, am_connect_failed);
-        }
 
         // Start non-blocking SSL handshake
         int handshake_result = ssl_handshake_nonblocking(*this, 5000);
@@ -234,8 +225,7 @@ inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, P
   // Handle ongoing SSL handshake
   if (current_status == SLOT_SSL_HANDSHAKE && protocol == PROTO_SSL && ssl) {
     switch (ssl_handshake_nonblocking(*this, 5000)) {
-      case 1:
-      {
+      case 1: {
         // Handshake completed successfully - cancel any active timeout
         cancel_connection_timeout(*this);
         status.store(SLOT_AVAILABLE, std::memory_order_release);
@@ -253,8 +243,7 @@ inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, P
         // Still needs WRITE - arm write event
         arm_write(env, ctx); // TODO: error handling?
         return WriteResultData(WriteResult::HANDSHAKE_WRITE);
-      default:
-      {
+      default: {
         // Handshake failed
         cleanup_slot_ssl(*this);
         return WriteResultData(WriteResult::CONNECT_FAILED, true, am_connect_failed);
@@ -333,13 +322,9 @@ inline Connection::WriteResultData Connection::handle_writable(ErlNifEnv* env, P
 // Connection Establishment Method Implementations
 //=============================================================================
 
-inline Connection::ConnectResultData
-Connection::connect_proto(ErlNifEnv* env, PoolContext* ctx,
-                         unsigned int stripe_id,
-                         const IP4Tuple& octets,
-                         int port, unsigned int timeout_ms,
-                         ProtocolType protocol, bool nodelay,
-                         const ErlNifPid& owner_pid)
+inline Connection::ConnectResultData Connection::connect_proto(
+    ErlNifEnv* env, PoolContext* ctx, unsigned int stripe_id, const IP4Tuple& octets, int port,
+    unsigned int timeout_ms, ProtocolType protocol, bool nodelay, const ErlNifPid& owner_pid)
 {
 #ifndef HAVE_OPENSSL
   // SSL requires OpenSSL at compile time
@@ -348,20 +333,17 @@ Connection::connect_proto(ErlNifEnv* env, PoolContext* ctx,
 #endif
 
   // RAII socket creation - automatic cleanup on all exit paths
-  auto socket_fd = FileDescriptor::create([&]() {
-    return create_socket_for_protocol(protocol);
-  });
+  auto socket_fd = FileDescriptor::create([&]() { return create_socket_for_protocol(protocol); });
 
-  if (!socket_fd)
-    return ConnectResultData(ConnectResult::SOCKET_FAILED, -1, am_socket_failed);
+  if (!socket_fd) return ConnectResultData(ConnectResult::SOCKET_FAILED, -1, am_socket_failed);
 
   if (!configure_socket_for_protocol(socket_fd.get(), protocol, nodelay)) {
     // No manual close() needed - RAII handles cleanup automatically
     return ConnectResultData(ConnectResult::CONFIG_FAILED, -1, am_failed_to_set_nonblocking);
   }
 
-  auto [o0, o1, o2, o3] = octets;
-  uint32_t ip_host = (o0 << 24) | (o1 << 16) | (o2 << 8) | o3;
+  auto [o0, o1, o2, o3]      = octets;
+  uint32_t           ip_host = (o0 << 24) | (o1 << 16) | (o2 << 8) | o3;
   struct sockaddr_in server_addr{};
   server_addr.sin_family      = AF_INET;
   server_addr.sin_port        = htons(static_cast<uint16_t>(port));
@@ -382,13 +364,12 @@ Connection::connect_proto(ErlNifEnv* env, PoolContext* ctx,
     // Connection completed immediately
 #ifdef HAVE_OPENSSL
     if (protocol == PROTO_SSL) {
-      auto& stripe = *ctx->stripes[stripe_id];
-      int  slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
+      auto& stripe  = *ctx->stripes[stripe_id];
+      int   slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
 
-      if (slot_id < 0)
-        return ConnectResultData(ConnectResult::STRIPE_FULL, -1, am_stripe_full);
+      if (slot_id < 0) return ConnectResultData(ConnectResult::STRIPE_FULL, -1, am_stripe_full);
 
-      auto& conn = stripe.slots[slot_id];
+      auto& conn    = stripe.slots[slot_id];
       conn.protocol = protocol;
 
       if (!setup_ssl_on_socket(conn, socket_fd.get())) {
@@ -397,7 +378,7 @@ Connection::connect_proto(ErlNifEnv* env, PoolContext* ctx,
       }
 
       // Transfer socket ownership to connection after successful setup
-      conn.fd = socket_fd.release();
+      conn.fd              = socket_fd.release();
 
       // Perform non-blocking SSL handshake
       int handshake_result = ssl_handshake_nonblocking(conn, timeout_ms);
@@ -429,10 +410,9 @@ Connection::connect_proto(ErlNifEnv* env, PoolContext* ctx,
 #endif
     {
       // For TCP/UDP, proceed with immediate slot claiming
-      auto& stripe = *ctx->stripes[stripe_id];
-      int slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
-      if (slot_id < 0)
-        return ConnectResultData(ConnectResult::STRIPE_FULL, -1, am_stripe_full);
+      auto& stripe  = *ctx->stripes[stripe_id];
+      int   slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
+      if (slot_id < 0) return ConnectResultData(ConnectResult::STRIPE_FULL, -1, am_stripe_full);
 
       // Transfer socket ownership to connection after successful claiming
       stripe.slots[slot_id].fd = socket_fd.release();
@@ -442,11 +422,10 @@ Connection::connect_proto(ErlNifEnv* env, PoolContext* ctx,
     }
   } else if (errno == EINPROGRESS) {
     // Connection in progress, register and set up for async notification
-    auto& stripe = *ctx->stripes[stripe_id];
-    int slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
+    auto& stripe  = *ctx->stripes[stripe_id];
+    int   slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
 
-    if (slot_id < 0)
-      return ConnectResultData(ConnectResult::STRIPE_FULL, -1, am_stripe_full);
+    if (slot_id < 0) return ConnectResultData(ConnectResult::STRIPE_FULL, -1, am_stripe_full);
 
     auto& conn = stripe.slots[slot_id];
 #ifdef HAVE_OPENSSL
@@ -474,12 +453,9 @@ Connection::connect_proto(ErlNifEnv* env, PoolContext* ctx,
   return ConnectResultData(ConnectResult::FAILED, -1, am_connect_failed);
 }
 
-inline Connection::ConnectResultData
-Connection::connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
-                               unsigned int stripe_id,
-                               const IP4Tuple& octets,
-                               int port, ProtocolType protocol, bool nodelay,
-                               const ErlNifPid& owner_pid)
+inline Connection::ConnectResultData Connection::connect_async_proto(
+    ErlNifEnv* env, PoolContext* ctx, unsigned int stripe_id, const IP4Tuple& octets, int port,
+    ProtocolType protocol, bool nodelay, const ErlNifPid& owner_pid)
 {
 #ifndef HAVE_OPENSSL
   // SSL requires OpenSSL at compile time
@@ -488,20 +464,17 @@ Connection::connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
 #endif
 
   // RAII socket creation - automatic cleanup on all exit paths
-  auto socket_fd = FileDescriptor::create([&]() {
-    return create_socket_for_protocol(protocol);
-  });
+  auto socket_fd = FileDescriptor::create([&]() { return create_socket_for_protocol(protocol); });
 
-  if (!socket_fd)
-    return ConnectResultData(ConnectResult::SOCKET_FAILED, -1, am_socket_failed);
+  if (!socket_fd) return ConnectResultData(ConnectResult::SOCKET_FAILED, -1, am_socket_failed);
 
   if (!configure_socket_for_protocol(socket_fd.get(), protocol, nodelay)) {
     // No manual close() needed - RAII handles cleanup automatically
     return ConnectResultData(ConnectResult::CONFIG_FAILED, -1, am_failed_to_set_nonblocking);
   }
 
-  auto [o0, o1, o2, o3] = octets;
-  uint32_t ip_host = (o0 << 24) | (o1 << 16) | (o2 << 8) | o3;
+  auto [o0, o1, o2, o3]      = octets;
+  uint32_t           ip_host = (o0 << 24) | (o1 << 16) | (o2 << 8) | o3;
   struct sockaddr_in server_addr{};
   server_addr.sin_family      = AF_INET;
   server_addr.sin_port        = htons(static_cast<uint16_t>(port));
@@ -516,8 +489,8 @@ Connection::connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
       return ConnectResultData(ConnectResult::FAILED, -1, am_connect_failed);
 
     // UDP connect succeeded, set up the connection immediately
-    auto& stripe = *ctx->stripes[stripe_id];
-    auto slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
+    auto& stripe  = *ctx->stripes[stripe_id];
+    auto  slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
 
     // CRITICAL FIX: For UDP, we need to make the conn available for send_and_release
     // immediately after claiming it, since UDP has no connection handshake phase.
@@ -529,9 +502,8 @@ Connection::connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
       stripe.slots[slot_id].arm_read(env, ctx);
     }
 
-    return slot_id < 0
-         ? ConnectResultData(ConnectResult::STRIPE_FULL, -1, am_stripe_full)
-         : ConnectResultData(ConnectResult::OK, slot_id);
+    return slot_id < 0 ? ConnectResultData(ConnectResult::STRIPE_FULL, -1, am_stripe_full)
+                       : ConnectResultData(ConnectResult::OK, slot_id);
   }
 
   // For TCP/SSL, handle async connection
@@ -540,8 +512,8 @@ Connection::connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
 #ifdef HAVE_OPENSSL
     if (protocol == PROTO_SSL) {
       // Use the centralized claim_slot function
-      auto& stripe = *ctx->stripes[stripe_id];
-      auto slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
+      auto& stripe  = *ctx->stripes[stripe_id];
+      auto  slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
 
       // Check if slot claiming failed
       if (slot_id < 0) {
@@ -549,7 +521,7 @@ Connection::connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
         return ConnectResultData(ConnectResult::STRIPE_FULL, -1, am_connect_failed);
       }
 
-      auto& conn = stripe.slots[slot_id];
+      auto& conn    = stripe.slots[slot_id];
       conn.protocol = protocol;
 
       if (!setup_ssl_on_socket(conn, socket_fd.get())) {
@@ -559,7 +531,7 @@ Connection::connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
       }
 
       // Transfer socket ownership to connection after successful SSL setup
-      conn.fd = socket_fd.release();
+      conn.fd              = socket_fd.release();
 
       // Perform SSL handshake
       int handshake_result = ssl_handshake_nonblocking(conn, 5000);
@@ -590,8 +562,8 @@ Connection::connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
     } else
 #endif
     {
-      auto& stripe = *ctx->stripes[stripe_id];
-      int slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
+      auto& stripe  = *ctx->stripes[stripe_id];
+      int   slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
       if (slot_id < 0) {
         // No manual close() needed - RAII handles cleanup automatically
         return ConnectResultData(ConnectResult::STRIPE_FULL, -1, am_stripe_full);
@@ -604,8 +576,8 @@ Connection::connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
     }
   } else if (errno == EINPROGRESS) {
     // Connection in progress, register and set up for async notification
-    auto& stripe = *ctx->stripes[stripe_id];
-    auto slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
+    auto& stripe  = *ctx->stripes[stripe_id];
+    auto  slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
 
     // Check if slot claiming failed
     if (slot_id < 0) // No manual close() needed - RAII handles cleanup automatically
@@ -641,18 +613,16 @@ Connection::connect_async_proto(ErlNifEnv* env, PoolContext* ctx,
 // Send and Release Method Implementation
 //=============================================================================
 
-inline Connection::SendResultData
-Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
-                            unsigned int stripe_id,
-                            ERL_NIF_TERM data_list)
+inline Connection::SendResultData Connection::send_and_release(
+    ErlNifEnv* env, PoolContext* ctx, unsigned int stripe_id, ERL_NIF_TERM data_list)
 {
-  auto& stripe = *ctx->stripes[stripe_id];
-  auto current_mask = stripe.lease_mask.load(std::memory_order_relaxed);
-  auto slot_id = -1;
+  auto&     stripe       = *ctx->stripes[stripe_id];
+  auto      current_mask = stripe.lease_mask.load(std::memory_order_relaxed);
+  auto      slot_id      = -1;
 
   // Loop with retry limit to prevent infinite loops
-  int retry_count = 0;
-  const int max_retries = stripe.capacity * 2; // Allow reasonable number of retries
+  int       retry_count  = 0;
+  const int max_retries  = stripe.capacity * 2; // Allow reasonable number of retries
 
   do {
     slot_id = std::countr_zero(~current_mask);
@@ -660,12 +630,11 @@ Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
       return SendResultData(SendResult::POOL_BUSY, -1, am_pool_busy);
 
     uint64_t target_bit = (1ULL << slot_id);
-    uint64_t new_mask = current_mask | target_bit;
+    uint64_t new_mask   = current_mask | target_bit;
 
     if (!stripe.lease_mask.compare_exchange_weak(
-          current_mask, new_mask,
-          std::memory_order_acquire,
-          std::memory_order_relaxed)) [[unlikely]] {
+            current_mask, new_mask, std::memory_order_acquire, std::memory_order_relaxed))
+        [[unlikely]] {
       retry_count++;
       if (retry_count >= max_retries) [[unlikely]]
         return SendResultData(SendResult::POOL_BUSY, -1, am_pool_busy);
@@ -673,8 +642,8 @@ Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
     }
 
     // CAS succeeded - now check if slot is available and passes throttling
-    auto& candidate_slot = stripe.slots[slot_id];
-    uint32_t slot_status = candidate_slot.status.load(std::memory_order_acquire);
+    auto&    candidate_slot = stripe.slots[slot_id];
+    uint32_t slot_status    = candidate_slot.status.load(std::memory_order_acquire);
 
     if (slot_status == SLOT_AVAILABLE && candidate_slot.fd >= 0 &&
         throttle_allow(ctx, candidate_slot))
@@ -691,7 +660,7 @@ Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
     if (retry_count >= max_retries) [[unlikely]]
       return SendResultData(SendResult::POOL_BUSY, -1, am_pool_busy);
 
-    current_mask |= target_bit;  // skip this slot on the next scan
+    current_mask |= target_bit; // skip this slot on the next scan
   } while (true);
 
   auto& conn = stripe.slots[slot_id];
@@ -703,10 +672,10 @@ Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
   // Inline storage for the common case (arterial_client always calls
   // this with a single-element list) -- avoids a heap allocation on
   // every write; only lists longer than this fall back to the heap.
-  constexpr size_t s_inline_iov_size = 16;
+  constexpr size_t                            s_inline_iov_size = 16;
   std::array<struct iovec, s_inline_iov_size> inline_iov;
-  std::vector<struct iovec> heap_iov;
-  struct iovec* iov;
+  std::vector<struct iovec>                   heap_iov;
+  struct iovec*                               iov;
   if (list_len <= s_inline_iov_size)
     iov = inline_iov.data();
   else {
@@ -714,8 +683,8 @@ Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
     iov = heap_iov.data();
   }
 
-  unsigned int i = 0;
-  size_t total_bytes = 0;
+  unsigned int i           = 0;
+  size_t       total_bytes = 0;
 
   // Iterate raw list cells; get() would attempt integer coercion for ERL_NIF_TERM,
   // so we use enif_get_list_cell directly to keep each element as a term.
@@ -724,19 +693,19 @@ Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
     while (enif_get_list_cell(env, tail, &head, &tail)) {
       ErlNifBinary bin;
       if (enif_inspect_binary(env, head, &bin)) {
-        iov[i].iov_base = bin.data;
-        iov[i].iov_len  = bin.size;
+        iov[i].iov_base  = bin.data;
+        iov[i].iov_len   = bin.size;
         total_bytes     += bin.size;
         i++;
       }
     }
   }
 
-  ssize_t  written = 0;
-  uint64_t target_bit = (1ULL << slot_id);
+  ssize_t  written       = 0;
+  uint64_t target_bit    = (1ULL << slot_id);
 
   // Handle pending buffer data - combine with new data if necessary
-  size_t pending_bytes = conn.pending_buffer.size() - conn.bytes_written;
+  size_t   pending_bytes = conn.pending_buffer.size() - conn.bytes_written;
 
   // If there's pending data, we need to handle it specially
   if (pending_bytes > 0) {
@@ -757,12 +726,11 @@ Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
 #ifdef HAVE_OPENSSL
     if (conn.ssl) {
     RETRY_PENDING:
-      ssize_t n = SSL_write(conn.ssl,
-                           conn.pending_buffer.data() + conn.bytes_written,
-                           static_cast<int>(remaining));
+      ssize_t n = SSL_write(
+          conn.ssl, conn.pending_buffer.data() + conn.bytes_written, static_cast<int>(remaining));
       if (n > 0) {
         conn.bytes_written += static_cast<size_t>(n);
-        written = static_cast<ssize_t>(conn.bytes_written);
+        written             = static_cast<ssize_t>(conn.bytes_written);
       } else {
         int ssl_error = SSL_get_error(conn.ssl, static_cast<int>(n));
         if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
@@ -792,17 +760,14 @@ Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
           }
         }
       }
-    }
-    else
+    } else
 #endif
     {
     RETRY_PENDING2:
-      ssize_t n = write(conn.fd,
-                       conn.pending_buffer.data() + conn.bytes_written,
-                       remaining);
+      ssize_t n = write(conn.fd, conn.pending_buffer.data() + conn.bytes_written, remaining);
       if (n > 0) {
         conn.bytes_written += static_cast<size_t>(n);
-        written = static_cast<ssize_t>(conn.bytes_written);
+        written             = static_cast<ssize_t>(conn.bytes_written);
       } else if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
           written = static_cast<ssize_t>(conn.bytes_written);
@@ -821,67 +786,66 @@ Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
     // No pending data - proceed with normal write
 
 #ifdef HAVE_OPENSSL
-  if (conn.ssl) {
-    // SSL doesn't support writev, so we need to write sequentially
-    for (unsigned int j = 0; j < i && written >= 0; ++j) {
-    RETRY1:
-      ssize_t n = SSL_write(conn.ssl, iov[j].iov_base, static_cast<int>(iov[j].iov_len));
-      if (n > 0)
-        written += n;
-      else {
-        int ssl_error = SSL_get_error(conn.ssl, static_cast<int>(n));
-        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE)
-          // Would block, we'll handle partial write below
-          break;
-
-        // Handle retryable SSL errors
-        if (ssl_error == SSL_ERROR_WANT_X509_LOOKUP) {
-          // Temporary X.509 error - will retry
-          break;
-        }
-
-        if (ssl_error == SSL_ERROR_SYSCALL) {
-          // Check if it's a temporary system error
-          if (errno == EINTR) [[unlikely]]
-            goto RETRY1;
-          if (errno == EAGAIN || errno == EWOULDBLOCK)
-            // Temporary system error - retry
+    if (conn.ssl) {
+      // SSL doesn't support writev, so we need to write sequentially
+      for (unsigned int j = 0; j < i && written >= 0; ++j) {
+      RETRY1:
+        ssize_t n = SSL_write(conn.ssl, iov[j].iov_base, static_cast<int>(iov[j].iov_len));
+        if (n > 0)
+          written += n;
+        else {
+          int ssl_error = SSL_get_error(conn.ssl, static_cast<int>(n));
+          if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE)
+            // Would block, we'll handle partial write below
             break;
+
+          // Handle retryable SSL errors
+          if (ssl_error == SSL_ERROR_WANT_X509_LOOKUP) {
+            // Temporary X.509 error - will retry
+            break;
+          }
+
+          if (ssl_error == SSL_ERROR_SYSCALL) {
+            // Check if it's a temporary system error
+            if (errno == EINTR) [[unlikely]]
+              goto RETRY1;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+              // Temporary system error - retry
+              break;
+          }
+
+          if (ssl_error == SSL_ERROR_ZERO_RETURN)
+            // Clean SSL shutdown from peer - treat as partial write completion
+            break;
+
+          // Unrecoverable SSL error
+          cleanup_slot_ssl(conn);
+          ctx->notify_and_close(env, conn);
+          return SendResultData(SendResult::WRITE_FAILED, slot_id, am_write_failed);
         }
 
-        if (ssl_error == SSL_ERROR_ZERO_RETURN)
-          // Clean SSL shutdown from peer - treat as partial write completion
+        // Check if we wrote the complete iovec entry
+        if (n < static_cast<ssize_t>(iov[j].iov_len))
+          // Partial write, we need to handle this in the buffer logic below
           break;
-
-        // Unrecoverable SSL error
-        cleanup_slot_ssl(conn);
-        ctx->notify_and_close(env, conn);
-        return SendResultData(SendResult::WRITE_FAILED, slot_id, am_write_failed);
       }
-
-      // Check if we wrote the complete iovec entry
-      if (n < static_cast<ssize_t>(iov[j].iov_len))
-        // Partial write, we need to handle this in the buffer logic below
-        break;
-    }
-  }
-  else
+    } else
 #endif
-  {
-  RETRY2:
-    written = (i > 0) ? writev(conn.fd, iov, i) : 0;
+    {
+    RETRY2:
+      written = (i > 0) ? writev(conn.fd, iov, i) : 0;
 
-    if (written < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-        written = 0;
-      else if (errno == EINTR) [[unlikely]]
-        goto RETRY2;
-      else {
-        ctx->notify_and_close(env, conn);
-        return SendResultData(SendResult::WRITE_FAILED, slot_id, am_write_failed);
+      if (written < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+          written = 0;
+        else if (errno == EINTR) [[unlikely]]
+          goto RETRY2;
+        else {
+          ctx->notify_and_close(env, conn);
+          return SendResultData(SendResult::WRITE_FAILED, slot_id, am_write_failed);
+        }
       }
     }
-  }
   } // End of else block for no pending data
 
   if (static_cast<size_t>(written) < total_bytes) {
@@ -913,21 +877,14 @@ Connection::send_and_release(ErlNifEnv* env, PoolContext* ctx,
 // Socket Options Connection Method Implementations
 //=============================================================================
 
-inline Connection::ConnectResultData
-Connection::connect_with_opts(ErlNifEnv* env, PoolContext* ctx,
-                             unsigned int stripe_id,
-                             const IP4Tuple& octets,
-                             int port, unsigned int timeout_ms,
-                             bool nodelay, const ErlNifPid& owner_pid,
-                             ERL_NIF_TERM socket_opts)
+inline Connection::ConnectResultData Connection::connect_with_opts(
+    ErlNifEnv* env, PoolContext* ctx, unsigned int stripe_id, const IP4Tuple& octets, int port,
+    unsigned int timeout_ms, bool nodelay, const ErlNifPid& owner_pid, ERL_NIF_TERM socket_opts)
 {
   // RAII socket creation - automatic cleanup on all exit paths
-  auto socket_fd = FileDescriptor::create([]() {
-    return socket(AF_INET, SOCK_STREAM, 0);
-  });
+  auto socket_fd = FileDescriptor::create([]() { return socket(AF_INET, SOCK_STREAM, 0); });
 
-  if (!socket_fd)
-    return ConnectResultData(ConnectResult::SOCKET_FAILED, -1, am_socket_failed);
+  if (!socket_fd) return ConnectResultData(ConnectResult::SOCKET_FAILED, -1, am_socket_failed);
 
   // Set non-blocking before applying custom options
   if (fcntl(socket_fd.get(), F_SETFL, O_NONBLOCK) == -1) {
@@ -955,7 +912,7 @@ Connection::connect_with_opts(ErlNifEnv* env, PoolContext* ctx,
   addr.sin_port        = htons(static_cast<uint16_t>(port));
   addr.sin_addr.s_addr = htonl((o0 << 24) | (o1 << 16) | (o2 << 8) | o3);
 
-  int result = connect(socket_fd.get(), (struct sockaddr*)&addr, sizeof(addr));
+  int result           = connect(socket_fd.get(), (struct sockaddr*)&addr, sizeof(addr));
   if (result == -1 && errno != EINPROGRESS)
     return ConnectResultData(ConnectResult::FAILED, -1, am_connect_failed);
 
@@ -966,16 +923,15 @@ Connection::connect_with_opts(ErlNifEnv* env, PoolContext* ctx,
   if (stripe_id >= ctx->stripe_count)
     return ConnectResultData(ConnectResult::FAILED, -1, am_connect_failed);
 
-  PoolStripe& stripe = *ctx->stripes[stripe_id];
-  int slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
-  if (slot_id < 0)
-    return ConnectResultData(ConnectResult::STRIPE_FULL, -1, am_stripe_full);
+  PoolStripe& stripe  = *ctx->stripes[stripe_id];
+  int         slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
+  if (slot_id < 0) return ConnectResultData(ConnectResult::STRIPE_FULL, -1, am_stripe_full);
 
   auto& conn = stripe.slots[slot_id];
 
   // Transfer socket ownership first so conn.fd is live before timerfd_create.
   // This ensures timerfd_create cannot reuse the socket's fd number.
-  conn.fd = socket_fd.release();
+  conn.fd    = socket_fd.release();
 
   if (result == 0) {
     // Connection succeeded immediately
@@ -987,22 +943,17 @@ Connection::connect_with_opts(ErlNifEnv* env, PoolContext* ctx,
     conn.status.store(SLOT_CONNECTING, std::memory_order_release);
     conn.arm_connect(env, ctx);
 
-    if (timeout_ms > 0)
-      conn.set_connect_timeout(ctx, timeout_ms);
+    if (timeout_ms > 0) conn.set_connect_timeout(ctx, timeout_ms);
   }
 
   stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
   return ConnectResultData(result == 0 ? ConnectResult::OK : ConnectResult::CONNECTING, slot_id);
 }
 
-inline Connection::ConnectResultData
-Connection::connect_proto_with_opts(ErlNifEnv* env, PoolContext* ctx,
-                                   unsigned int stripe_id,
-                                   const IP4Tuple& octets,
-                                   int port, unsigned int timeout_ms,
-                                   ProtocolType protocol, bool nodelay,
-                                   const ErlNifPid& owner_pid,
-                                   ERL_NIF_TERM socket_opts)
+inline Connection::ConnectResultData Connection::connect_proto_with_opts(
+    ErlNifEnv* env, PoolContext* ctx, unsigned int stripe_id, const IP4Tuple& octets, int port,
+    unsigned int timeout_ms, ProtocolType protocol, bool nodelay, const ErlNifPid& owner_pid,
+    ERL_NIF_TERM socket_opts)
 {
 #ifndef HAVE_OPENSSL
   if (protocol == PROTO_SSL)
@@ -1010,12 +961,9 @@ Connection::connect_proto_with_opts(ErlNifEnv* env, PoolContext* ctx,
 #endif
 
   // RAII socket creation - automatic cleanup on all exit paths
-  auto socket_fd = FileDescriptor::create([&]() {
-    return create_socket_for_protocol(protocol);
-  });
+  auto socket_fd = FileDescriptor::create([&]() { return create_socket_for_protocol(protocol); });
 
-  if (!socket_fd)
-    return ConnectResultData(ConnectResult::SOCKET_FAILED, -1, am_socket_failed);
+  if (!socket_fd) return ConnectResultData(ConnectResult::SOCKET_FAILED, -1, am_socket_failed);
 
   // Configure socket for protocol (sets non-blocking)
   if (!configure_socket_for_protocol(socket_fd.get(), protocol, false))
@@ -1042,37 +990,36 @@ Connection::connect_proto_with_opts(ErlNifEnv* env, PoolContext* ctx,
   addr.sin_port        = htons(static_cast<uint16_t>(port));
   addr.sin_addr.s_addr = htonl((o0 << 24) | (o1 << 16) | (o2 << 8) | o3);
 
-  int result        = -1;
-  int connect_errno = 0;  // Save errno from connect() call
+  int result           = -1;
+  int connect_errno    = 0; // Save errno from connect() call
 
   // For UDP, we "connect" to set default destination (client mode)
   // This allows send/recv to work with the default peer. For UDP the connect
   // call shouldn't fail.  For TCP/SSL, it should be set to EINPROGRESS.
-  result = connect(socket_fd.get(), (struct sockaddr*)&addr, sizeof(addr));
-  connect_errno = errno;  // Save errno immediately
+  result               = connect(socket_fd.get(), (struct sockaddr*)&addr, sizeof(addr));
+  connect_errno        = errno; // Save errno immediately
   if (result < 0 && (protocol == PROTO_UDP || connect_errno != EINPROGRESS))
     return ConnectResultData(ConnectResult::FAILED, -1, am_connect_failed);
 
   // For EINPROGRESS, connection is in progress - proceed with slot claiming
 
   // Get the stripe for claiming
-  PoolStripe& stripe = *ctx->stripes[stripe_id];
+  PoolStripe& stripe  = *ctx->stripes[stripe_id];
 
-  auto slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
-  if (slot_id < 0)
-    return ConnectResultData(ConnectResult::STRIPE_FULL, -1, am_stripe_full);
+  auto        slot_id = ctx->claim_slot(env, stripe, socket_fd.get(), owner_pid);
+  if (slot_id < 0) return ConnectResultData(ConnectResult::STRIPE_FULL, -1, am_stripe_full);
 
   auto& conn = stripe.slots[slot_id];
-  #ifdef HAVE_OPENSSL
+#ifdef HAVE_OPENSSL
   conn.protocol = protocol;
-  #endif
+#endif
 
   // Transfer socket ownership first so conn.fd is live before timerfd_create.
   // This ensures timerfd_create cannot reuse the socket's fd number.
   conn.fd = socket_fd.release();
 
   switch (protocol) {
-  #ifdef HAVE_OPENSSL
+#ifdef HAVE_OPENSSL
     case PROTO_SSL: {
       if (!setup_ssl_on_socket(conn, conn.fd)) {
         stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
@@ -1104,7 +1051,7 @@ Connection::connect_proto_with_opts(ErlNifEnv* env, PoolContext* ctx,
           return ConnectResultData(ConnectResult::SSL_FAILED, -1, am_connect_failed);
       }
     }
-  #endif
+#endif
 
     case PROTO_TCP:
       if (result == 0) {
@@ -1120,8 +1067,7 @@ Connection::connect_proto_with_opts(ErlNifEnv* env, PoolContext* ctx,
       conn.status.store(SLOT_CONNECTING, std::memory_order_release);
       conn.arm_connect(env, ctx);
 
-      if (timeout_ms > 0)
-        conn.set_connect_timeout(ctx, timeout_ms);
+      if (timeout_ms > 0) conn.set_connect_timeout(ctx, timeout_ms);
 
       stripe.lease_mask.fetch_and(~(1ULL << slot_id), std::memory_order_release);
       return ConnectResultData(ConnectResult::CONNECTING, slot_id);
@@ -1142,29 +1088,26 @@ Connection::connect_proto_with_opts(ErlNifEnv* env, PoolContext* ctx,
 // FIFO Operations Method Implementations
 //=============================================================================
 
-inline Connection::FifoResultData
-Connection::reserve_send_fifo_request(ErlNifEnv* env, PoolContext* ctx,
-                                     unsigned int stripe_id,
-                                     ERL_NIF_TERM data_list,
-                                     unsigned int reserv_timeout,
-                                     unsigned int req_timeout)
+inline Connection::FifoResultData Connection::reserve_send_fifo_request(
+    ErlNifEnv* env, PoolContext* ctx, unsigned int stripe_id, ERL_NIF_TERM data_list,
+    unsigned int reserv_timeout, unsigned int req_timeout)
 {
   // TODO: Implement timeout support for FIFO reservations and requests
-  (void)reserv_timeout;  // Reserved for future implementation
-  (void)req_timeout;     // Reserved for future implementation
+  (void)reserv_timeout; // Reserved for future implementation
+  (void)req_timeout;    // Reserved for future implementation
 
-  auto& stripe = *ctx->stripes[stripe_id];
+  auto&     stripe = *ctx->stripes[stripe_id];
 
   // Get caller PID for queuing if needed
   ErlNifPid caller_pid;
   enif_self(env, &caller_pid);
 
   // Try immediate reservation first (fast path)
-  uint64_t current_mask = stripe.lease_mask.load(std::memory_order_relaxed);
+  uint64_t  current_mask = stripe.lease_mask.load(std::memory_order_relaxed);
 
   // Immediate reservation attempt (limited retries for performance)
-  int retry_count = 0;
-  const int max_retries = 3;  // Reduce retries for better performance
+  int       retry_count  = 0;
+  const int max_retries  = 3; // Reduce retries for better performance
 
   while (retry_count < max_retries) {
     int slot_id = std::countr_zero(~current_mask);
@@ -1175,9 +1118,7 @@ Connection::reserve_send_fifo_request(ErlNifEnv* env, PoolContext* ctx,
     uint64_t new_mask   = current_mask | target_bit;
 
     if (stripe.lease_mask.compare_exchange_weak(
-          current_mask, new_mask,
-          std::memory_order_relaxed, std::memory_order_relaxed)) {
-
+            current_mask, new_mask, std::memory_order_relaxed, std::memory_order_relaxed)) {
       auto& conn = stripe.slots[slot_id];
       // Use relaxed ordering for performance - status check still provides safety
       if (conn.status.load(std::memory_order_relaxed) != SLOT_AVAILABLE) {
@@ -1193,7 +1134,7 @@ Connection::reserve_send_fifo_request(ErlNifEnv* env, PoolContext* ctx,
 
       // Generate reservation ID
       static std::atomic<uint64_t> reservation_counter{1000000};
-      uint64_t id = reservation_counter.fetch_add(1, std::memory_order_relaxed);
+      uint64_t                     id = reservation_counter.fetch_add(1, std::memory_order_relaxed);
 
       if (!conn.set_fifo_request(caller_pid, id)) {
         // Failed to set request - release conn
@@ -1206,12 +1147,12 @@ Connection::reserve_send_fifo_request(ErlNifEnv* env, PoolContext* ctx,
       // Send the request data immediately (combined operation)
       // Use stack-allocated array for better performance (most requests have few segments)
       static constexpr size_t MAX_IOVECS = 32;
-      iovec iovecs[MAX_IOVECS];
-      size_t iovec_count = 0;
-      size_t total_bytes = 0;
+      iovec                   iovecs[MAX_IOVECS];
+      size_t                  iovec_count = 0;
+      size_t                  total_bytes = 0;
 
       // Process the request data and send it
-      ERL_NIF_TERM head, tail = data_list;
+      ERL_NIF_TERM            head, tail = data_list;
       while (enif_get_list_cell(env, tail, &head, &tail) && iovec_count < MAX_IOVECS) {
         ErlNifBinary bin;
         if (!enif_inspect_binary(env, head, &bin)) {
@@ -1219,9 +1160,9 @@ Connection::reserve_send_fifo_request(ErlNifEnv* env, PoolContext* ctx,
           stripe.lease_mask.fetch_and(~target_bit, std::memory_order_release);
           return FifoResultData(FifoResult::PARTIAL, -1, 0, am_partial);
         }
-        iovecs[iovec_count].iov_base = const_cast<void*>(reinterpret_cast<const void*>(bin.data));
-        iovecs[iovec_count].iov_len = bin.size;
-        total_bytes += bin.size;
+        iovecs[iovec_count].iov_base  = const_cast<void*>(reinterpret_cast<const void*>(bin.data));
+        iovecs[iovec_count].iov_len   = bin.size;
+        total_bytes                  += bin.size;
         iovec_count++;
       }
 
@@ -1248,8 +1189,7 @@ Connection::reserve_send_fifo_request(ErlNifEnv* env, PoolContext* ctx,
           conn.clear_fifo_request();
           stripe.lease_mask.fetch_and(~target_bit, std::memory_order_release);
           return FifoResultData(FifoResult::PARTIAL, -1, 0, am_partial);
-        }
-        else if (errno == EINTR) [[unlikely]]
+        } else if (errno == EINTR) [[unlikely]]
           goto REPEAT_WRITE;
         else {
           conn.clear_fifo_request();

@@ -27,6 +27,7 @@
 #include "arterial_connection.hpp"
 #include "arterial_fifo.hxx"
 #include "arterial_core.hpp"
+#include "reactor.hxx"
 #include "arterial_pool.hxx"
 #include "arterial_connection.hxx"
 #include "arterial_connection_timer.hxx"

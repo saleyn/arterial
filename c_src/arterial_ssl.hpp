@@ -11,8 +11,8 @@ namespace arterial {
 //=============================================================================
 
 // Forward declarations for SSL functions used in connection handling
-static bool setup_ssl_on_socket(Connection& slot, int fd);
-static int  ssl_handshake_nonblocking(Connection& slot, int timeout_ms);
+static bool     setup_ssl_on_socket(Connection& slot, int fd);
+static int      ssl_handshake_nonblocking(Connection& slot, int timeout_ms);
 
 // Global SSL context - initialized once
 static SSL_CTX* g_ssl_ctx = nullptr;
@@ -29,12 +29,13 @@ struct SocketOption {
 // SSL Helpers
 //===========================================================================
 
-static bool init_ssl_context() {
+static bool init_ssl_context()
+{
   if (g_ssl_ctx) return true;
 
-
   // Use modern OpenSSL initialization
-  if (OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL) == 0) {
+  if (OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL) ==
+      0) {
     fprintf(stderr, "OPENSSL_init_ssl failed\n");
     ERR_print_errors_fp(stderr);
     return false;
@@ -70,17 +71,22 @@ static bool init_ssl_context() {
     fprintf(stderr, "Failed to set max TLS version to 1.3\n");
 
   // Set both TLS 1.3 ciphersuites and TLS 1.2 cipher list for maximum compatibility
-  if (SSL_CTX_set_ciphersuites(g_ssl_ctx, "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_CCM_SHA256") != 1)
+  if (SSL_CTX_set_ciphersuites(
+          g_ssl_ctx, "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256:"
+                     "TLS_AES_128_CCM_SHA256") != 1)
     fprintf(stderr, "Failed to set TLS 1.3 ciphersuites\n");
 
   // TLS 1.2 cipher list
-  if (SSL_CTX_set_cipher_list(g_ssl_ctx, "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256") != 1)
+  if (SSL_CTX_set_cipher_list(
+          g_ssl_ctx,
+          "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-SHA384:ECDHE-"
+          "RSA-AES128-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256") != 1)
     fprintf(stderr, "Failed to set TLS 1.2 cipher list\n");
 
   // Set supported curves for ECDHE - these are standard curves supported by Erlang
   if (SSL_CTX_set1_curves_list(g_ssl_ctx, "secp256r1:secp384r1:secp521r1") != 1)
     fprintf(stderr, "Failed to set curves list (non-fatal)\n");
-    // This is non-fatal, continue
+  // This is non-fatal, continue
 
   // Set security level to 0 to accept any certificate for testing
   SSL_CTX_set_security_level(g_ssl_ctx, 0);
@@ -89,7 +95,8 @@ static bool init_ssl_context() {
 }
 
 // Cleanup SSL library (called during NIF unload)
-void cleanup_ssl() {
+void cleanup_ssl()
+{
   if (g_ssl_ctx) {
     SSL_CTX_free(g_ssl_ctx);
     g_ssl_ctx = nullptr;
@@ -99,7 +106,8 @@ void cleanup_ssl() {
 }
 
 // Clean up SSL resources for a slot
-void cleanup_slot_ssl(Connection& slot) {
+void cleanup_slot_ssl(Connection& slot)
+{
   if (slot.ssl) {
     SSL_shutdown(slot.ssl);
     SSL_free(slot.ssl);
@@ -108,19 +116,18 @@ void cleanup_slot_ssl(Connection& slot) {
 }
 
 // Helper to setup SSL on a connected socket
-static bool setup_ssl_on_socket(Connection& slot, int fd) {
+static bool setup_ssl_on_socket(Connection& slot, int fd)
+{
   if (!init_ssl_context()) {
     fprintf(stderr, "Failed to initialize SSL context\n");
     return false;
   }
 
-  // Check if socket is actually connected
-  int error = 0;
-  socklen_t len = sizeof(error);
-  if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) != 0 || error != 0) {
-    fprintf(stderr, "Socket not properly connected (error: %d)\n", error);
+  // Check if socket is actually connected (SO_ERROR == 0 means connected)
+  int       error = 0;
+  socklen_t len   = sizeof(error);
+  if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) != 0 || error != 0)
     return false;
-  }
 
   // Ensure socket has adequate buffers for SSL handshake
   int bufsize = 65536;
@@ -135,7 +142,6 @@ static bool setup_ssl_on_socket(Connection& slot, int fd) {
   if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) != 0)
     fprintf(stderr, "Failed to set TCP_NODELAY: %s\n", strerror(errno));
 
-
   // Clean up any existing SSL object first
   if (slot.ssl) {
     SSL_free(slot.ssl);
@@ -148,7 +154,6 @@ static bool setup_ssl_on_socket(Connection& slot, int fd) {
     ERR_print_errors_fp(stderr);
     return false;
   }
-
 
   if (SSL_set_fd(slot.ssl, fd) != 1) {
     fprintf(stderr, "Failed to associate SSL with socket fd %d\n", fd);
@@ -175,14 +180,14 @@ static bool setup_ssl_on_socket(Connection& slot, int fd) {
 // SSL handshake step with proper I/O event handling
 // Returns: 1 = completed, 0 = need read, -2 = need write, -1 = failed
 // TODO: make handshake non-blocking
-static int ssl_handshake_nonblocking(Connection& slot, int /*timeout_ms*/) {
+static int ssl_handshake_nonblocking(Connection& slot, int /*timeout_ms*/)
+{
   if (!slot.ssl) [[unlikely]]
     return -1;
 
   // Ensure socket is in non-blocking mode
   int flags = fcntl(slot.fd, F_GETFL);
-  if (flags != -1 && !(flags & O_NONBLOCK))
-    fcntl(slot.fd, F_SETFL, flags | O_NONBLOCK);
+  if (flags != -1 && !(flags & O_NONBLOCK)) fcntl(slot.fd, F_SETFL, flags | O_NONBLOCK);
 
   // Attempt SSL handshake
   int result = SSL_connect(slot.ssl);
@@ -194,9 +199,9 @@ static int ssl_handshake_nonblocking(Connection& slot, int /*timeout_ms*/) {
   int ssl_error = SSL_get_error(slot.ssl, result);
 
   switch (ssl_error) {
-    case SSL_ERROR_WANT_READ:  return  0; // Need to read more data
+    case SSL_ERROR_WANT_READ:  return 0;  // Need to read more data
     case SSL_ERROR_WANT_WRITE: return -2; // Need to write more data
-    default:                   return -1; // Actual error
+    default:                   return -1;                   // Actual error
   }
 }
 

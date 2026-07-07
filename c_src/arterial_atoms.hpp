@@ -2,12 +2,12 @@
 
 namespace arterial {
 
-using ::nifpp::am_true;
-using ::nifpp::am_false;
-using ::nifpp::am_ok;
 using ::nifpp::am_error;
-using ::nifpp::am_undefined;
+using ::nifpp::am_false;
 using ::nifpp::am_nil;
+using ::nifpp::am_ok;
+using ::nifpp::am_true;
+using ::nifpp::am_undefined;
 
 NIFPP_ADD_KNOWN_ATOM(am_add_membership);
 NIFPP_ADD_KNOWN_ATOM(am_alloc_failed);

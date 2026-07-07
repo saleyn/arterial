@@ -1,7 +1,7 @@
 #pragma once
 
-#include "enif.hpp"
 #include "arterial_types.hpp"
+#include "enif.hpp"
 #include <memory>
 
 // Platform-specific includes
@@ -11,22 +11,23 @@
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
 #include <sys/event.h>
-#include <sys/types.h>
 #include <sys/time.h>
+#include <sys/types.h>
 #endif
 
-#include <unistd.h>
 #include <fcntl.h>
+#include <unistd.h>
 
 // Generic fallback headers (for platforms without timerfd/kqueue)
-#if !defined(__linux__) && !defined(__APPLE__) && !defined(__FreeBSD__) && !defined(__OpenBSD__) && !defined(__NetBSD__)
-#include <thread>
-#include <chrono>
+#if !defined(__linux__) && !defined(__APPLE__) && !defined(__FreeBSD__) && \
+    !defined(__OpenBSD__) && !defined(__NetBSD__)
 #include <atomic>
-#include <mutex>
+#include <chrono>
 #include <condition_variable>
-#include <unordered_map>
+#include <mutex>
 #include <queue>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 #endif
 
@@ -48,7 +49,7 @@ struct Connection;
 ///   2. Register timeout_fd with enif_select
 ///   3. When timeout_fd becomes ready → connection timed out
 ///   4. When connection succeeds → call close_connection_timeout_fd(timeout_fd)
-inline int create_connection_timeout_fd(uint64_t timeout_ms);
+inline int  create_connection_timeout_fd(uint64_t timeout_ms);
 
 /// @brief Close and cleanup a timeout fd created by create_connection_timeout_fd
 /// @param timeout_fd File descriptor returned by create_connection_timeout_fd
@@ -78,33 +79,31 @@ public:
   /// @brief Factory method to create timeout with RAII guarantees
   /// @param timeout_ms Timeout in milliseconds
   /// @return unique_ptr to ConnectionTimeout, nullptr on failure
-  static std::unique_ptr<ConnectionTimeout> create(uint64_t timeout_ms) {
+  static std::unique_ptr<ConnectionTimeout> create(uint64_t timeout_ms)
+  {
     int timeout_fd = create_connection_timeout_fd(timeout_ms);
-    if (timeout_fd < 0) {
-      return nullptr;  // Failed to create timeout
-    }
+    if (timeout_fd < 0) return nullptr; // Failed to create timeout
 
     // Use private constructor - can't fail after this point
     return std::unique_ptr<ConnectionTimeout>(new ConnectionTimeout(timeout_fd));
   }
 
   /// @brief Destructor - automatically cleans up timeout resources
-  ~ConnectionTimeout() noexcept {
-    cleanup();
-  }
+  ~ConnectionTimeout() noexcept { cleanup(); }
 
   /// @brief Move constructor - transfer ownership
-  ConnectionTimeout(ConnectionTimeout&& other) noexcept
-    : m_timeout_fd(other.m_timeout_fd) {
-    other.m_timeout_fd = -1;  // Transfer ownership
+  ConnectionTimeout(ConnectionTimeout&& other) noexcept : m_timeout_fd(other.m_timeout_fd)
+  {
+    other.m_timeout_fd = -1; // Transfer ownership
   }
 
   /// @brief Move assignment - transfer ownership with cleanup
-  ConnectionTimeout& operator=(ConnectionTimeout&& other) noexcept {
+  ConnectionTimeout& operator=(ConnectionTimeout&& other) noexcept
+  {
     if (this != &other) {
-      cleanup();  // Clean up current resource
-      m_timeout_fd = other.m_timeout_fd;
-      other.m_timeout_fd = -1;  // Transfer ownership
+      cleanup();               // Clean up current resource
+      m_timeout_fd       = other.m_timeout_fd;
+      other.m_timeout_fd = -1; // Transfer ownership
     }
     return *this;
   }
@@ -114,7 +113,7 @@ public:
 
   /// @brief Get the timeout file descriptor (for enif_select)
   /// @return File descriptor, or -1 if inactive
-  int get_fd() const noexcept { return m_timeout_fd; }
+  int  get_fd() const noexcept { return m_timeout_fd; }
 
   /// @brief Explicitly cancel timeout (optional - destructor will do this)
   void cancel() noexcept { cleanup(); }
@@ -122,9 +121,10 @@ public:
   /// @brief Release ownership of the timeout fd (advanced usage)
   /// @return The file descriptor (caller takes ownership)
   /// @warning Caller must call close_connection_timeout_fd() on the returned fd
-  int release() noexcept {
-    int fd = m_timeout_fd;
-    m_timeout_fd = -1;  // Release ownership
+  int  release() noexcept
+  {
+    int fd       = m_timeout_fd;
+    m_timeout_fd = -1; // Release ownership
     return fd;
   }
 
@@ -133,17 +133,18 @@ private:
   explicit ConnectionTimeout(int timeout_fd) noexcept : m_timeout_fd(timeout_fd) {}
 
   /// @brief Internal cleanup method
-  void cleanup() noexcept {
+  void cleanup() noexcept
+  {
     if (m_timeout_fd >= 0) {
       close_connection_timeout_fd(m_timeout_fd);
       m_timeout_fd = -1;
     }
   }
 
-  int m_timeout_fd;  // Platform-specific timeout file descriptor (-1 = inactive)
+  int m_timeout_fd; // Platform-specific timeout file descriptor (-1 = inactive)
 
   // Non-copyable (move-only)
-  ConnectionTimeout(const ConnectionTimeout&) = delete;
+  ConnectionTimeout(const ConnectionTimeout&)            = delete;
   ConnectionTimeout& operator=(const ConnectionTimeout&) = delete;
 };
 
@@ -170,11 +171,11 @@ public:
   /// @param timeout_ms Timeout in milliseconds (0 = no timeout)
   /// @param setup_enif_select Whether to register with enif_select automatically
   TimeoutGuard(Connection& conn, uint64_t timeout_ms, bool setup_enif_select = false)
-    : m_conn(conn), m_dismissed(timeout_ms == 0) {
-
+      : m_conn(conn), m_dismissed(timeout_ms == 0)
+  {
     if (timeout_ms > 0) {
       m_timeout_fd = create_connection_timeout_fd(timeout_ms);
-      m_active = (m_timeout_fd >= 0);
+      m_active     = (m_timeout_fd >= 0);
 
       if (m_active && setup_enif_select) {
         // TODO: Add enif_select registration if needed
@@ -184,34 +185,31 @@ public:
   }
 
   /// @brief Destructor - automatically cancels timeout if not dismissed
-  ~TimeoutGuard() noexcept {
-    if (m_active && !m_dismissed && m_timeout_fd >= 0) {
-      close_connection_timeout_fd(m_timeout_fd);
-    }
+  ~TimeoutGuard() noexcept
+  {
+    if (m_active && !m_dismissed && m_timeout_fd >= 0) close_connection_timeout_fd(m_timeout_fd);
   }
 
   /// @brief Dismiss the timeout guard (connection succeeded)
-  void dismiss() noexcept {
-    m_dismissed = true;
-  }
+  void dismiss() noexcept { m_dismissed = true; }
 
   /// @brief Check if timeout is active and not dismissed
   bool is_active() const noexcept { return m_active && !m_dismissed; }
 
   /// @brief Get the timeout file descriptor
-  int get_fd() const noexcept { return m_timeout_fd; }
+  int  get_fd() const noexcept { return m_timeout_fd; }
 
 private:
   Connection& m_conn;
-  int m_timeout_fd{-1};
-  bool m_active{false};
-  bool m_dismissed{false};
+  int         m_timeout_fd{-1};
+  bool        m_active{false};
+  bool        m_dismissed{false};
 
   // Non-copyable, non-movable (tied to specific connection)
-  TimeoutGuard(const TimeoutGuard&) = delete;
+  TimeoutGuard(const TimeoutGuard&)            = delete;
   TimeoutGuard& operator=(const TimeoutGuard&) = delete;
-  TimeoutGuard(TimeoutGuard&&) = delete;
-  TimeoutGuard& operator=(TimeoutGuard&&) = delete;
+  TimeoutGuard(TimeoutGuard&&)                 = delete;
+  TimeoutGuard& operator=(TimeoutGuard&&)      = delete;
 };
 
 //=============================================================================
@@ -222,7 +220,7 @@ private:
 /// @param conn Connection to setup timeout for
 /// @param timeout_ms Timeout in milliseconds (0 = no timeout)
 /// @return timeout fd for enif_select, or -1 if no timeout or error
-inline int setup_connection_timeout_fd(Connection& conn, uint64_t timeout_ms);
+inline int  setup_connection_timeout_fd(Connection& conn, uint64_t timeout_ms);
 
 /// @brief Cancel connection timeout if active
 inline void cancel_connection_timeout(Connection& conn);

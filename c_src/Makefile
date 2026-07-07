@@ -145,7 +145,7 @@ else
   URING_LDFLAGS :=
 endif
 
-$(REACTOR_TEST_OBJ): reactor_test.cpp reactor.hpp reactor_platform.hpp erl_nif_stub.h | $(OBJ_DIR)
+$(REACTOR_TEST_OBJ): reactor_test.cpp reactor.hxx reactor.hpp reactor_platform.hpp erl_nif_stub.h | $(OBJ_DIR)
 	$(CXX) -c $(CXXFLAGS) $(URING_CFLAGS) -DREACTOR_TEST_STUB_NIF -o $@ $<
 
 $(REACTOR_TEST): $(REACTOR_TEST_OBJ) $(HDRS) | $(PRIV_DIR)
@@ -158,7 +158,7 @@ test_reactor: $(REACTOR_TEST)
 REACTOR_BENCH     := $(PRIV_DIR)/reactor_bench
 REACTOR_BENCH_OBJ := $(OBJ_DIR)/reactor_bench.o
 
-$(REACTOR_BENCH_OBJ): reactor_bench.cpp reactor.hpp reactor_platform.hpp erl_nif_stub.h | $(OBJ_DIR)
+$(REACTOR_BENCH_OBJ): reactor_bench.cpp reactor.hxx reactor.hpp reactor_platform.hpp erl_nif_stub.h | $(OBJ_DIR)
 	$(CXX) -c $(CXXFLAGS) $(URING_CFLAGS) -DREACTOR_TEST_STUB_NIF -o $@ $<
 
 $(REACTOR_BENCH): $(REACTOR_BENCH_OBJ) | $(PRIV_DIR)

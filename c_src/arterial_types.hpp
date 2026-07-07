@@ -1,20 +1,19 @@
 #pragma once
 
+#include "arterial_types.hpp"
+#include "enif.hpp"
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <type_traits>
-#include <cstdint>
-#include <cstddef>
-#include <utility>  // for std::exchange
 #include <unistd.h> // for close()
-#include "enif.hpp"
-#include "arterial_types.hpp"
+#include <utility>  // for std::exchange
 
 namespace arterial {
 
 using namespace nifpp;
-using IP4Tuple =
-  std::tuple<unsigned int, unsigned int, unsigned int, unsigned int>;
+using IP4Tuple = std::tuple<unsigned int, unsigned int, unsigned int, unsigned int>;
 
 //=============================================================================
 // Core Types and Enumerations
@@ -29,17 +28,12 @@ enum SlotStatus : uint32_t {
   SLOT_SSL_HANDSHAKE     = 5,
   SLOT_BUSY              = 6,
   // FIFO Mode 3 statuses
-  SLOT_FIFO_RESERVED     = 100,  // Mode 3: Connection reserved for single request
-  SLOT_FIFO_REQUEST_SENT = 101,  // Mode 3: Request sent, awaiting reply
-  SLOT_FIFO_DRAINING     = 102   // Mode 3: Processing reply, about to release
+  SLOT_FIFO_RESERVED     = 100, // Mode 3: Connection reserved for single request
+  SLOT_FIFO_REQUEST_SENT = 101, // Mode 3: Request sent, awaiting reply
+  SLOT_FIFO_DRAINING     = 102  // Mode 3: Processing reply, about to release
 };
 
-enum ProtocolType : uint32_t {
-  PROTO_UNKNOWN = 0,
-  PROTO_TCP     = 1,
-  PROTO_UDP     = 2,
-  PROTO_SSL     = 3
-};
+enum ProtocolType : uint32_t { PROTO_UNKNOWN = 0, PROTO_TCP = 1, PROTO_UDP = 2, PROTO_SSL = 3 };
 
 //=============================================================================
 // The protocol dispatcher
@@ -48,12 +42,12 @@ enum ProtocolType : uint32_t {
 template <typename Visitor>
 void visit_protocol(ProtocolType proto, Visitor&& visitor) {
   switch (proto) {
-    case PROTO_SSL: 
-      return visitor(std::integral_constant<ProtocolType, PROTO_SSL>{}); 
-    case PROTO_UDP: 
-      return visitor(std::integral_constant<ProtocolType, PROTO_UDP>{}); 
-    default:        
-      return visitor(std::integral_constant<ProtocolType, PROTO_TCP>{}); 
+    case PROTO_SSL:
+      return visitor(std::integral_constant<ProtocolType, PROTO_SSL>{});
+    case PROTO_UDP:
+      return visitor(std::integral_constant<ProtocolType, PROTO_UDP>{});
+    default:
+      return visitor(std::integral_constant<ProtocolType, PROTO_TCP>{});
   }
 }
 
@@ -123,16 +117,14 @@ public:
   explicit FileDescriptor(int fd) noexcept : m_fd(fd) {}
 
   /// @brief Destructor - automatically closes the file descriptor
-  ~FileDescriptor() noexcept {
-    close();
-  }
+  ~FileDescriptor() noexcept { close(); }
 
   /// @brief Move constructor
-  FileDescriptor(FileDescriptor&& other) noexcept
-    : m_fd(std::exchange(other.m_fd, INVALID_FD)) {}
+  FileDescriptor(FileDescriptor&& other) noexcept : m_fd(std::exchange(other.m_fd, INVALID_FD)) {}
 
   /// @brief Move assignment operator
-  FileDescriptor& operator=(FileDescriptor&& other) noexcept {
+  FileDescriptor& operator=(FileDescriptor&& other) noexcept
+  {
     if (this != &other) {
       close();
       m_fd = std::exchange(other.m_fd, INVALID_FD);
@@ -141,45 +133,56 @@ public:
   }
 
   /// @brief Copy operations are deleted to prevent double-close
-  FileDescriptor(const FileDescriptor&) = delete;
+  FileDescriptor(const FileDescriptor&)            = delete;
   FileDescriptor& operator=(const FileDescriptor&) = delete;
 
   /// @brief Factory method for safe fd creation
   /// @param creator Function that creates the file descriptor
   /// @return FileDescriptor wrapper, or empty wrapper if creation failed
-  template<typename Creator>
-  static FileDescriptor create(Creator&& creator) {
+  template <typename Creator>
+  static FileDescriptor create(Creator&& creator)
+  {
     int fd = creator();
     return (fd >= 0) ? FileDescriptor(fd) : FileDescriptor();
   }
 
   /// @brief Get the raw file descriptor
   /// @return File descriptor value, or INVALID_FD if not valid
-  int get() const noexcept { return m_fd; }
+  int      get() const noexcept { return m_fd; }
 
   explicit operator int() const { return m_fd; }
 
   /// @brief Check if the file descriptor is valid
   /// @return true if fd >= 0
-  bool is_valid() const noexcept { return m_fd >= 0; }
+  bool     is_valid() const noexcept { return m_fd >= 0; }
 
   /// @brief Boolean conversion - true if valid
   explicit operator bool() const noexcept { return is_valid(); }
 
   /// @brief Release ownership of the file descriptor
   /// @return The file descriptor value (caller becomes responsible for closing)
-  int release() noexcept { return std::exchange(m_fd, INVALID_FD); }
+  int      release() noexcept { return std::exchange(m_fd, INVALID_FD); }
 
   /// @brief Reset to a new file descriptor (closes current fd)
   /// @param fd New file descriptor to manage
-  void reset(int fd = INVALID_FD) noexcept { close(); m_fd = fd; }
+  void     reset(int fd = INVALID_FD) noexcept
+  {
+    close();
+    m_fd = fd;
+  }
 
   /// @brief Manual close (safe to call multiple times)
-  void close() noexcept { if (m_fd >= 0) { ::close(m_fd); m_fd = INVALID_FD; } }
+  void close() noexcept
+  {
+    if (m_fd >= 0) {
+      ::close(m_fd);
+      m_fd = INVALID_FD;
+    }
+  }
 
 private:
   static constexpr int INVALID_FD = -1;
-  int m_fd = INVALID_FD;
+  int                  m_fd       = INVALID_FD;
 };
 
 //=============================================================================
@@ -187,23 +190,22 @@ private:
 //=============================================================================
 
 // Simple optional implementation for C++14 compatibility
-template<typename T>
+template <typename T>
 struct simple_optional {
   simple_optional() = default;
-  simple_optional(const T& value) : m_has_value(true) {
-    new(m_storage) T(value);
-  }
-  ~simple_optional() {
-    if (m_has_value)
-      reinterpret_cast<T*>(m_storage)->~T();
+  simple_optional(const T& value) : m_has_value(true) { new (m_storage) T(value); }
+  ~simple_optional()
+  {
+    if (m_has_value) reinterpret_cast<T*>(m_storage)->~T();
   }
 
-  bool     has_value()      const { return m_has_value; }
-  explicit operator bool()  const { return m_has_value; }
-  T&       operator*()            { return *reinterpret_cast<T*>(m_storage); }
-  const T& operator*()      const { return *reinterpret_cast<const T*>(m_storage); }
+  bool     has_value() const { return m_has_value; }
+  explicit operator bool() const { return m_has_value; }
+  T&       operator*() { return *reinterpret_cast<T*>(m_storage); }
+  const T& operator*() const { return *reinterpret_cast<const T*>(m_storage); }
+
 private:
-  bool            m_has_value = false;
+  bool m_has_value = false;
   alignas(T) char m_storage[sizeof(T)];
 };
 
@@ -215,8 +217,8 @@ private:
 static constexpr std::size_t MAX_SLOTS_PER_STRIPE = 64;
 
 // FIFO queue constants
-static constexpr std::size_t FIFO_QUEUE_SIZE = 64;
-static constexpr std::size_t FIFO_QUEUE_MASK = FIFO_QUEUE_SIZE - 1;
+static constexpr std::size_t FIFO_QUEUE_SIZE      = 64;
+static constexpr std::size_t FIFO_QUEUE_MASK      = FIFO_QUEUE_SIZE - 1;
 
 //=============================================================================
 // Pool Utilization Stats
@@ -235,13 +237,14 @@ struct PoolUtilization {
 //=============================================================================
 
 // Compatibility function for counting trailing zeros (needed by other headers)
-inline int count_trailing_zeros(uint64_t value) {
+inline int count_trailing_zeros(uint64_t value)
+{
 #if (__cplusplus >= 202002L) || (defined(_MSVC_LANG) && _MSVC_LANG >= 202002L)
   return std::countr_zero(value);
 #elif defined(__has_builtin) && __has_builtin(__builtin_ctzll)
   return value ? __builtin_ctzll(value) : 64;
 #else
-  #warning "No support for GCC __builtin_ctzll"
+#warning "No support for GCC __builtin_ctzll"
   // Fallback implementation
   if (value == 0) return 64;
   int count = 0;
@@ -254,7 +257,8 @@ inline int count_trailing_zeros(uint64_t value) {
 }
 
 // Count one bits in an integer (needed by other headers)
-inline size_t count_one_bits(uint64_t value) {
+inline size_t count_one_bits(uint64_t value)
+{
 #if (__cplusplus >= 202002L) || (defined(_MSVC_LANG) && _MSVC_LANG >= 202002L)
   return std::popcount(value);
 #elif defined(__has_builtin) && __has_builtin(_mm_popcnt_u64)
@@ -262,7 +266,7 @@ inline size_t count_one_bits(uint64_t value) {
 #elif defined(__has_builtin) && __has_builtin(__builtin_popcountll)
   return __builtin_popcountll(value);
 #else
-  #error "No support for GCC __builtin_popcountll"
+#error "No support for GCC __builtin_popcountll"
 #endif
 }
 

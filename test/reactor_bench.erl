@@ -6,12 +6,12 @@
 %%
 %% Scenarios
 %% ---------
-%%   1. C++ server (Reactor)   <->  C++ client (Reactor)
-%%   2. C++ server (Reactor)   <->  Erl client (gen_tcp)
-%%   3. Erl server (gen_tcp)   <->  Erl client (gen_tcp)
-%%   4. C++ server (Reactor)   <->  Erl client (Reactor NIF)
+%%   1. C++ server (Reactor)     <-> C++ client (Reactor)
+%%   2. C++ server (Reactor)     <-> Erl client (gen_tcp)
+%%   3. Erl server (gen_tcp)     <-> Erl client (gen_tcp)
+%%   4. C++ server (Reactor)     <-> Erl client (Reactor NIF)
 %%   5. Erl server (Reactor NIF) <-> C++ client (Reactor)
-%%   6. Erl server (gen_tcp)   <->  C++ client (Reactor)
+%%   6. Erl server (gen_tcp)     <-> C++ client (Reactor)
 %%   7. Erl server (Reactor NIF) <-> Erl client (Reactor NIF)
 %%
 %% Usage:
@@ -34,7 +34,7 @@
 
 -define(CONNS,    8).
 -define(REQS,     2_000).
--define(MSG_SIZE, 8).
+-define(MSG_SIZE, 128).
 -define(TIMEOUT,  5_000).
 -define(STRIPES,  0).   %% 0 = one stripe per connection
 
