@@ -28,7 +28,6 @@ s4_debug_test() ->
     end || P <- Pids],
     T1 = erlang:monotonic_time(millisecond),
     Errs = length([X || X <- Results, X =:= timeout]),
-    io:format(standard_error, "done in ~pms, timeouts=~p~n", [T1-T0, Errs]),
     Port ! {self(), close},
     ?assertEqual(0, Errs)
   after 3000 -> ?assert(false)
