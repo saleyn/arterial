@@ -8,7 +8,7 @@ DEBUG    ?= 0
 REBAR    ?= rebar3
 APP      := $(shell sed -nE 's/^\{application, ([a-zA-Z0-9_]+),.*/\1/p' src/*.app.src | head -n1)
 
-all: deps.get compile
+all: deps.get compile $(if $(filter 1 Y yes,$(TEST)),reactor-bins)
 
 deps.get:
 	rebar3 get-deps
@@ -16,8 +16,13 @@ deps.get:
 compile:
 	rebar3 $@
 
+# Build reactor_test and reactor_bench standalone binaries.
+# Invoked automatically when TEST=1 make is run.
+reactor-bins:
+	$(MAKE) -C c_src TEST=1 $(PRIV_DIR)/reactor_test $(PRIV_DIR)/reactor_bench
+
 nif:	# Invoked by rebar3 through compile pre-hook
-	$(MAKE) -C c_src $(if $(findstring /test,$(REBAR_BUILD_DIR)),TEST=1,)
+	$(MAKE) -C c_src $(if $(filter 1 Y yes,$(TEST)),TEST=1,)
 
 cover:
 	$(REBAR) cover --verbose
@@ -140,6 +145,9 @@ bench-reactor:
 clean:
 	$(MAKE) -C c_src $@
 	rebar3 clean
+
+info:
+	$(MAKE) -C c_src $@
 
 distclean: clean
 	rm -fr _build obj doc

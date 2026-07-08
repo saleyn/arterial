@@ -62,10 +62,14 @@ else
   EXT := .so
 endif
 
-SRC        := arterial_nif.cpp
-NIF_SUFFIX := $(if $(filter 1,$(TEST)),_test,)
-OBJ        := $(OBJ_DIR)/arterial$(NIF_SUFFIX).o
-TARGET     := $(PRIV_DIR)/arterial$(NIF_SUFFIX)$(EXT)
+TEST          := $(if $(filter 1 Y yes,$(TEST)),yes)
+SRC           := arterial_nif.cpp
+NIF_SUFFIX    := $(if $(TEST),_test,)
+OBJ           := $(OBJ_DIR)/arterial$(NIF_SUFFIX).o
+TARGET        := $(PRIV_DIR)/arterial$(NIF_SUFFIX)$(EXT)
+
+REACTOR_TEST  := $(PRIV_DIR)/reactor_test
+REACTOR_BENCH := $(PRIV_DIR)/reactor_bench
 
 # Detect compiler family for LTO flags.
 # AppleClang uses ld64 which handles thin-LTO natively — no -fuse-ld=lld.
@@ -105,7 +109,13 @@ else
 	LDFLAGS  += $(LINK_FLAGS)
 endif
 
-all: $(TARGET)
+all: $(TARGET) $(if $(TEST),$(REACTOR_TEST) $(REACTOR_BENCH))
+
+info:
+	@echo "Targets: 	$(TARGET) $(if $(TEST),$(REACTOR_TEST) $(REACTOR_BENCH))"
+	@echo "Test:    	$(TEST)"
+	@echo "CXXFLAGS:	$(CXXFLAGS)"
+	@echo "LDFLAGS:   $(LDFLAGS)"
 
 $(TARGET): $(OBJ) | $(PRIV_DIR)
 	$(CXX) $(LDFLAGS) $(POOL_LDFLAGS) $(SHARED_LDFLAGS) -I$(ERL_INC) -o $@ $<
@@ -134,7 +144,6 @@ $(OBJ): $(SRC) $(HDRS) | $(OBJ_DIR)
 $(PRIV_DIR) $(OBJ_DIR) $(TEST_DIR):
 	@mkdir -p $@
 
-REACTOR_TEST := $(PRIV_DIR)/reactor_test
 REACTOR_TEST_OBJ := $(OBJ_DIR)/reactor_test.o
 # Use the same WSL-aware uring selection as the NIF build above.
 ifeq ($(_HAS_URING),yes)
@@ -151,11 +160,10 @@ $(REACTOR_TEST_OBJ): reactor_test.cpp reactor.hxx reactor.hpp reactor_platform.h
 $(REACTOR_TEST): $(REACTOR_TEST_OBJ) $(HDRS) | $(PRIV_DIR)
 	$(CXX) $(LDFLAGS) $(URING_LDFLAGS) -o $@ $< -lpthread
 
-test_reactor: $(REACTOR_TEST)
+test-reactor: $(REACTOR_TEST)
 	@echo "==> Running reactor C++ tests"
 	$(REACTOR_TEST)
 
-REACTOR_BENCH     := $(PRIV_DIR)/reactor_bench
 REACTOR_BENCH_OBJ := $(OBJ_DIR)/reactor_bench.o
 
 $(REACTOR_BENCH_OBJ): reactor_bench.cpp reactor.hxx reactor.hpp reactor_platform.hpp erl_nif_stub.h | $(OBJ_DIR)
@@ -197,4 +205,4 @@ enif.hpp:
 	curl -s -O https://raw.githubusercontent.com/saleyn/nifpp/main/enif.hpp
 
 clean:
-	rm -f *.o $(PRIV_DIR)/arterial_nif.so $(OBJ_DIR)/*.o
+	rm -f $(PRIV_DIR)/*$(EXT) $(OBJ_DIR)/*.o
