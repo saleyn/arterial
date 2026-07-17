@@ -132,6 +132,7 @@ static ErlNifFunc nif_funcs[] = {
     {"reserve_send_fifo_request", 5, reserve_send_fifo_request_nif, 0},
 
     // Corr-map NIFs
+    {        "register_and_send", 5,         register_and_send_nif, 0},
     {        "register_and_send", 6,         register_and_send_nif, 0},
     {          "unregister_corr", 3,           unregister_corr_nif, 0},
     {   "lookup_and_remove_corr", 3,    lookup_and_remove_corr_nif, 0},

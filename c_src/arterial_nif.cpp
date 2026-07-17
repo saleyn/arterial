@@ -947,7 +947,7 @@ static ERL_NIF_TERM handle_fifo_reply_nif(
   PoolContext* ctx;
   unsigned int stripe_id, slot_id;
 
-  assert(argc == 3);
+  assert(argc == 4);
 
   if  (!get(env, argv[0], ctx)
     || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count-1))
@@ -968,7 +968,7 @@ static ERL_NIF_TERM handle_fifo_reply_nif(
   auto reply_msg = make(msg_env, std::make_tuple(
     am_arterial_fifo_reply,
     stripe_id, slot_id, argv[3]
-  ));
+  ));  // argv[3] is the 4th argument (arity=4)
 
   enif_send(env, &conn.fifo_requester_pid, msg_env, reply_msg);
 
@@ -1063,13 +1063,18 @@ static ERL_NIF_TERM reserve_send_fifo_request_nif(
 #endif
 
 //-----------------------------------------------------------------------------
-// register_and_send(PoolRef, StripeId, CorrId, CallerPid, DeadlineUs, DataList)
+// register_and_send/5 (PoolRef, StripeId, CorrId, TimeoutMs, Data)
 //   → {ok, SlotId} | {error, Reason}
 //
-// Atomically inserts the correlation entry and then sends the data in one NIF
-// call, replacing the two-call sequence register_corr + send_and_release on
-// the hot path.  On send failure the correlation entry is removed before
-// returning the error so the caller does not need to call unregister_corr.
+// Hot-path variant: uses enif_self() for the caller pid and computes the
+// absolute deadline internally from the relative TimeoutMs argument (avoids
+// os:system_time + self() BIF calls in Erlang).  Data may be either a binary
+// or an iolist.  TimeoutMs may be the atom 'infinity' for no deadline.
+//-----------------------------------------------------------------------------
+// register_and_send/6 (PoolRef, StripeId, CorrId, CallerPid, DeadlineUs, DataList)
+//   → {ok, SlotId} | {error, Reason}
+//
+// Legacy/explicit variant: caller passes pid and absolute deadline directly.
 //-----------------------------------------------------------------------------
 static ERL_NIF_TERM register_and_send_nif(
   ErlNifEnv* env, [[maybe_unused]] int argc, const ERL_NIF_TERM argv[])
@@ -1077,35 +1082,75 @@ static ERL_NIF_TERM register_and_send_nif(
   PoolContext* ctx;
   unsigned int stripe_id, corr_id;
   ErlNifPid    caller_pid;
-  ErlNifSInt64 deadline_us;
+  int64_t      deadline_us;
+  ERL_NIF_TERM data_term;
 
-  assert(argc == 6);
+  if (argc == 5) {
+    // Hot path: register_and_send(PoolRef, StripeId, CorrId, TimeoutMs, Data)
+    if  (!get(env, argv[0], ctx)
+      || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count - 1))
+      || !get(env, argv[2], corr_id)) [[unlikely]]
+      return enif_make_badarg(env);
 
-  if  (!get(env, argv[0], ctx)
-    || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count - 1))
-    || !get(env, argv[2], corr_id)
-    || !enif_get_local_pid(env, argv[3], &caller_pid)
-    || !enif_get_int64(env, argv[4], &deadline_us)
-    || !enif_is_list(env, argv[5])) [[unlikely]]
+    // Caller PID from env (no argument needed)
+    enif_self(env, &caller_pid);
+
+    // Timeout: integer (ms) or atom 'infinity'
+    ErlNifUInt64 timeout_ms;
+    if (enif_get_uint64(env, argv[3], &timeout_ms)) {
+      struct timespec ts;
+      clock_gettime(CLOCK_REALTIME, &ts);
+      int64_t now_us = static_cast<int64_t>(ts.tv_sec) * 1000000LL
+                     + static_cast<int64_t>(ts.tv_nsec) / 1000;
+      deadline_us = now_us + static_cast<int64_t>(timeout_ms) * 1000;
+    } else if (enif_is_atom(env, argv[3])) {
+      // 'infinity' → never expires
+      deadline_us = INT64_MAX;
+    } else [[unlikely]] {
+      return enif_make_badarg(env);
+    }
+
+    data_term = argv[4];
+  } else {
+    // Legacy: register_and_send(PoolRef, StripeId, CorrId, CallerPid, DeadlineUs, DataList)
+    assert(argc == 6);
+
+    ErlNifSInt64 raw_deadline;
+    if  (!get(env, argv[0], ctx)
+      || !get(env, argv[1], stripe_id, (unsigned int)(ctx->stripe_count - 1))
+      || !get(env, argv[2], corr_id)
+      || !enif_get_local_pid(env, argv[3], &caller_pid)
+      || !enif_get_int64(env, argv[4], &raw_deadline)
+      || !enif_is_list(env, argv[5])) [[unlikely]]
+      return enif_make_badarg(env);
+
+    deadline_us = static_cast<int64_t>(raw_deadline);
+    data_term   = argv[5];
+  }
+
+  // Data must be an iolist (list of binaries).
+  if (!enif_is_list(env, data_term)) [[unlikely]]
     return enif_make_badarg(env);
+  ERL_NIF_TERM data_list = data_term;
 
-  auto& ct = ctx->stripes[stripe_id]->corr_table;
-  if (!ct.insert(corr_id, caller_pid,
-                 static_cast<uint32_t>(stripe_id),
-                 static_cast<int64_t>(deadline_us))) [[unlikely]]
-    return make_tuple(env, am_error, enif_make_atom(env, "table_full"));
-
-  auto result = Connection::send_and_release(env, ctx, stripe_id, argv[5]);
+  auto result = Connection::send_and_release(env, ctx, stripe_id, data_list);
 
   switch (result.result) {
     case Connection::SendResult::OK:
     case Connection::SendResult::PARTIAL:
-      return make_tuple(env, am_ok, result.slot_id);
-
+      break;
     default:
-      ct.erase(corr_id);
       return make_tuple(env, am_error, result.error_reason);
   }
+
+  // Insert the corr entry now that we know the slot_id (conn_id for drain_by_conn).
+  auto& ct = ctx->stripes[stripe_id]->corr_table;
+  if (!ct.insert(corr_id, caller_pid,
+                 static_cast<uint32_t>(result.slot_id),
+                 deadline_us)) [[unlikely]]
+    return make_tuple(env, am_error, enif_make_atom(env, "table_full"));
+
+  return make_tuple(env, am_ok, result.slot_id);
 }
 
 //-----------------------------------------------------------------------------

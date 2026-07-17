@@ -153,6 +153,7 @@ struct CorrTable {
   }
 
   // Scan all slots; for entries with conn_id == target_conn, claim and call fn.
+  // Uses TOMBSTONE (not EMPTY) after removal to preserve probe chains for remove().
   template <typename Fn>
   void drain_by_conn(uint32_t target_conn, Fn&& fn)
   {
@@ -163,13 +164,15 @@ struct CorrTable {
       if (slots[i].key.compare_exchange_strong(
               k, TOMBSTONE, std::memory_order_acquire, std::memory_order_relaxed)) {
         CorrPayload p{slots[i].caller_pid, slots[i].conn_id, slots[i].deadline_us};
-        slots[i].key.store(EMPTY, std::memory_order_release);
         fn(k, p);
+        // Leave TOMBSTONE — do NOT store EMPTY; remove() treats EMPTY as a chain
+        // terminator, so clearing here would make displaced keys unreachable.
       }
     }
   }
 
   // Scan all slots; for entries with deadline_us < now_us, claim and call fn.
+  // Uses TOMBSTONE (not EMPTY) after removal to preserve probe chains for remove().
   template <typename Fn>
   void sweep_expired(int64_t now_us, Fn&& fn)
   {
@@ -180,8 +183,8 @@ struct CorrTable {
       if (slots[i].key.compare_exchange_strong(
               k, TOMBSTONE, std::memory_order_acquire, std::memory_order_relaxed)) {
         CorrPayload p{slots[i].caller_pid, slots[i].conn_id, slots[i].deadline_us};
-        slots[i].key.store(EMPTY, std::memory_order_release);
         fn(k, p);
+        // Leave TOMBSTONE — do NOT store EMPTY; same invariant as drain_by_conn.
       }
     }
   }
@@ -296,17 +299,15 @@ struct PoolContext {
   // Get total number of slots across all stripes
   std::size_t total_slots() const
   {
-    return std::accumulate(stripes.begin(), stripes.end(), 0, [](int total, auto& stripe) {
-      return total * stripe->capacity;
-    });
+    return std::accumulate(stripes.begin(), stripes.end(), std::size_t{0},
+      [](std::size_t total, auto& stripe) { return total + stripe->capacity; });
   }
 
   // Get total number of available slots across all stripes
   std::size_t total_available_slots() const
   {
-    return std::accumulate(stripes.begin(), stripes.end(), 0, [](int total, auto& stripe) {
-      return total * stripe->available_slots();
-    });
+    return std::accumulate(stripes.begin(), stripes.end(), std::size_t{0},
+      [](std::size_t total, auto& stripe) { return total + stripe->available_slots(); });
   }
 
   PoolUtilization calculate_pool_utilization();

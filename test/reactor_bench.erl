@@ -56,7 +56,7 @@ run() ->
   Reqs   = list_to_integer(os:getenv("REQS",  integer_to_list(?REQS))),
   MSizes =
     case os:getenv("MSIZE") of
-      false -> [8, 256, 1024];
+      false -> [64, 256, 1024];
       Val   -> [list_to_integer(Val)]
     end,
   [run_with(Conns, Reqs, MsgSize) || MsgSize <- MSizes],
@@ -209,6 +209,8 @@ run_with(NConns, NReqs, MsgSize) ->
           timer:sleep(10),
           Client(P, NConns, WarmReqs, MsgSize),
           R = Client(P, NConns, NReqs, MsgSize),
+          arterial_pool:stop(reactor_bench_arterial_pool),
+          erase({arterial_pool_port, reactor_bench_arterial_pool}),
           Stop(S),
           print_row(Label, I, R);
         false ->
@@ -672,21 +674,24 @@ arterial_client_run(ServerPort, NConns, NReqs, MsgSize) ->
   Payload    = binary:copy(<<0>>, MsgSize - 4),
   Pool       = ?ARTERIAL_POOL,
   reactor_bench_codec:set_msg_size(MsgSize),
-  arterial_pool:stop(Pool),
-  {ok, _} = application:ensure_all_started(arterial),
-  {ok, _} = arterial_pool:start_link(Pool, #{
-    size               => NConns,
-    codec              => reactor_bench_codec,
-    address            => "127.0.0.1",
-    port               => ServerPort,
-    default_timeout_ms => ?TIMEOUT
-  }),
-  ok = arterial_pool:wait_connected(Pool, all, 8000),
-  try
-    arterial_bench_run(Pool, NConns, DurationMs, Payload, MsgSize)
-  after
-    arterial_pool:stop(Pool)
-  end.
+  %% Reuse existing pool if it matches; otherwise start fresh.
+  case get({arterial_pool_port, Pool}) of
+    ServerPort ->
+      ok;  % pool already running against this server port
+    _ ->
+      arterial_pool:stop(Pool),
+      {ok, _} = application:ensure_all_started(arterial),
+      {ok, _} = arterial_pool:start_link(Pool, #{
+        size               => NConns,
+        codec              => reactor_bench_codec,
+        address            => "127.0.0.1",
+        port               => ServerPort,
+        default_timeout_ms => ?TIMEOUT
+      }),
+      ok = arterial_pool:wait_connected(Pool, all, 8000),
+      put({arterial_pool_port, Pool}, ServerPort)
+  end,
+  arterial_bench_run(Pool, NConns, DurationMs, Payload, MsgSize).
 
 arterial_bench_run(Pool, NWorkers, DurationMs, Payload, MsgSize) ->
   Parent   = self(),

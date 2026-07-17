@@ -3,5 +3,6 @@
   codec              :: module(),
   size               :: pos_integer(),
   default_timeout_ms :: pos_integer(),
-  throttle           :: undefined | {pos_integer(), pos_integer()}
+  throttle           :: undefined | {pos_integer(), pos_integer()},
+  observe            :: boolean()
 }).

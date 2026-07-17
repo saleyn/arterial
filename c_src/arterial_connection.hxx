@@ -849,11 +849,16 @@ inline Connection::SendResultData Connection::send_and_release(
   } // End of else block for no pending data
 
   if (static_cast<size_t>(written) < total_bytes) {
-    conn.pending_buffer.resize(total_bytes);
-    size_t offset = 0;
-    for (unsigned int j = 0; j < i; ++j) {
-      std::memcpy(conn.pending_buffer.data() + offset, iov[j].iov_base, iov[j].iov_len);
-      offset += iov[j].iov_len;
+    // pending_bytes > 0: conn.pending_buffer already holds the combined data
+    // (old pending + new iovecs appended above); total_bytes == pending_buffer.size().
+    // pending_bytes == 0: buffer is empty; copy the new iovecs into it now.
+    if (pending_bytes == 0) {
+      conn.pending_buffer.resize(total_bytes);
+      size_t offset = 0;
+      for (unsigned int j = 0; j < i; ++j) {
+        std::memcpy(conn.pending_buffer.data() + offset, iov[j].iov_base, iov[j].iov_len);
+        offset += iov[j].iov_len;
+      }
     }
     conn.bytes_written = static_cast<size_t>(written);
     conn.status.store(SLOT_WRITE_POLLING, std::memory_order_release);
@@ -1144,16 +1149,22 @@ inline Connection::FifoResultData Connection::reserve_send_fifo_request(
 
       conn.status.store(SLOT_FIFO_RESERVED, std::memory_order_release);
 
-      // Send the request data immediately (combined operation)
-      // Use stack-allocated array for better performance (most requests have few segments)
-      static constexpr size_t MAX_IOVECS = 32;
-      iovec                   iovecs[MAX_IOVECS];
+      // Build iovec from the full data list — no element cap.
+      unsigned int list_len = 0;
+      enif_get_list_length(env, data_list, &list_len);
+
+      constexpr size_t        s_inline_fifo_iov = 16;
+      std::array<iovec, s_inline_fifo_iov> inline_iovecs;
+      std::vector<iovec>      heap_iovecs;
+      iovec*                  iovecs      = (list_len <= s_inline_fifo_iov)
+                                              ? inline_iovecs.data()
+                                              : (heap_iovecs.resize(list_len), heap_iovecs.data());
       size_t                  iovec_count = 0;
       size_t                  total_bytes = 0;
 
       // Process the request data and send it
       ERL_NIF_TERM            head, tail = data_list;
-      while (enif_get_list_cell(env, tail, &head, &tail) && iovec_count < MAX_IOVECS) {
+      while (enif_get_list_cell(env, tail, &head, &tail)) {
         ErlNifBinary bin;
         if (!enif_inspect_binary(env, head, &bin)) {
           // Cleanup on error

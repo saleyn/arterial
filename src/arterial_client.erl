@@ -52,19 +52,26 @@ carried this request dies before a reply arrives (see
 -spec call(arterial_pool:name(), term(), non_neg_integer() | infinity) ->
   {ok, arterial:response()} | {error, term()}.
 call(Pool, Request, Timeout) ->
-  Dispatcher = arterial_observe:dispatcher(),
-  Dispatcher:call(Pool, fun() -> do_call(Pool, Request, Timeout, Dispatcher) end).
-
-do_call(Pool, Request, Timeout, Dispatcher) ->
-  #pool_meta{pool_ref = PoolRef, codec = Codec, size = Size} = arterial_pool:pool_meta(Pool),
+  #pool_meta{pool_ref = PoolRef, codec = Codec, size = Size,
+             observe = Observe} = arterial_pool:pool_meta(Pool),
   CorrId = new_corr_id(),
   Data   = Codec:encode_request(CorrId, Request),
   Start  = erlang:system_info(scheduler_id) rem Size,
-  case send_to_any(PoolRef, Size, Start, 0, CorrId, Data, Timeout, Dispatcher, Pool) of
-    {ok, ConnID} ->
-      await_reply(PoolRef, CorrId, ConnID, Timeout);
-    {error, _} = Error ->
-      Error
+  case Observe of
+    false ->
+      case send_to_any_fast(PoolRef, Size, Start, 0, CorrId, Data, Timeout) of
+        {ok, ConnID} -> await_reply(PoolRef, CorrId, ConnID, Timeout);
+        {error, _} = Error -> Error
+      end;
+    true ->
+      Dispatcher = arterial_observe_span,
+      Dispatcher:call(Pool, fun() ->
+        Deadline = arterial_util:calc_expiration(os:system_time(microsecond), Timeout),
+        case send_to_any(PoolRef, Size, Start, 0, CorrId, Data, Deadline, Dispatcher, Pool) of
+          {ok, ConnID} -> await_reply(PoolRef, CorrId, ConnID, Timeout);
+          {error, _} = Error -> Error
+        end
+      end)
   end.
 
 -doc """
@@ -85,15 +92,20 @@ ok
 """.
 -spec cast(arterial_pool:name(), term()) -> ok | {error, term()}.
 cast(Pool, Request) ->
-  Dispatcher = arterial_observe:dispatcher(),
-  Dispatcher:cast(Pool, fun() -> do_cast(Pool, Request, Dispatcher) end).
-
-do_cast(Pool, Request, Dispatcher) ->
-  #pool_meta{pool_ref = PoolRef, codec = Codec, size = Size} = arterial_pool:pool_meta(Pool),
+  #pool_meta{pool_ref = PoolRef, codec = Codec, size = Size,
+             observe = Observe} = arterial_pool:pool_meta(Pool),
   CorrId = new_corr_id(),
   Data   = Codec:encode_request(CorrId, Request),
   Start  = erlang:system_info(scheduler_id) rem Size,
-  send_cast_to_any(PoolRef, Size, Start, 0, Data, Dispatcher, Pool).
+  case Observe of
+    false ->
+      send_cast_to_any_noop(PoolRef, Size, Start, 0, Data);
+    true ->
+      Dispatcher = arterial_observe_span,
+      Dispatcher:cast(Pool, fun() ->
+        send_cast_to_any(PoolRef, Size, Start, 0, Data, Dispatcher, Pool)
+      end)
+  end.
 
 -doc """
 A fresh wire-level correlation id, truncated to 32 bits (the width
@@ -108,9 +120,15 @@ another id), and `monotonic` forces a single counter shared across every
 scheduler -- measurably more contended under concurrency than the
 per-scheduler counters backing plain `unique_integer/1`.
 """.
--spec new_corr_id() -> non_neg_integer().
+-spec new_corr_id() -> pos_integer().
 new_corr_id() ->
-  erlang:unique_integer([positive]) band 16#FFFFFFFF.
+  % Mask to 32 bits for the NIF corr table; avoid 0 (EMPTY sentinel) and
+  % 16#FFFFFFFF (TOMBSTONE sentinel) by remapping them to 1.
+  case erlang:unique_integer([positive]) band 16#FFFFFFFF of
+    0          -> 1;
+    16#FFFFFFFF -> 1;
+    Id         -> Id
+  end.
 
 %%%-----------------------------------------------------------------------------
 %%% Internal functions
@@ -120,14 +138,32 @@ new_corr_id() ->
 %% handled entirely inside the NIF's register_and_send (CAS on lease_mask):
 %% the Erlang layer just needs to advance to the next stripe on failure and
 %% give up after trying all Size stripes.
-send_to_any(_PoolRef, Size, _Start, Size, _CorrId, _Data, _Timeout, _Dispatcher, _Pool) ->
+%% Hot path: arity-5 NIF computes deadline and gets caller pid internally.
+send_to_any_fast(_PoolRef, Size, _Start, Size, _CorrId, _Data, _Timeout) ->
   {error, no_connection};
-send_to_any(PoolRef, Size, Start, Offset, CorrId, Data, Timeout, Dispatcher, Pool) ->
-  ConnID   = (Start + Offset) rem Size,
-  Deadline = arterial_util:calc_expiration(os:system_time(microsecond), Timeout),
+send_to_any_fast(PoolRef, Size, Start, Offset, CorrId, Data, Timeout) ->
+  ConnID = (Start + Offset) rem Size,
+  case arterial_nif:register_and_send(PoolRef, ConnID, CorrId, Timeout, [Data]) of
+    {ok,    _SlotId} -> {ok, ConnID};
+    {error, _Reason} -> send_to_any_fast(PoolRef, Size, Start, Offset + 1, CorrId, Data, Timeout)
+  end.
+
+send_to_any(_PoolRef, Size, _Start, Size, _CorrId, _Data, _Deadline, _Dispatcher, _Pool) ->
+  {error, no_connection};
+send_to_any(PoolRef, Size, Start, Offset, CorrId, Data, Deadline, Dispatcher, Pool) ->
+  ConnID = (Start + Offset) rem Size,
   case Dispatcher:register_and_send(Pool, PoolRef, ConnID, CorrId, self(), Deadline, Data) of
     {ok,    _SlotId} -> {ok, ConnID};
-    {error, _Reason} -> send_to_any(PoolRef, Size, Start, Offset + 1, CorrId, Data, Timeout, Dispatcher, Pool)
+    {error, _Reason} -> send_to_any(PoolRef, Size, Start, Offset + 1, CorrId, Data, Deadline, Dispatcher, Pool)
+  end.
+
+send_cast_to_any_noop(_PoolRef, Size, _Start, Size, _Data) ->
+  {error, no_connection};
+send_cast_to_any_noop(PoolRef, Size, Start, Offset, Data) ->
+  ConnID = (Start + Offset) rem Size,
+  case arterial_nif:send_and_release(PoolRef, ConnID, [Data]) of
+    {ok,    _SlotId} -> ok;
+    {error, _Reason} -> send_cast_to_any_noop(PoolRef, Size, Start, Offset + 1, Data)
   end.
 
 send_cast_to_any(_PoolRef, Size, _Start, Size, _Data, _Dispatcher, _Pool) ->

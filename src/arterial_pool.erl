@@ -347,7 +347,8 @@ init([Name, Opts]) ->
     codec              = Codec,
     size               = Size,
     default_timeout_ms = DefaultTimeoutMs,
-    throttle           = ThrottleState
+    throttle           = ThrottleState,
+    observe            = arterial_observe:enabled()
   }),
   %% Connection availability is now managed entirely by the NIF layer
 

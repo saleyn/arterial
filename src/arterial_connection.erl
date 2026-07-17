@@ -255,8 +255,10 @@ handle_info(bounce_check, #state{bounce = #bounce_state{}} = State) ->
 
 %% Reactor NIF: data arrives pre-read from C++ reactor thread.
 %% The binary is already decoded from the socket; we just decode the protocol.
+%% Drain all pending read messages from the mailbox in one pass to reduce
+%% gen_server loop overhead under high throughput.
 handle_info({arterial_event, ConnID, 0, read, Bin}, #state{conn_id = ConnID} = State) ->
-  append_and_decode(Bin, State);
+  append_and_decode(drain_reads(ConnID, Bin), State);
 
 handle_info({arterial_event, ConnID, 0, closed}, #state{conn_id = ConnID} = State) ->
   disconnect(closed, State#state{buffer = <<>>});
@@ -352,8 +354,15 @@ handle_connect_result(Error, #state{pfx = Pfx} = State) ->
 %%% Internal functions: read path (decode + dispatch)
 %%%-----------------------------------------------------------------------------
 
-%% handle_read_event/1 removed: the Reactor NIF reads data in C++ and delivers
-%% it directly as {arterial_event, ConnID, 0, read, Binary} — no NIF callback.
+%% Drain all consecutive read messages from the mailbox (non-blocking).
+%% Reduces gen_server loop re-entry overhead when multiple reads pile up.
+drain_reads(ConnID, Bin) ->
+  receive
+    {arterial_event, ConnID, 0, read, More} ->
+      drain_reads(ConnID, <<Bin/binary, More/binary>>)
+  after 0 ->
+    Bin
+  end.
 
 append_and_decode(Bin, #state{pfx = Pfx, pool_ref = PoolRef, codec = Codec,
                               buffer = Buffer, conn_id = ConnID} = State) ->

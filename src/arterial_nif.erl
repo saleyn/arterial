@@ -35,7 +35,7 @@ group membership management.
 -export([is_slot_available/3, set_slot_available/3, set_slot_unavailable/3]).
 -export([reserve_fifo_connection/3, send_fifo_request/6, release_fifo_connection/4, fifo_connection_status/3, handle_fifo_reply/4]).
 -export([reserve_send_fifo_request/5]).
--export([register_and_send/6, unregister_corr/3,
+-export([register_and_send/5, register_and_send/6, unregister_corr/3,
          lookup_and_remove_corr/3, corr_count/2, drain_corr_map/3, sweep_corr_map/2]).
 -export([info/0]).
 
@@ -461,6 +461,18 @@ reserve_send_fifo_request(_PoolRef, _StripeId, _RequestData, _ReservationTimeout
 %%%-----------------------------------------------------------------------------
 %%% Corr-map NIFs (in-NIF correlation-id → caller mapping, replaces ETS table)
 %%%-----------------------------------------------------------------------------
+
+-doc """
+Hot-path variant: register the correlation entry and send `Data` in a
+single NIF call. The caller PID is obtained internally via `enif_self`
+and the absolute deadline is computed from `TimeoutMs` inside the NIF
+(avoids `os:system_time` and `self()` BIF calls in the Erlang hot path).
+""".
+-spec register_and_send(pool_ref(), non_neg_integer(), non_neg_integer(),
+                        non_neg_integer() | infinity, iolist()) ->
+  {ok, non_neg_integer()} | {error, term()}.
+register_and_send(_PoolRef, _StripeId, _CorrId, _TimeoutMs, _Data) ->
+  ?NOT_LOADED_ERROR.
 
 -doc """
 Register the correlation entry and send `Data` in a single NIF call.
